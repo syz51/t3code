@@ -292,8 +292,7 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
       ...(yield* changedFiles),
       ...(yield* untrackedFiles),
       ...ignored,
-      "node_modules/.modules.yaml",
-      "node_modules/.pnpm/lock.yaml",
+      "bun.lock",
     ]) {
       hash.update(`\0${file}\0`);
       // Untracked nested repositories are listed as directories.
@@ -394,13 +393,11 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
     knipPasses.push(["exec", "knip", ...args]);
   }
 
-  // A version bump can leave a patch unused, causing pnpm to reject the install
-  // with ERR_PNPM_UNUSED_PATCH. Check it here as Release Smoke does in CI.
+  // A version bump can leave a patch unused; bun only warns that it "no longer applies".
   const runPatchCheck = files.some(
     (file) =>
-      file === "pnpm-workspace.yaml" ||
-      file === "pnpm-lock.yaml" ||
-      file === ".pnpmfile.cjs" ||
+      file === "bun.lock" ||
+      file === "bunfig.toml" ||
       file.startsWith("patches/") ||
       file.startsWith("apps/mobile/deps/") ||
       path.basename(file) === "package.json",
@@ -440,7 +437,6 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
         yield* fs.copy(inRoot(relative), dest);
       });
       yield* copy("package.json");
-      yield* copy("pnpm-workspace.yaml");
       for (const pkg of packages) yield* copy(`${pkg.dir}/package.json`);
       const modulesDir = "apps/mobile/modules";
       if (yield* fs.exists(inRoot(modulesDir))) {
@@ -449,16 +445,16 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
           if (yield* fs.exists(inRoot(manifest))) yield* copy(manifest);
         }
       }
-      for (const extra of ["apps/mobile/deps", "patches", ".pnpmfile.cjs"]) {
+      for (const extra of ["apps/mobile/deps", "patches", "bunfig.toml"]) {
         if (yield* fs.exists(inRoot(extra))) yield* copy(extra);
       }
       const result = yield* vp(["install", "--lockfile-only", "--ignore-scripts"], temp);
-      if (result.ok || !result.output.includes("ERR_PNPM_UNUSED_PATCH")) return result;
+      if (!result.output.includes("no longer applies")) return result;
       return {
         ok: false,
         output:
           `${result.output}\nUnused dependency patches: remove each patch named above from ` +
-          "patchedDependencies in pnpm-workspace.yaml and from patches/, " +
+          "patchedDependencies in package.json and from patches/, " +
           "update it to the version the install resolves, " +
           "or pin the dependency that pulls it in to the patched version.",
       };

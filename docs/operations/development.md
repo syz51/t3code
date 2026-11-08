@@ -2,11 +2,12 @@
 
 ## First checkout
 
-Install `vp` using the [root README](../../README.md#install-vp). It provides the Node version
-pinned in `package.json` (Node 26), so no separate Node install is needed. From the repository root:
+Install [Bun](https://bun.sh) 1.4 or newer, which installs this fork's dependencies, and Node 26
+(`engines.node` in `package.json`), which runs the app. Install `vp` using the
+[root README](../../README.md#install-vp) for the task runner. From the repository root:
 
 ```sh
-vp i
+bun install
 vp run dev
 ```
 

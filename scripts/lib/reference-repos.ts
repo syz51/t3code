@@ -14,8 +14,8 @@ export const referenceRepos: ReadonlyArray<ReferenceRepo> = [
     prefix: ".repos/effect",
     repository: "https://github.com/Effect-TS/effect.git",
     latestRef: "main",
-    versionSourcePath: "pnpm-workspace.yaml",
-    packageVersionPath: ["catalog", "effect"],
+    versionSourcePath: "package.json",
+    packageVersionPath: ["workspaces", "catalog", "effect"],
     versionTagPrefix: "effect@",
   },
   {
@@ -23,8 +23,8 @@ export const referenceRepos: ReadonlyArray<ReferenceRepo> = [
     prefix: ".repos/alchemy-effect",
     repository: "https://github.com/alchemy-run/alchemy-effect.git",
     latestRef: "main",
-    versionSourcePath: "pnpm-workspace.yaml",
-    packageVersionPath: ["catalog", "alchemy"],
+    versionSourcePath: "package.json",
+    packageVersionPath: ["workspaces", "catalog", "alchemy"],
     versionTagPrefix: "v",
   },
 ];

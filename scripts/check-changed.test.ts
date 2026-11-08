@@ -316,11 +316,11 @@ function launcherFixture() {
     write(file, NodeFS.readFileSync(NodePath.join(import.meta.dirname, "..", file), "utf8"));
   }
   write(".gitignore", "node_modules/\nrecords/\n");
-  write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
   write(
     "package.json",
     JSON.stringify({
       type: "module",
+      workspaces: ["packages/*"],
       scripts: {
         "knip:check:files": "knip --include files",
         "knip:check:exports": "knip --exports",

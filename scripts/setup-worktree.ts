@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - runs before `vp i`, so only Node built-ins exist.
+// @effect-diagnostics nodeBuiltinImport:off - runs before `bun install`, so only Node built-ins exist.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -9,7 +9,7 @@ const worktree = NodePath.dirname(import.meta.dirname);
 
 // T3 runs setup in the background, so agents can start before it ends.
 // `setup-running` holds this PID until setup ends with `setup-done` or
-// `setup-failed`, so agents wait instead of racing it with their own `vp i`.
+// `setup-failed`, so agents wait instead of racing it with their own `bun install`.
 const markerDir = NodePath.join(worktree, ".t3");
 const runningMarker = NodePath.join(markerDir, "setup-running");
 const doneMarker = NodePath.join(markerDir, "setup-done");
@@ -30,7 +30,7 @@ process.on("exit", (code) => {
 // A cancelled setup must still leave a marker, or agents would wait forever.
 // During install, the signal goes on to the installer and setup exits when the
 // install output closes. Any child the shell leaves behind holds that output
-// open, so no marker appears while `vp i` can still write node_modules.
+// open, so no marker appears while `bun install` can still write node_modules.
 let cancelSignal: NodeJS.Signals | undefined;
 let activeInstall: NodeChildProcess.ChildProcess | undefined;
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
@@ -46,10 +46,9 @@ if (!projectRoot) {
   throw new Error("T3CODE_PROJECT_ROOT is not set. Run this through the t3.json setup action.");
 }
 
-// Use the shell for Windows vp shims. Unattended installs need pnpm's confirmation
-// flag and closed stdin so other prompts fail. A stale lockfile must fail, not be rewritten.
+// Use the shell for Windows shims. Closed stdin makes prompts fail. A stale lockfile must fail, not be rewritten.
 // Pipe output so the failure marker can keep its tail.
-const install = NodeChildProcess.spawn("vp i --frozen-lockfile -- --yes", {
+const install = NodeChildProcess.spawn("bun install --frozen-lockfile", {
   cwd: worktree,
   shell: true,
   stdio: ["ignore", "pipe", "pipe"],
@@ -73,30 +72,6 @@ if (installStatus !== 0 || cancelSignal) {
     ? `Cancelled by ${cancelSignal}.`
     : installOutput.trimEnd().split("\n").slice(-30).join("\n");
   process.exit(installStatus || 1);
-}
-
-// pnpm cannot clone or hardlink across filesystems, so a store on another
-// device silently turns every worktree install into a full copy.
-const storeDir: unknown = JSON.parse(
-  NodeFS.readFileSync(NodePath.join(worktree, "node_modules", ".modules.yaml"), "utf8"),
-).storeDir;
-if (
-  typeof storeDir === "string" &&
-  NodeFS.statSync(storeDir).dev !== NodeFS.statSync(NodePath.join(worktree, "node_modules")).dev
-) {
-  process.stderr.write(
-    [
-      "",
-      "WARNING: the pnpm store is on a different filesystem than this worktree.",
-      `  store:    ${storeDir}`,
-      `  worktree: ${worktree}`,
-      "pnpm cannot hardlink or clone across filesystems, so it copied every package into node_modules.",
-      "Fix: put the store on the worktree's filesystem, for example:",
-      `  pnpm config set store-dir ${JSON.stringify(NodePath.join(NodePath.dirname(worktree), ".pnpm-store"))} --global`,
-      "",
-      "",
-    ].join("\n"),
-  );
 }
 
 // Worktrees link main-checkout env files; replace only symlinks so real files always survive.

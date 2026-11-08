@@ -91,7 +91,7 @@ export default defineConfig({
     tasks: {
       ...cachedTestTasks(process.env.T3_CACHED_TESTS),
       // The two knip passes read the same files and write nothing, so they run side by side.
-      // The `knip:check` script runs this task, so `vp run knip:check` and `pnpm run knip:check` both use it.
+      // The `knip:check` script runs this task, so `vp run knip:check` and `bun run knip:check` both use it.
       "knip:check:all": {
         command: 'node -e ""',
         dependsOn: ["knip:check:files", "knip:check:exports"],
@@ -174,7 +174,7 @@ export default defineConfig({
       "dist",
       "dist-electron",
       "node_modules",
-      "pnpm-lock.yaml",
+      "bun.lock",
       "*.tsbuildinfo",
       "**/routeTree.gen.ts",
       "**/*.graphql.ts",
@@ -207,7 +207,7 @@ export default defineConfig({
       "dist",
       "dist-electron",
       "node_modules",
-      "pnpm-lock.yaml",
+      "bun.lock",
       "*.tsbuildinfo",
       "**/routeTree.gen.ts",
       "**/*.graphql.ts",
