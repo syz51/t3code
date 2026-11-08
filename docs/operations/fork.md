@@ -109,15 +109,29 @@ with the installed app. Stop the server with Ctrl+C.
 ## Desktop app
 
 ```sh
-vp run dist:desktop:artifact --platform mac --target dir --arch arm64 --output-dir ~/.t3-fork/build
+T3CODE_DESKTOP_VERSION=0.1.8-fork.$(date +%Y%m%d) \
+  vp run dist:desktop:artifact --platform mac --target dir --arch arm64 --output-dir ~/.t3-fork/build
 ```
 
 It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
-about a minute. Do not open it while Nightly runs. As built, it has the same identity as Nightly:
+about a minute. Do not open it while Nightly runs.
+
+`T3CODE_DESKTOP_VERSION` is `<core>-fork.<YYYYMMDD>`, where `<core>` is the core of the newest
+upstream nightly tag (`git tag -l 'v*-nightly*' --sort=-creatordate | head -1`). Clients compare
+only the core with their own, so a matching core shows no version-mismatch banner, and the build
+reads as Stable. Without the variable the build takes `apps/desktop/package.json` (an older core),
+and clients show the banner. Avoid:
+
+- an older core, such as `0.1.7-fork.*`, which also sorts below `0.1.7`, so mobile offers `0.1.7`
+  as an update;
+- `-nightly.`, `-preview.` and `-pr.` suffixes, which rename the app and pose as an official
+  channel build.
+
+Apart from its version, it has the same identity as Nightly:
 
 |               | Fork build                                | Nightly                          |
 | ------------- | ----------------------------------------- | -------------------------------- |
-| Name          | T3 Code (Beta), 0.1.7                     | T3 Code (Nightly), 0.1.8-nightly |
+| Name          | T3 Code (Beta), 0.1.8-fork.YYYYMMDD       | T3 Code (Nightly), 0.1.8-nightly |
 | Bundle id     | `com.t3tools.t3code`                      | `com.t3tools.t3code`             |
 | Signature     | ad-hoc                                    | Developer ID, team ARK85ZXQ4Z    |
 | URL schemes   | `t3code`, `t3code-dev`, `http`, `https`   | same                             |
@@ -133,9 +147,11 @@ There are two ways to use a fork build daily:
 - **Replace Nightly.** Quit Nightly and copy the fork app into `/Applications`. It keeps the
   same `~/.t3` state. Nightly updates stop, so update by syncing `fork`, rebuilding and copying
   the app again. The new signature makes macOS ask again for privacy permissions and keychain
-  access. To roll back, quit the fork app and reinstall Nightly from T3's download page. A fork
-  build that ran newer migrations can leave `~/.t3` ahead of Nightly, so copy
-  `statev2.sqlite` with the `VACUUM INTO` command above before switching.
+  access. Keep the Nightly app (move it out of `/Applications`) and roll back by quitting the
+  fork app and moving Nightly back. If the fork app fails to start, its recovery page offers to
+  download its own version from upstream releases; no such release exists, so use the kept
+  Nightly instead. A fork build that ran newer migrations can leave `~/.t3` ahead of Nightly, so
+  copy `statev2.sqlite` with the `VACUUM INTO` command above before switching.
 - **Run beside Nightly.** This needs fork patches to the bundle id (`DESKTOP_APP_ID` in
   `scripts/build-desktop-artifact.ts`), the Electron data folder (`DesktopUserData.ts`), the URL
   schemes and the default state folder (`DesktopStatePaths.ts`). Updates are rebuilds as above.
