@@ -56,6 +56,8 @@ const SETTLED_THREAD_AGE = Duration.days(7);
 const TURN_ITEMS_COMPACTED_BEFORE = "turn-items-compacted-before";
 const KEPT_OUTPUT_CHARS = 8192;
 const COMPACTED_OUTPUT_MIN_CHARS = 2 * KEPT_OUTPUT_CHARS + 1024;
+// Each rewritten row is parsed several times; bound one statement's work by bytes.
+const UPDATE_PAGE_BYTES = 4 * 1024 * 1024;
 const SETTLED_ITEM_STATUSES = ["completed", "failed", "interrupted", "cancelled"] as const;
 
 type MetadataRow = {
@@ -267,168 +269,231 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
     });
 
     // Drops updates between an entity's first and newest one, through the previous pass's mark.
-    const pruneSupersededUpdates = Effect.fnUntraced(function* (
-      now: DateTime.Utc,
-      head: number,
-      betweenPages: Effect.Effect<void>,
-    ) {
-      const metadata = yield* sql<MetadataRow>`
-        SELECT projection_name, last_sequence, updated_at
-        FROM orchestration_v2_projection_metadata
-        WHERE projection_name IN (
-          ${SUPERSEDED_MARK}, ${SUPERSEDED_THROUGH}, ${EVENT_LOG_PRUNED_THROUGH}
-        )
-      `.pipe(NodeSqliteClient.readOnly);
-      const read = (name: string) => metadata.find((row) => row.projection_name === name);
-      const mark = read(SUPERSEDED_MARK);
-      if (
-        mark !== undefined &&
-        DateTime.toEpochMillis(now) - Date.parse(mark.updated_at) <
-          Duration.toMillis(SUPERSEDED_GRACE)
-      ) {
-        return 0;
-      }
-      const after = Math.max(
-        read(SUPERSEDED_THROUGH)?.last_sequence ?? 0,
-        read(EVENT_LOG_PRUNED_THROUGH)?.last_sequence ?? 0,
-      );
-      const through = mark?.last_sequence ?? 0;
-      let deleted = 0;
-      if (through > after) {
-        const referenced = yield* readPromptReferences(after, head, betweenPages);
-        let referencesThrough = head;
-        const streams = yield* sql<{ readonly stream_id: string }>`
-          SELECT DISTINCT stream_id FROM orchestration_events
-          WHERE sequence > ${after} AND sequence <= ${through}
-            AND application_event_version = 2 AND aggregate_kind = 'thread'
-            AND event_type IN ${sql.in(SUPERSEDABLE_EVENT_TYPES)}
+    const pruneSupersededUpdates = Effect.fn("ProjectionMaintenance.pruneSupersededUpdates")(
+      function* (now: DateTime.Utc, head: number, betweenPages: Effect.Effect<void>) {
+        const metadata = yield* sql<MetadataRow>`
+          SELECT projection_name, last_sequence, updated_at
+          FROM orchestration_v2_projection_metadata
+          WHERE projection_name IN (
+            ${SUPERSEDED_MARK}, ${SUPERSEDED_THROUGH}, ${EVENT_LOG_PRUNED_THROUGH}
+          )
         `.pipe(NodeSqliteClient.readOnly);
-        for (const { stream_id: streamId } of streams) {
-          const rows = yield* sql<{ readonly sequence: number }>`
-            SELECT sequence FROM (
-              SELECT
-                sequence,
-                LAG(sequence) OVER entity AS previous,
-                LEAD(sequence) OVER entity AS next
-              FROM orchestration_events
-              WHERE stream_id = ${streamId}
-                AND application_event_version = 2 AND aggregate_kind = 'thread'
-                AND sequence > ${after} AND sequence <= ${head}
-                AND event_type IN ${sql.in(SUPERSEDABLE_EVENT_TYPES)}
-              WINDOW entity AS (
-                PARTITION BY event_type, json_extract(payload_json, '$.id') ORDER BY sequence
-              )
-            )
-            WHERE previous IS NOT NULL AND next IS NOT NULL AND sequence <= ${through}
+        const read = (name: string) => metadata.find((row) => row.projection_name === name);
+        const mark = read(SUPERSEDED_MARK);
+        if (
+          mark !== undefined &&
+          DateTime.toEpochMillis(now) - Date.parse(mark.updated_at) <
+            Duration.toMillis(SUPERSEDED_GRACE)
+        ) {
+          return 0;
+        }
+        const after = Math.max(
+          read(SUPERSEDED_THROUGH)?.last_sequence ?? 0,
+          read(EVENT_LOG_PRUNED_THROUGH)?.last_sequence ?? 0,
+        );
+        const through = mark?.last_sequence ?? 0;
+        const streams = new Set<string>();
+        for (let cursor = after; cursor < through;) {
+          const windowEnd = Math.min(cursor + REFERENCE_SCAN_WINDOW, through);
+          const rows = yield* sql<{ readonly stream_id: string }>`
+            SELECT DISTINCT stream_id FROM orchestration_events
+            WHERE sequence > ${cursor} AND sequence <= ${windowEnd}
+              AND aggregate_kind = 'thread'
+              AND event_type IN ${sql.in(SUPERSEDABLE_EVENT_TYPES)}
           `.pipe(NodeSqliteClient.readOnly);
-          yield* Effect.yieldNow;
-          for (let start = 0; start < rows.length; start += PAGE_SIZE) {
-            const candidates = rows.slice(start, start + PAGE_SIZE).map((row) => row.sequence);
-            deleted += yield* sql.withTransaction(
-              Effect.gen(function* () {
-                const appended = yield* sql<{
-                  readonly sequence: number;
-                  readonly prompt_sequence: number | null;
-                }>`
-                  SELECT
-                    sequence,
-                    CASE
-                      WHEN event_type IN ('subagent.updated', 'turn-item.updated')
-                        AND json_type(payload_json, '$.promptSequence') = 'integer'
-                      THEN json_extract(payload_json, '$.promptSequence')
-                    END AS prompt_sequence
-                  FROM orchestration_events WHERE sequence > ${referencesThrough}
-                `;
-                for (const row of appended) {
-                  if (row.prompt_sequence !== null) referenced.add(row.prompt_sequence);
-                  referencesThrough = Math.max(referencesThrough, row.sequence);
-                }
-                const obsolete = candidates.filter((sequence) => !referenced.has(sequence));
-                if (obsolete.length === 0) return 0;
-                yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
-                return obsolete.length;
-              }),
-            );
+          for (const row of rows) streams.add(row.stream_id);
+          cursor = windowEnd;
+          yield* betweenPages;
+        }
+        let deleted = 0;
+        if (streams.size > 0) {
+          const referenced = yield* readPromptReferences(after, head, betweenPages);
+          let referencesThrough = head;
+          for (const streamId of streams) {
+            // Per entity: its newest update so far, and whether an older one precedes it.
+            const newest = new Map<string, { sequence: number; deletable: boolean }>();
+            const candidates: Array<number> = [];
+            for (let cursor = after; ;) {
+              const rows = yield* sql<{
+                readonly sequence: number;
+                readonly entity: string;
+                readonly uncommanded: number;
+              }>`
+                SELECT
+                  sequence,
+                  event_type || ':' || json_extract(payload_json, '$.id') AS entity,
+                  command_id IS NULL AS uncommanded
+                FROM orchestration_events
+                WHERE stream_id = ${streamId}
+                  AND application_event_version = 2 AND aggregate_kind = 'thread'
+                  AND sequence > ${cursor} AND sequence <= ${head}
+                  AND event_type IN ${sql.in(SUPERSEDABLE_EVENT_TYPES)}
+                ORDER BY sequence ASC
+                LIMIT ${PAGE_SIZE}
+              `.pipe(NodeSqliteClient.readOnly);
+              for (const row of rows) {
+                const previous = newest.get(row.entity);
+                if (previous?.deletable === true) candidates.push(previous.sequence);
+                newest.set(row.entity, {
+                  sequence: row.sequence,
+                  deletable:
+                    previous !== undefined && row.uncommanded === 1 && row.sequence <= through,
+                });
+              }
+              yield* betweenPages;
+              if (rows.length < PAGE_SIZE) break;
+              cursor = rows.at(-1)?.sequence ?? head;
+            }
+            for (let start = 0; start < candidates.length; start += PAGE_SIZE) {
+              const page = candidates.slice(start, start + PAGE_SIZE);
+              deleted += yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  // Rows appended since the reference scan may borrow a prompt from a candidate.
+                  const appended = yield* sql<{
+                    readonly sequence: number;
+                    readonly prompt_sequence: number | null;
+                  }>`
+                    SELECT
+                      sequence,
+                      CASE
+                        WHEN event_type IN ('subagent.updated', 'turn-item.updated')
+                          AND json_type(payload_json, '$.promptSequence') = 'integer'
+                        THEN json_extract(payload_json, '$.promptSequence')
+                      END AS prompt_sequence
+                    FROM orchestration_events WHERE sequence > ${referencesThrough}
+                  `;
+                  for (const row of appended) {
+                    if (row.prompt_sequence !== null) referenced.add(row.prompt_sequence);
+                    referencesThrough = Math.max(referencesThrough, row.sequence);
+                  }
+                  const obsolete = page.filter((sequence) => !referenced.has(sequence));
+                  if (obsolete.length === 0) return 0;
+                  yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
+                  return obsolete.length;
+                }),
+              );
+              yield* Effect.yieldNow;
+              yield* betweenPages;
+            }
+          }
+        }
+        if (through > after) yield* writeMetadata(SUPERSEDED_THROUGH, through, now);
+        yield* writeMetadata(SUPERSEDED_MARK, head, now);
+        return deleted;
+      },
+    );
+
+    // Threads settled and untouched for SETTLED_THREAD_AGE keep their transcript, but each long
+    // text tool output keeps only its ends and reasoning text is cleared. Clients render both.
+    const compactSettledTurnItems = Effect.fn("ProjectionMaintenance.compactSettledTurnItems")(
+      function* (now: DateTime.Utc, betweenPages: Effect.Effect<void>) {
+        const cutoff = DateTime.subtractDuration(now, SETTLED_THREAD_AGE);
+        const cutoffIso = DateTime.formatIso(cutoff);
+        const previous = yield* sql<MetadataRow>`
+          SELECT projection_name, last_sequence, updated_at
+          FROM orchestration_v2_projection_metadata
+          WHERE projection_name = ${TURN_ITEMS_COMPACTED_BEFORE}
+        `.pipe(NodeSqliteClient.readOnly);
+        // Settling bumps updated_at, so a thread settled later enters a later window.
+        const threads = yield* sql<{ readonly thread_id: string }>`
+          SELECT thread_id FROM orchestration_v2_projection_threads
+          WHERE updated_at < ${cutoffIso} AND updated_at >= ${previous[0]?.updated_at ?? ""}
+            AND json_extract(payload_json, '$.settledAt') IS NOT NULL
+        `.pipe(NodeSqliteClient.readOnly);
+        const output = sql`json_extract(payload_json, '$.output')`;
+        const compactable = sql`
+          status IN ${sql.in(SETTLED_ITEM_STATUSES)}
+          AND (
+            (type IN ('command_execution', 'dynamic_tool')
+              AND length(payload_json) > ${COMPACTED_OUTPUT_MIN_CHARS}
+              AND json_type(payload_json, '$.output') = 'text')
+            OR (type = 'reasoning' AND json_extract(payload_json, '$.text') <> '')
+          )
+        `;
+        let compacted = 0;
+        for (const { thread_id: threadId } of threads) {
+          const items: Array<{ readonly turn_item_id: string; readonly size: number }> = [];
+          let cursor: { readonly ordinal: number; readonly id: string } | undefined;
+          for (;;) {
+            const rows = yield* sql<{
+              readonly turn_item_id: string;
+              readonly ordinal: number;
+              readonly size: number;
+            }>`
+              SELECT turn_item_id, ordinal, length(payload_json) AS size
+              FROM orchestration_v2_projection_turn_items
+              WHERE thread_id = ${threadId} AND ${
+                cursor === undefined
+                  ? sql`1`
+                  : sql`(ordinal, turn_item_id) > (${cursor.ordinal}, ${cursor.id})`
+              }
+              ORDER BY ordinal, turn_item_id
+              LIMIT ${PAGE_SIZE}
+            `.pipe(NodeSqliteClient.readOnly);
+            const last = rows.at(-1);
+            if (last !== undefined) {
+              const page = yield* sql<{ readonly turn_item_id: string; readonly size: number }>`
+                SELECT turn_item_id, length(payload_json) AS size
+                FROM orchestration_v2_projection_turn_items
+                WHERE turn_item_id IN ${sql.in(rows.map((row) => row.turn_item_id))} AND ${compactable}
+              `.pipe(NodeSqliteClient.readOnly);
+              items.push(...page);
+              cursor = { ordinal: last.ordinal, id: last.turn_item_id };
+            }
+            yield* betweenPages;
+            if (rows.length < PAGE_SIZE) break;
+          }
+          const pages: Array<Array<string>> = [];
+          let pageBytes = 0;
+          for (const item of items) {
+            const page = pages.at(-1);
+            if (
+              page === undefined ||
+              page.length >= PAGE_SIZE ||
+              pageBytes + item.size > UPDATE_PAGE_BYTES
+            ) {
+              pages.push([item.turn_item_id]);
+              pageBytes = item.size;
+            } else {
+              page.push(item.turn_item_id);
+              pageBytes += item.size;
+            }
+          }
+          for (const ids of pages) {
+            // Rechecks the thread so one that resumed during the pass keeps its items.
+            const updated = yield* sql<{ readonly turn_item_id: string }>`
+              UPDATE orchestration_v2_projection_turn_items
+              SET payload_json = CASE type
+                WHEN 'reasoning' THEN json_set(payload_json, '$.text', '')
+                ELSE json_set(
+                  payload_json,
+                  '$.output',
+                  substr(${output}, 1, ${KEPT_OUTPUT_CHARS})
+                    || ${"\n\n[T3 Code removed "}
+                    || CAST(length(${output}) - ${2 * KEPT_OUTPUT_CHARS} AS INTEGER)
+                    || ${" characters of this output once the thread had been settled for 7 days.]\n\n"}
+                    || substr(${output}, ${-KEPT_OUTPUT_CHARS})
+                )
+              END
+              WHERE turn_item_id IN ${sql.in(ids)}
+                AND ${compactable}
+                AND (type = 'reasoning' OR length(${output}) > ${COMPACTED_OUTPUT_MIN_CHARS})
+                AND EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_threads AS thread
+                  WHERE thread.thread_id = ${threadId} AND thread.updated_at < ${cutoffIso}
+                    AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
+                )
+              RETURNING turn_item_id
+            `;
+            compacted += updated.length;
             yield* Effect.yieldNow;
             yield* betweenPages;
           }
-          yield* betweenPages;
         }
-        yield* writeMetadata(SUPERSEDED_THROUGH, through, now);
-      }
-      yield* writeMetadata(SUPERSEDED_MARK, head, now);
-      return deleted;
-    });
-
-    // Threads untouched for SETTLED_THREAD_AGE keep their transcript, but each long tool output
-    // keeps only its ends and reasoning text is cleared. Clients render both as they are.
-    const compactSettledTurnItems = Effect.fnUntraced(function* (
-      now: DateTime.Utc,
-      betweenPages: Effect.Effect<void>,
-    ) {
-      const cutoff = DateTime.subtractDuration(now, SETTLED_THREAD_AGE);
-      const cutoffIso = DateTime.formatIso(cutoff);
-      const previous = yield* sql<MetadataRow>`
-        SELECT projection_name, last_sequence, updated_at
-        FROM orchestration_v2_projection_metadata
-        WHERE projection_name = ${TURN_ITEMS_COMPACTED_BEFORE}
-      `.pipe(NodeSqliteClient.readOnly);
-      const threads = yield* sql<{ readonly thread_id: string }>`
-        SELECT thread_id FROM orchestration_v2_projection_threads
-        WHERE updated_at < ${cutoffIso} AND updated_at >= ${previous[0]?.updated_at ?? ""}
-      `.pipe(NodeSqliteClient.readOnly);
-      let compacted = 0;
-      for (const { thread_id: threadId } of threads) {
-        const items = yield* sql<{ readonly turn_item_id: string }>`
-          SELECT turn_item_id FROM orchestration_v2_projection_turn_items
-          WHERE thread_id = ${threadId}
-            AND status IN ${sql.in(SETTLED_ITEM_STATUSES)}
-            AND (
-              (type IN ('command_execution', 'dynamic_tool')
-                AND length(payload_json) > ${COMPACTED_OUTPUT_MIN_CHARS})
-              OR (type = 'reasoning' AND json_extract(payload_json, '$.text') <> '')
-            )
-        `.pipe(NodeSqliteClient.readOnly);
-        yield* Effect.yieldNow;
-        for (let start = 0; start < items.length; start += PAGE_SIZE) {
-          const ids = items.slice(start, start + PAGE_SIZE).map((item) => item.turn_item_id);
-          const output = sql`json_extract(payload_json, '$.output')`;
-          // Rechecks the thread so one that resumed during the pass keeps its items.
-          const updated = yield* sql<{ readonly turn_item_id: string }>`
-            UPDATE orchestration_v2_projection_turn_items
-            SET payload_json = CASE type
-              WHEN 'reasoning' THEN json_set(payload_json, '$.text', '')
-              ELSE json_set(
-                payload_json,
-                '$.output',
-                substr(${output}, 1, ${KEPT_OUTPUT_CHARS})
-                  || ${"\n\n[T3 Code removed "}
-                  || CAST(length(${output}) - ${2 * KEPT_OUTPUT_CHARS} AS INTEGER)
-                  || ${" characters of this output after the thread settled.]\n\n"}
-                  || substr(${output}, ${-KEPT_OUTPUT_CHARS})
-              )
-            END
-            WHERE turn_item_id IN ${sql.in(ids)}
-              AND status IN ${sql.in(SETTLED_ITEM_STATUSES)}
-              AND (
-                (type IN ('command_execution', 'dynamic_tool')
-                  AND length(${output}) > ${COMPACTED_OUTPUT_MIN_CHARS})
-                OR (type = 'reasoning' AND json_extract(payload_json, '$.text') <> '')
-              )
-              AND EXISTS (
-                SELECT 1 FROM orchestration_v2_projection_threads AS thread
-                WHERE thread.thread_id = ${threadId} AND thread.updated_at < ${cutoffIso}
-              )
-            RETURNING turn_item_id
-          `;
-          compacted += updated.length;
-          yield* Effect.yieldNow;
-          yield* betweenPages;
-        }
-      }
-      yield* writeMetadata(TURN_ITEMS_COMPACTED_BEFORE, 0, cutoff);
-      return compacted;
-    });
+        yield* writeMetadata(TURN_ITEMS_COMPACTED_BEFORE, 0, cutoff);
+        return compacted;
+      },
+    );
 
     // A pass prunes through the mark the previous pass left once that mark is a day old, so
     // at least RETAINED_EVENT_HISTORY of events always remains. Receipts stay for idempotency.

@@ -77,6 +77,7 @@ export class DatabaseMaintenance extends Context.Service<
         readonly afterBytes: number;
         readonly deletedEventCount: number;
         readonly deletedReceiptCount: number;
+        readonly compactedTurnItemCount: number;
       },
       DatabaseMissingError | DatabaseInUseError | DatabaseCompactError
     >;
@@ -184,6 +185,7 @@ const make = Effect.gen(function* () {
         afterBytes,
         deletedEventCount: result.deletedEventCount,
         deletedReceiptCount: result.deletedReceiptCount,
+        compactedTurnItemCount: result.compactedTurnItemCount,
       };
     },
     (effect, databasePath) =>
