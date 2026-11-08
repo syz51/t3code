@@ -133,8 +133,6 @@ jobs:
         uses: ./.github/actions/setup-ci-deps
         with:
           task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
-        env:
-          pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
 
       - id: release_meta
         name: Resolve release version
@@ -220,14 +218,6 @@ jobs:
             --channel "${{ steps.release_meta.outputs.release_channel }}" \
             --current-tag "${{ steps.release_meta.outputs.tag }}" \
             --github-output
-
-      # Share only the verification results, not the large registry metadata cache.
-      - name: Upload dependency verification
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-dependency-verification
-          path: ${{ runner.temp }}/pnpm-metadata/lockfile-verified.jsonl
 
   quality:
     name: Release quality checks
@@ -534,21 +524,10 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
 
-      # pnpm checks the lockfile and policy before reusing this result. A missing
-      # artifact leaves the cache empty, so installation runs the checks again.
-      - name: Download dependency verification
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: release-dependency-verification
-          path: ${{ runner.temp }}/pnpm-metadata
-
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
           install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
-        env:
-          pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
 
       - name: Download relay client tracing config
         uses: actions/download-artifact@v8
@@ -653,8 +632,8 @@ jobs:
       resource_key: darwin-arm64
       cli_archive: true
       launch_check: true
-      # desktop_mac_x64 saves the shared pnpm store; this job finishes last.
-      save_pnpm_store: false
+      # desktop_mac_x64 saves the shared install cache; this job finishes last.
+      save_install_cache: false
 
   desktop_mac_x64:
     name: Desktop macOS x64
@@ -1059,7 +1038,6 @@ jobs:
           sparse-checkout: |
             /.github/actions/setup-ci-deps/
             /package.json
-            /pnpm-workspace.yaml
           sparse-checkout-cone-mode: false
 
       - name: Setup Node.js
@@ -1467,7 +1445,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if git diff --quiet -- apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json pnpm-lock.yaml; then
+          if git diff --quiet -- apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json bun.lock; then
             echo "No version changes to commit."
             exit 0
           fi
@@ -1475,7 +1453,7 @@ jobs:
           git config user.name "${{ steps.app_bot.outputs.name }}"
           git config user.email "${{ steps.app_bot.outputs.email }}"
 
-          git add apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json pnpm-lock.yaml
+          git add apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json bun.lock
           git commit --no-verify -m "chore(release): prepare $RELEASE_TAG"
           git push origin HEAD:main
 

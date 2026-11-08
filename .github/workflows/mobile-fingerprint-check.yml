@@ -10,8 +10,8 @@ name: Mobile Fingerprint Check
 # signal has to fire before merge, not after.)
 #
 # The check is advisory: it always passes, the label is the signal. Both
-# fingerprints are computed in this one job (same OS, same corepack-pinned
-# pnpm), so the comparison is self-consistent; no EXPO_TOKEN needed.
+# fingerprints are computed in this one job (same OS, same bun), so the
+# comparison is self-consistent; no EXPO_TOKEN needed.
 on:
   pull_request:
     # Run even when a rebase or base change removes every native input from the
@@ -47,7 +47,7 @@ jobs:
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           paths=$(git diff --no-renames --name-only "$base_sha" HEAD -- \
             apps/mobile/ packages/client-runtime/ packages/contracts/ packages/shared/ \
-            assets/ scripts/ patches/ package.json pnpm-lock.yaml pnpm-workspace.yaml \
+            assets/ scripts/ patches/ package.json bun.lock bunfig.toml \
             .github/workflows/mobile-fingerprint-check.yml)
           if [[ -n "$paths" ]]; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -55,6 +55,12 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
             echo "No native fingerprint inputs changed; clearing any stale native change label." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Setup Bun
+        if: steps.changes.outputs.relevant == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
 
       - name: Setup Vite+
         if: steps.changes.outputs.relevant == 'true'
@@ -65,14 +71,6 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.changes.outputs.relevant == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
 
       - name: Fingerprint merge result
         if: steps.changes.outputs.relevant == 'true'
@@ -92,7 +90,7 @@ jobs:
           # Re-sync node_modules to the base commit's lockfile before
           # fingerprinting — a dep-changing PR must not fingerprint the base
           # against head's installed packages.
-          pnpm install --filter=@t3tools/mobile...
+          bun install --frozen-lockfile --filter=@t3tools/mobile...
           cd apps/mobile
           for platform in ios android; do
             npx expo-updates fingerprint:generate --platform "$platform" > "$RUNNER_TEMP/fp/base/$platform.json"

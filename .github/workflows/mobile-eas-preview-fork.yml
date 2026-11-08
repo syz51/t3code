@@ -81,6 +81,13 @@ jobs:
 
       # No caches: pull_request_target saves them under main's scope, where
       # trusted workflows with other secrets would restore what PR code wrote.
+      - name: Setup Bun
+        if: steps.expo-token.outputs.present == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+          no-cache: true
+
       - name: Setup Vite+
         if: steps.expo-token.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@v1
@@ -90,14 +97,6 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.expo-token.outputs.present == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
 
       - name: Setup EAS
         if: steps.expo-token.outputs.present == 'true'

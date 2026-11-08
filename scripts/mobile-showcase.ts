@@ -417,7 +417,7 @@ function printUsage(config: ShowcaseConfig): void {
   NodeProcess.stdout.write(`App screenshot showcase
 
 Usage:
-  pnpm --filter @t3tools/mobile screenshots [options]
+  bun run --filter @t3tools/mobile screenshots [options]
 
 Options:
   --platform ios|android|all  Capture one platform (repeatable)
@@ -737,8 +737,8 @@ export function encodeAndroidPairingUrls(pairingUrls: ReadonlyArray<string>): st
 
 function startMetro(config: ShowcaseConfig): NodeChildProcess.ChildProcess {
   return spawnProcess(
-    "pnpm",
-    ["exec", "expo", "start", "--dev-client", "--port", String(config.metroPort)],
+    "bun",
+    ["x", "expo", "start", "--dev-client", "--port", String(config.metroPort)],
     {
       cwd: MOBILE_ROOT,
       env: {
@@ -760,7 +760,7 @@ async function warmMetroBundle(
 
 async function buildIos(): Promise<string> {
   const derivedData = NodePath.join(MOBILE_ROOT, ".showcase/ios-derived-data");
-  await runCommand("pnpm", ["exec", "expo", "prebuild", "--clean", "--platform", "ios"], {
+  await runCommand("bun", ["x", "expo", "prebuild", "--clean", "--platform", "ios"], {
     cwd: MOBILE_ROOT,
     env: MOBILE_BUILD_ENV,
   });
@@ -788,7 +788,7 @@ async function buildIos(): Promise<string> {
 }
 
 async function buildAndroid(abis: ReadonlyArray<string>): Promise<string> {
-  await runCommand("pnpm", ["exec", "expo", "prebuild", "--clean", "--platform", "android"], {
+  await runCommand("bun", ["x", "expo", "prebuild", "--clean", "--platform", "android"], {
     cwd: MOBILE_ROOT,
     env: MOBILE_BUILD_ENV,
   });

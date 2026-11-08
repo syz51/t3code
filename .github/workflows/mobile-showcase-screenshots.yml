@@ -58,6 +58,11 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
         with:
@@ -68,13 +73,6 @@ jobs:
               - --filter=@t3tools/mobile...
               - --filter=@t3tools/scripts...
               - --filter=t3...
-
-      - name: Expose pnpm
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
 
       - name: Install AXe
         # Locks the simulator and answers the notification prompt for the
@@ -91,10 +89,10 @@ jobs:
         run: npm install --global agent-device@0.21.25
 
       - name: Capture iOS showcase
-        run: pnpm screenshots:mobile --platform ios --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}"
+        run: bun run screenshots:mobile --platform ios --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}"
 
       - name: Validate App Store Connect assets
-        run: pnpm screenshots:mobile --platform ios --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}" --validate-only
+        run: bun run screenshots:mobile --platform ios --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}" --validate-only
 
       - name: Upload iOS screenshots
         if: always()
@@ -123,6 +121,11 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
         with:
@@ -133,13 +136,6 @@ jobs:
               - --filter=@t3tools/mobile...
               - --filter=@t3tools/scripts...
               - --filter=t3...
-
-      - name: Expose pnpm
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -168,10 +164,10 @@ jobs:
           cores: 8
           ram-size: 4096M
           disable-animations: false
-          script: pnpm screenshots:mobile --platform android --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}"
+          script: bun run screenshots:mobile --platform android --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}"
 
       - name: Validate Google Play assets
-        run: pnpm screenshots:mobile --platform android --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}" --validate-only
+        run: bun run screenshots:mobile --platform android --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}" --validate-only
 
       - name: Upload Android screenshots
         if: always()

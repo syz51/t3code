@@ -54,14 +54,8 @@ const MOBILE_NATIVE =
 const OWN_TEST_JOB = new Set(["t3", "@t3tools/web", "@t3tools/monorepo"]);
 
 function readWorkspace() {
-  const patterns = [];
-  let inPackages = false;
-  for (const line of fs.readFileSync(path.join(root, "pnpm-workspace.yaml"), "utf8").split("\n")) {
-    if (/^\S/.test(line)) inPackages = line.startsWith("packages:");
-    const entry = inPackages && line.match(/^\s+-\s+["']?([^"'\s]+)/);
-    if (entry) patterns.push(entry[1]);
-  }
-
+  const { workspaces } = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const patterns = Array.isArray(workspaces) ? workspaces : workspaces.packages;
   const dirs = patterns.flatMap((pattern) => {
     if (!pattern.endsWith("/*")) return [pattern];
     const parent = pattern.slice(0, -2);

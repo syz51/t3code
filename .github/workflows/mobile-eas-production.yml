@@ -2,9 +2,10 @@ name: Mobile EAS Production
 
 # Production builds and OTA updates run from CI (Linux) — never from a laptop.
 # Under the fingerprint runtime-version policy the fingerprint must be computed
-# in the same OS/pnpm as the EAS build; a macOS `eas build` computes a different
-# fingerprint (platform-specific deps + pnpm version) and errors. On this Linux
-# runner, with corepack pinning pnpm 10.24 in eas.json, local == build.
+# in the same OS/bun as the EAS build; a macOS `eas build` computes a different
+# fingerprint (platform-specific deps + bun version) and errors. On this Linux
+# runner, with eas.json pinning the same bun as package.json packageManager,
+# local == build.
 #
 # Every merge reconciles native fingerprints and publishes matching OTAs.
 # iOS prereleases use the testflight profile (3.0.0); App Store binaries use
@@ -61,8 +62,9 @@ on:
       - assets/**
       - scripts/**
       - patches/**
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
+      - package.json
+      - bun.lock
+      - bunfig.toml
       - .github/workflows/mobile-eas-production.yml
 
 # Serialize runs so OTAs publish in merge order. GitHub keeps at most one
@@ -126,6 +128,12 @@ jobs:
           # `git clone --depth 1 file://<workspace>`, which fails (exit 128)
           # when the partial clone can't serve the unfetched blobs.
 
+      - name: Setup Bun
+        if: steps.expo-token.outputs.present == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
       - name: Setup Vite+
         if: steps.expo-token.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@v1
@@ -135,14 +143,6 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.expo-token.outputs.present == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
 
       - name: Setup EAS
         if: steps.expo-token.outputs.present == 'true'

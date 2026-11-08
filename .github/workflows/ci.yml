@@ -42,7 +42,7 @@ jobs:
         with:
           fetch-depth: 2
           sparse-checkout: |
-            /pnpm-workspace.yaml
+            /package.json
             /.github/scripts/ci-changes.cjs
             /.github/actions/ci-changes/
             /*/package.json
@@ -94,7 +94,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         id: electron
@@ -284,7 +284,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
