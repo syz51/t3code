@@ -60,11 +60,12 @@ It reads `~/.t3/userdata/statev2.sqlite` read-only and writes a pruned copy (5 r
 `--threads-per-project` for more data. Stop the fork server first; the command rewrites the copy.
 
 For work that needs the whole database, such as measuring its size, take a full read-only
-backup into a separate directory instead:
+copy into a separate directory instead. `.backup` restarts on every write by the running app
+and may never finish; `VACUUM INTO` copies one consistent snapshot (about 2 minutes for 4.4 GB):
 
 ```sh
 mkdir -p ~/.t3-fork-full/userdata
-sqlite3 -readonly ~/.t3/userdata/statev2.sqlite ".backup '$HOME/.t3-fork-full/userdata/statev2.sqlite'"
+sqlite3 "file:$HOME/.t3/userdata/statev2.sqlite?mode=ro" "VACUUM INTO '$HOME/.t3-fork-full/userdata/statev2.sqlite'"
 ```
 
 ## Run
@@ -76,3 +77,38 @@ vp run start serve --base-dir ~/.t3-fork --port 3799
 
 It prints a pairing URL for `http://localhost:3799`. Open it in a browser that is not paired
 with the installed app. Stop the server with Ctrl+C.
+
+## Desktop app
+
+```sh
+vp run dist:desktop:artifact --platform mac --target dir --arch arm64 --output-dir ~/.t3-fork/build
+```
+
+It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
+about a minute. Do not open it while Nightly runs. As built, it has the same identity as Nightly:
+
+|               | Fork build                                | Nightly                          |
+| ------------- | ----------------------------------------- | -------------------------------- |
+| Name          | T3 Code (Beta), 0.1.7                     | T3 Code (Nightly), 0.1.8-nightly |
+| Bundle id     | `com.t3tools.t3code`                      | `com.t3tools.t3code`             |
+| Signature     | ad-hoc                                    | Developer ID, team ARK85ZXQ4Z    |
+| URL schemes   | `t3code`, `t3code-dev`, `http`, `https`   | same                             |
+| Update feed   | none (no `app-update.yml`)                | T3's nightly channel             |
+| State         | `~/.t3` unless `T3CODE_HOME` is set       | `~/.t3`                          |
+| Electron data | `~/Library/Application Support/t3code-v2` | same                             |
+
+The single-instance lock lives in the Electron data folder, so a second app with this identity
+quits or hands off to the one already running.
+
+There are two ways to use a fork build daily:
+
+- **Replace Nightly.** Quit Nightly and copy the fork app into `/Applications`. It keeps the
+  same `~/.t3` state. Nightly updates stop, so update by syncing `fork`, rebuilding and copying
+  the app again. The new signature makes macOS ask again for privacy permissions and keychain
+  access. To roll back, quit the fork app and reinstall Nightly from T3's download page. A fork
+  build that ran newer migrations can leave `~/.t3` ahead of Nightly, so copy
+  `statev2.sqlite` with the `VACUUM INTO` command above before switching.
+- **Run beside Nightly.** This needs fork patches to the bundle id (`DESKTOP_APP_ID` in
+  `scripts/build-desktop-artifact.ts`), the Electron data folder (`DesktopUserData.ts`), the URL
+  schemes and the default state folder (`DesktopStatePaths.ts`). Updates are rebuilds as above.
+  Rollback is deleting the fork app and its state folder.
