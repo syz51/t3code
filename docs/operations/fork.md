@@ -28,6 +28,34 @@ When the rebase conflicts, run `git rebase --abort` and leave `fork` as it was. 
 that names the conflicting patch, its files and the upstream commit it conflicts with. When a
 check fails, file a task with the failing check and its output, and do not push.
 
+## State retention
+
+The fork adds two rules to the 6-hourly history compaction in
+[ProjectionMaintenance](../../apps/server/src/orchestration-v2/ProjectionMaintenance.ts). `t3 doctor`
+runs the same pass. Measured on a full copy of a 4.46 GB database from 2026-11-08, the two
+rules made the file 204 MB (4.6%) smaller.
+Most of the effect is that older history stops growing.
+
+| Table                                    | Size then        | Readers                                               | Fork rule                                              |
+| ---------------------------------------- | ---------------- | ----------------------------------------------------- | ------------------------------------------------------ |
+| `orchestration_events`                   | 1.4 GB, 1-2 days | reconnect replay, command-id retries, prompt anchors  | drop superseded `turn-item.updated` and `node.updated` |
+| `orchestration_v2_projection_turn_items` | 1.4 GB           | thread views, `getTurnItem`, thread find, MCP context | trim items of threads unchanged for 7 days             |
+| `orchestration_v2_projection_nodes`      | 0.5 GB           | thread views, recovery                                | none                                                   |
+
+- **Superseded updates.** Both event types carry the whole entity, so a newer one replaces an
+  older one. Each entity keeps its first update, because clients append an entity where they
+  first see it. It also keeps its newest update and any prompt anchor that a later row borrows.
+  The pass drops only rows older than the previous pass's mark, which is at least an hour old,
+  so recent command-id retries still replay. Provider-turn updates stay, because later ones
+  inherit `tokenUsage` (upstream PR #22548 handles them).
+- **Settled threads.** For a thread unchanged for 7 days, each finished command or tool output
+  longer than 17 KB keeps its first and last 8 KB, with a note saying how much was removed.
+  Reasoning text becomes empty and shows as a "Thinking" row. Messages, diffs and checkpoints
+  stay. Removed output cannot be recovered.
+
+Related upstream work: issue #28903 (retention for events and turn items), PR #29806 (one-day
+event window) and PR #22548 (provider-turn updates).
+
 ## Prerequisites
 
 - `vp`, installed as the [root README](../../README.md#install-vp) says. With

@@ -272,10 +272,13 @@ it.effect("prunes events the projections cover once the retained day has passed"
     const highWater = yield* eventStore.latestSequence();
     const projection = yield* projections.getThreadProjection(threadId);
 
+    // Before the day passes, only the command's middle updates go; its first and newest stay.
     yield* TestClock.adjust("23 hours");
-    assert.equal((yield* maintenance.pruneEventStore()).deletedEventCount, 0);
+    assert.equal((yield* maintenance.pruneEventStore()).deletedEventCount, 2);
+    assert.notInclude(yield* remainingEventIds(threadId), "event:turn-item-compaction:command:1");
+    assert.include(yield* remainingEventIds(threadId), "event:turn-item-compaction:command:0");
     yield* TestClock.adjust("1 hour");
-    assert.equal((yield* maintenance.pruneEventStore()).deletedEventCount, 4);
+    assert.equal((yield* maintenance.pruneEventStore()).deletedEventCount, 2);
 
     assert.deepEqual(yield* remainingEventIds(threadId), [
       "event:turn-item-compaction:thread",
@@ -299,6 +302,87 @@ it.effect("prunes events the projections cover once the retained day has passed"
       ),
       ["Review prompt A. ".repeat(40)],
     );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+function commandEvent(
+  threadId: ThreadId,
+  now: DateTime.Utc,
+  key: string,
+  status: "running" | "completed",
+  output: string,
+): OrchestrationV2DomainEvent {
+  return {
+    id: EventId.make(`event:settled:${threadId}:${key}`),
+    type: "turn-item.updated",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: TurnItemId.make(`turn-item:settled:${threadId}:${key}`),
+      threadId,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 100,
+      status,
+      title: key,
+      startedAt: now,
+      completedAt: status === "completed" ? now : null,
+      updatedAt: now,
+      type: "command_execution",
+      input: `run ${key}`,
+      output,
+    },
+  };
+}
+
+it.effect("trims tool output and clears reasoning of threads settled for seven days", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const output = "head:" + "x".repeat(40_000) + ":tail";
+    const settledId = ThreadId.make("thread:settled");
+    const createdAt = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        { ...threadCreated(makeThread(settledId, createdAt), createdAt), id: EventId.make("e:s") },
+        commandEvent(settledId, createdAt, "done", "completed", output),
+        commandEvent(settledId, createdAt, "stuck", "running", output),
+        itemEvent(settledId, createdAt, itemSpecs[1], 69),
+      ],
+    });
+    yield* TestClock.adjust("6 days");
+    const recentId = ThreadId.make("thread:recent");
+    const recentAt = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        { ...threadCreated(makeThread(recentId, recentAt), recentAt), id: EventId.make("e:r") },
+        commandEvent(recentId, recentAt, "done", "completed", output),
+      ],
+    });
+    const recent = yield* projections.getThreadProjection(recentId);
+    yield* TestClock.adjust("25 hours");
+
+    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 2);
+    const items = (yield* projections.getThreadProjection(settledId)).turnItems;
+    const outputOf = (key: string) => {
+      const item = items.find((entry) => entry.id.endsWith(`:${key}`));
+      return item?.type === "command_execution" ? item.output : undefined;
+    };
+    const trimmed = outputOf("done") ?? "";
+    assert.isTrue(trimmed.startsWith("head:" + "x".repeat(8187)));
+    assert.isTrue(trimmed.endsWith("x".repeat(8187) + ":tail"));
+    assert.include(trimmed, "removed 23626 characters");
+    assert.equal(outputOf("stuck"), output);
+    const reasoning = items.find((item) => item.type === "reasoning");
+    assert.equal(reasoning?.type === "reasoning" ? reasoning.text : null, "");
+    assert.deepEqual(yield* projections.getThreadProjection(recentId), recent);
+
+    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 0);
   }).pipe(Effect.provide(layerTest)),
 );
 
