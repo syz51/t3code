@@ -3,6 +3,31 @@
 This fork (`syz51/t3code`) is tested next to the installed T3 Code app. The installed app owns
 `~/.t3` and port 3773. Fork runs use `~/.t3-fork` and port 3799, so they never touch either.
 
+## Branches
+
+- `main` mirrors `upstream/main` (`pingdotgg/t3code`). It never carries fork commits, so it
+  only fast-forwards.
+- `fork` is `upstream/main` plus the fork's patches. Keep them few and small, and keep
+  fork-only material in fork-only files such as this one, so rebases stay clean.
+- Patch work branches start from `fork`. A patch meant for upstream starts from `main` instead,
+  and lands on `fork` once upstream merges it, or as a cherry-pick until then.
+
+## Sync with upstream
+
+```sh
+git fetch upstream main
+git push origin upstream/main:main
+git switch fork
+git rebase upstream/main
+vp i
+vp run check:changed upstream/main
+git push --force-with-lease=fork:<old fork sha> origin fork
+```
+
+When the rebase conflicts, run `git rebase --abort` and leave `fork` as it was. File a board task
+that names the conflicting patch, its files and the upstream commit it conflicts with. When a
+check fails, file a task with the failing check and its output, and do not push.
+
 ## Prerequisites
 
 - `vp`, installed as the [root README](../../README.md#install-vp) says. With
