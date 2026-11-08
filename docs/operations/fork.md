@@ -9,6 +9,7 @@ This fork (`syz51/t3code`) is tested next to the installed T3 Code app. The inst
   only fast-forwards.
 - `fork` is `upstream/main` plus the fork's patches. Keep them few and small, and keep
   fork-only material in fork-only files such as this one, so rebases stay clean.
+- `fork` installs with bun instead of upstream's pnpm. See [Package manager](#package-manager).
 - Patch work branches start from `fork`. A patch meant for upstream starts from `main` instead,
   and lands on `fork` once upstream merges it, or as a cherry-pick until then.
 
@@ -19,12 +20,42 @@ git fetch upstream main
 git push origin upstream/main:main
 git switch fork
 git rebase upstream/main
-vp i
-vp run check:changed upstream/main
+bun install --frozen-lockfile
+bun run typecheck:bun
 git push --force-with-lease=fork:<old fork sha> origin fork
 ```
 
-When the rebase conflicts, run `git rebase --abort` and leave `fork` as it was. File a board task
+`typecheck:bun` typechecks every package without Vite+. It is the only check here: the fork's CI
+does not run, and lint, format, knip and tests still need Vite+ (see
+[Package manager](#package-manager)). Where Vite+ is installed, also run
+`vp run check:changed upstream/main` before pushing.
+
+The bun conversion is four commits, from "build: switch the fork's package manager from pnpm to
+bun" to "docs(fork): sync upstream with bun …". They edit upstream files, so they conflict
+whenever upstream changes those files.
+
+The first commit conflicts whenever upstream changes `package.json`, `pnpm-lock.yaml` or
+`pnpm-workspace.yaml`. Never merge `bun.lock`, `bunfig.toml` or the converted `package.json` by
+hand. Regenerate them from upstream's files:
+
+```sh
+git checkout upstream/main -- package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs
+bun scripts/fork-convert-to-bun.ts
+git add -A package.json bun.lock bunfig.toml pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs
+git rebase --continue
+```
+
+The script migrates upstream's lockfile and workspace into `package.json` and `bun.lock`,
+writes `bunfig.toml`, formats `package.json` as `vp fmt` does, and deletes the pnpm files. It
+fails when bun still warns, for example about a patch that no longer applies to a new version.
+Fix that in `package.json` and run `bun install`.
+
+The other three commits conflict when upstream edits a workflow, script or doc they change. Keep
+upstream's change and redo the commit's edit in it: `bun install` for pnpm installs, `bun.lock`
+for `pnpm-lock.yaml`, and `package.json` for `pnpm-workspace.yaml`. `apps/mobile/eas.json` pins
+the same bun version as `packageManager`; update both together.
+
+When the rebase conflicts in any other patch, run `git rebase --abort` and leave `fork` as it was. File a board task
 that names the conflicting patch, its files and the upstream commit it conflicts with. When a
 check fails, file a task with the failing check and its output, and do not push.
 
@@ -56,19 +87,47 @@ runs the same pass. They stop older history from growing; they do not make the f
 Related upstream work: issue #28903 (retention for events and turn items), PR #29806 (one-day
 event window) and PR #22548 (provider-turn updates).
 
+## Package manager
+
+`fork` uses bun 1.4 (`packageManager` in `package.json`). `bun install` reads the workspaces,
+catalog, overrides, patches and package extensions from `package.json`, and `bunfig.toml` holds the
+install settings. pnpm features with no direct bun equivalent:
+
+| pnpm setting                                     | On `fork`                                                              |
+| ------------------------------------------------ | ---------------------------------------------------------------------- |
+| `allowBuilds`                                    | `trustedDependencies`: only the `true` entries may run install scripts |
+| `"-"` overrides (drop a dependency)              | Dropped; the next re-resolve of their parents installs them            |
+| `catalog:` in `packageExtensions`                | Replaced with the catalog version                                      |
+| `patchedDependencies` on a `file:` tarball       | Keyed by the tarball path, as bun requires                             |
+| `publicHoistPattern`, `minimumReleaseAgeExclude` | In `bunfig.toml`; bun exempts every version of an excluded package     |
+| `.pnpmfile.cjs` (WSL architectures on Windows)   | Dropped; on Windows with WSL, pass bun's `--os` and `--cpu` flags      |
+| `strictPeerDependencies`, `peerDependencyRules`  | Dropped; bun does not fail on unmet peers                              |
+| `permissions` (skills that dependencies ship)    | Dropped; bun does not link them                                        |
+
+Still on upstream's tooling, so not usable where pnpm and Vite+ are not installed:
+
+- Vite+ (`vp`) still runs lint, format, tests, builds, the dev runner and CI. Only install and
+  `typecheck:bun` run without it. `bun install` skips upstream's `prepare` script, which
+  calls Vite+, so it does not install the git hooks.
+- The release scripts (`scripts/build-desktop-artifact.ts`, `scripts/build-cli-archive.ts`,
+  `scripts/release-smoke.ts`) still read `pnpm-workspace.yaml` and stage installs for pnpm, so
+  the desktop and CLI builds below do not work yet.
+- The dev container and `apps/mobile/deps/README.md` still name pnpm.
+
 ## Prerequisites
 
-- `vp`, installed as the [root README](../../README.md#install-vp) says. With
-  `VP_NODE_MANAGER=no`, `vp` uses the `node` on `PATH`.
-- Node 26.12.1 (`engines.node`). With fnm: `fnm install 26.12.1`, then prefix each command
+- Bun 1.4 or newer.
+- Node 26.12.1 (`engines.node`), which runs the app. With fnm: `fnm install 26.12.1`, then prefix each command
   below with `fnm exec --using=26.12.1`.
+- `vp` for the build, run and desktop steps below, installed as the
+  [root README](../../README.md#install-vp) says.
 
 ## Build
 
 From the repository root of a clean clone:
 
 ```sh
-vp i
+bun install
 vp run --filter @t3tools/web build
 vp run --filter t3 build:bundle
 ```
