@@ -127,8 +127,13 @@ install settings. pnpm features with no direct bun equivalent:
 Still on upstream's tooling, so not usable where pnpm and Vite+ are not installed:
 
 - Vite+ (`vp`) still runs lint, format, tests, builds, the dev runner and CI. Only install and
-  `typecheck:bun` run without it. `bun install` skips upstream's `prepare` script, which
-  calls Vite+, so it does not install the git hooks.
+  `typecheck:bun` run without it. `fork-convert-to-bun.ts` deletes upstream's `prepare` script
+  (`vp config --no-agent`), so no install sets up the git hooks. Run `vp config --no-agent`
+  once in the main checkout; worktrees share its `core.hooksPath`.
+- Tests, knip and the dev runner need Node, not bun's runtime. Bun has no `node:sea`, which the
+  server imports, and it treats `undici` as built in, so knip reports `undici` unused. Where
+  `BUN_OPTIONS=--bun` is set, `bun run` swaps Node for bun; use `vp run <script>` or
+  `BUN_OPTIONS= bun run <script>`.
 - `scripts/build-cli-archive.ts` and `scripts/release-smoke.ts` still stage installs for pnpm,
   so the CLI archive and release smoke test do not work yet. The desktop build below stages
   with bun.
