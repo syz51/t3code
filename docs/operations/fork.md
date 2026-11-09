@@ -129,9 +129,9 @@ Still on upstream's tooling, so not usable where pnpm and Vite+ are not installe
 - Vite+ (`vp`) still runs lint, format, tests, builds, the dev runner and CI. Only install and
   `typecheck:bun` run without it. `bun install` skips upstream's `prepare` script, which
   calls Vite+, so it does not install the git hooks.
-- The release scripts (`scripts/build-desktop-artifact.ts`, `scripts/build-cli-archive.ts`,
-  `scripts/release-smoke.ts`) still read `pnpm-workspace.yaml` and stage installs for pnpm, so
-  the desktop and CLI builds below do not work yet.
+- `scripts/build-cli-archive.ts` and `scripts/release-smoke.ts` still stage installs for pnpm,
+  so the CLI archive and release smoke test do not work yet. The desktop build below stages
+  with bun.
 - The dev container and `apps/mobile/deps/README.md` still name pnpm.
 
 ## Prerequisites
@@ -193,7 +193,19 @@ T3CODE_DESKTOP_VERSION=0.1.8-fork.$(date +%Y%m%d) \
 ```
 
 It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
-about a minute. Do not open it while Nightly runs.
+about a minute. Do not open it from Finder while Nightly runs. To try it beside Nightly, give it
+its own home folder, so it uses its own Electron data folder, single-instance lock and state:
+
+```sh
+mkdir -p /tmp/t3-fork-home
+HOME=/tmp/t3-fork-home T3CODE_HOME=/tmp/t3-fork-home/.t3 T3CODE_PORT=3799 \
+  ~/.t3-fork/build/mac-arm64/T3\ Code\ \(Beta\).app/Contents/MacOS/T3\ Code\ \(Beta\) &
+fork_pid=$!
+```
+
+Quit it with `kill $fork_pid`. Afterwards, run
+`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u ~/.t3-fork/build/mac-arm64/T3\ Code\ \(Beta\).app`
+so `t3code://` links keep opening Nightly.
 
 `T3CODE_DESKTOP_VERSION` is `<core>-fork.<YYYYMMDD>`, where `<core>` is the core of the newest
 upstream nightly tag (`git tag -l 'v*-nightly*' --sort=-creatordate | head -1`). Clients compare
@@ -223,15 +235,42 @@ quits or hands off to the one already running.
 
 There are two ways to use a fork build daily:
 
-- **Replace Nightly.** Quit Nightly and copy the fork app into `/Applications`. It keeps the
-  same `~/.t3` state. Nightly updates stop, so update by syncing `fork`, rebuilding and copying
-  the app again. The new signature makes macOS ask again for privacy permissions and keychain
-  access. Keep the Nightly app (move it out of `/Applications`) and roll back by quitting the
-  fork app and moving Nightly back. If the fork app fails to start, its recovery page offers to
-  download its own version from upstream releases; no such release exists, so use the kept
-  Nightly instead. A fork build that ran newer migrations can leave `~/.t3` ahead of Nightly, so
-  copy `statev2.sqlite` with the `VACUUM INTO` command above before switching.
+- **Replace Nightly.** Keep the same `~/.t3` state and update by syncing `fork`, rebuilding and
+  swapping again. See [Switch to the fork build](#switch-to-the-fork-build).
 - **Run beside Nightly.** This needs fork patches to the bundle id (`DESKTOP_APP_ID` in
   `scripts/build-desktop-artifact.ts`), the Electron data folder (`DesktopUserData.ts`), the URL
   schemes and the default state folder (`DesktopStatePaths.ts`). Updates are rebuilds as above.
   Rollback is deleting the fork app and its state folder.
+
+## Switch to the fork build
+
+`scripts/fork-app-swap.sh` replaces Nightly with a fork build, and `scripts/fork-app-rollback.sh`
+undoes it. Quitting Nightly ends every running agent thread, so only run them by hand, never from
+an agent inside Nightly.
+
+1. Build the app as in [Desktop app](#desktop-app).
+2. Run `scripts/fork-app-swap.sh --dry-run`. It runs while Nightly is open and lists what the swap
+   would do or refuse.
+3. Quit Nightly (T3 Code > Quit).
+4. Run `scripts/fork-app-swap.sh`. It refuses while Nightly runs or anything holds
+   `statev2.sqlite` open. It backs up `statev2.sqlite` with `VACUUM INTO` to
+   `~/.t3-swap-backup/<time>/`, moves Nightly there, and copies the fork app into `/Applications`.
+5. Open `/Applications/T3 Code (Beta).app`. The new signature makes macOS ask again for privacy
+   permissions and keychain access.
+
+To update, quit the fork app, rebuild, and replace `/Applications/T3 Code (Beta).app` with the new
+build.
+
+To roll back:
+
+1. Quit the fork app.
+2. Run `scripts/fork-app-rollback.sh --dry-run`, then `scripts/fork-app-rollback.sh`. It moves the
+   fork app into the backup folder and moves Nightly back.
+3. Open Nightly. Its updater brings it up to date.
+
+The rollback restores the database backup only when the fork ran newer migrations than the backup
+holds, because Nightly cannot read a database migrated past it. It keeps the fork's database
+beside the backup as `statev2.fork.sqlite`. Otherwise it keeps the current database, with the work
+done on the fork. Pass `--restore-db` to restore the backup anyway, or a backup folder to roll back
+to an older swap. If the fork app fails to start, its recovery page offers to download its own
+version from upstream releases. No such release exists, so roll back instead.
