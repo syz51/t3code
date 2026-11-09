@@ -162,13 +162,17 @@ const recordSpans = () => {
   return { tracer, spans, order };
 };
 
-const callTool = (name: string, args: Record<string, unknown>) =>
+const callTool = (
+  name: string,
+  args: Record<string, unknown>,
+  scope: McpInvocationContext.McpInvocationScope = invocation,
+) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     return yield* server
       .callTool({ name, arguments: args })
       .pipe(
-        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
   });
@@ -271,6 +275,12 @@ const layerRecordingTools = (calls: Array<unknown>) => {
     OrchestratorToolkit.tools.t3_thread_read,
     OrchestratorToolkit.tools.t3_thread_wait,
     ProjectToolkit.tools.t3_project_update,
+    // The real parameters without the launch services, which the recording handler never uses.
+    Tool.make("t3_thread_launch", {
+      parameters: ProjectToolkit.tools.t3_thread_launch.parametersSchema,
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
   );
   const record = McpToolAccess.reads((params: unknown) =>
     Effect.sync(() => calls.push(params)).pipe(
@@ -286,6 +296,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_thread_read: record,
       t3_thread_wait: record,
       t3_project_update: record,
+      t3_thread_launch: record,
     }),
   ).pipe(
     Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
@@ -592,6 +603,46 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
+
+it.effect("rejects keys a tool does not declare and names them", () => {
+  const calls: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const launch = yield* callTool("t3_thread_launch", { title: "Fix", prompt: "Do it" }).pipe(
+      Effect.flip,
+    );
+    expect(String(launch)).toContain('Expected no excess property\n  at ["prompt"]');
+    const nested = yield* callTool("delegate_task", {
+      task: "Inspect",
+      target: { model: null, isolation: "worktree" },
+    }).pipe(Effect.flip);
+    expect(String(nested)).toContain('at ["target"]["isolation"]');
+    expect(calls).toEqual([]);
+
+    yield* callTool("t3_thread_launch", { title: "Fix", message: "Do it" });
+    // A linked environment checked the call against its own, possibly newer, schema.
+    const linked = { sessionId: "peer", label: "laptop", access: "auto" as const, linked: true };
+    yield* callTool(
+      "t3_thread_launch",
+      { title: "Fix", message: "Do it", addedLater: true },
+      { ...invocation, client: linked },
+    );
+    expect(calls).toEqual([
+      { title: "Fix", message: "Do it" },
+      { title: "Fix", message: "Do it" },
+    ]);
+  }).pipe(Effect.provide(layerRecordingTools(calls)));
+});
+
+it.effect("rejects keys an image tool does not declare", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const inputs = yield* serveSnapshots("mcp-snapshot-keys-client", {});
+      const snapshot = yield* callTool("preview_snapshot", { tabID: "tab-1" }).pipe(Effect.flip);
+      expect(String(snapshot)).toContain('at ["tabID"]');
+      expect(inputs).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layerTest)),
+);
 
 it.effect(
   "clamps t3_thread_read page sizes above their maximum instead of rejecting the call",
