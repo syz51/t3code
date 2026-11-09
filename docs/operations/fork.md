@@ -20,13 +20,17 @@ git fetch upstream main
 git push origin upstream/main:main
 git switch fork
 git rebase upstream/main
+bun scripts/fork-ci-runners.ts
 bun install --frozen-lockfile
 bun run typecheck:bun
 git push --force-with-lease=fork:<old fork sha> origin fork
 ```
 
-`typecheck:bun` typechecks every package without Vite+. It is the only check here: the fork's CI
-does not run, and lint, format, knip and tests still need Vite+ (see
+`fork-ci-runners.ts` maps runners in workflows that upstream added since the last sync. When it
+changes files, commit them as `ci(fork): run new workflows on GitHub-hosted runners`.
+
+`typecheck:bun` typechecks every package without Vite+. It is the only check here: CI runs on PRs
+to `fork`, not on this push, and lint, format, knip and tests still need Vite+ (see
 [Package manager](#package-manager)). Where Vite+ is installed, also run
 `vp run check:changed upstream/main` before pushing.
 
@@ -54,6 +58,22 @@ The other three commits conflict when upstream edits a workflow, script or doc t
 upstream's change and redo the commit's edit in it: `bun install` for pnpm installs, `bun.lock`
 for `pnpm-lock.yaml`, and `package.json` for `pnpm-workspace.yaml`. `apps/mobile/eas.json` pins
 the same bun version as `packageManager`; update both together.
+
+The commit "ci(fork): run upstream's workflows on GitHub-hosted runners" maps upstream's
+Blacksmith runner labels, which the fork has no installation for, to GitHub-hosted runners. It
+also makes Agent Context Budget compare with the PR's base branch, because `fork` lags `main`
+until the sync. It conflicts when upstream edits a `runs-on` line or that budget fetch. Keep the
+rebased file and rerun the script:
+
+```sh
+git checkout --ours -- <conflicting workflow files>
+bun scripts/fork-ci-runners.ts
+git add .github/workflows
+git rebase --continue
+```
+
+The script fails when a label names an OS it has no runner for, or when upstream changed the
+budget fetch. Add the runner to `hostedRunners` or redo the edit by hand.
 
 When the rebase conflicts in any other patch, run `git rebase --abort` and leave `fork` as it was. File a board task
 that names the conflicting patch, its files and the upstream commit it conflicts with. When a
