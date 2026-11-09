@@ -44,7 +44,7 @@ running_from() { ps -axo command= | grep -F "$1/Contents/" | grep -v grep || tru
 refuse() {
   if [[ $dry_run -eq 1 ]]; then echo "The real rollback would stop here: $*"; else fail "$*"; fi
 }
-last_migration() { sqlite3 "file:$1?mode=ro" "SELECT coalesce(max(migration_id), 0) FROM effect_sql_migrations"; }
+last_migration() { sqlite3 "file:$1?mode=ro&immutable=1" "SELECT coalesce(max(migration_id), 0) FROM effect_sql_migrations"; }
 
 [[ -f "$backup_dir/swap.env" ]] || fail "$backup_dir has no swap.env; pass the backup folder the swap printed"
 fork_app_name="$(sed -n 's/^fork_app=//p' "$backup_dir/swap.env")"

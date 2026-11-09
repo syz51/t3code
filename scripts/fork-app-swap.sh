@@ -72,9 +72,10 @@ free_kib="$(df -k "$df_dir" | awk 'NR == 2 { print $4 }')"
 
 run mkdir -p "$backup_dir"
 backup_db="$backup_dir/statev2.sqlite"
-echo "+ sqlite3 'file:$state_db?mode=ro' \"VACUUM INTO '$backup_db'\""
+echo "+ sqlite3 'file:$state_db?mode=ro&immutable=1' \"VACUUM INTO '$backup_db'\""
 if [[ $dry_run -eq 0 ]]; then
-  sqlite3 "file:$state_db?mode=ro" "VACUUM INTO '${backup_db//\'/\'\'}'"
+  # WAL database with no -shm once the app quits: a plain mode=ro open fails, and nothing holds it now.
+  sqlite3 "file:$state_db?mode=ro&immutable=1" "VACUUM INTO '${backup_db//\'/\'\'}'"
   [[ "$(sqlite3 "file:$backup_db?mode=ro" "PRAGMA quick_check")" == "ok" ]] ||
     fail "the database backup failed its quick_check; nothing else changed"
   printf 'nightly_version=%s\nfork_version=%s\nfork_app=%s\n' \
