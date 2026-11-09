@@ -557,14 +557,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         overrides: {},
         bunfigPath: "/repo/bunfig.toml",
       }).args;
-    const prefix = [
-      "install",
-      "--production",
-      "--config",
-      "/repo/bunfig.toml",
-      "--linker",
-      "hoisted",
-    ];
+    const prefix = ["install", "--production", "--config=/repo/bunfig.toml", "--linker", "hoisted"];
     assert.deepStrictEqual(stage("mac", "arm64"), [...prefix, "--os", "darwin", "--cpu", "arm64"]);
     assert.deepStrictEqual(stage("mac", "universal"), [...prefix, "--os", "darwin", "--cpu", "*"]);
     assert.deepStrictEqual(stage("linux", "arm64"), [

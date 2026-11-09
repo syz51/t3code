@@ -1611,11 +1611,11 @@ export function createStageBunInstall(input: {
     },
     // electron-builder and server.asar need physical packages, not links into bun's store.
     // The stage is outside the repo, so it names the repo's bunfig.toml for minimumReleaseAge.
+    // bun fails to resolve `--config <path>`; only `--config=<path>` works.
     args: [
       "install",
       "--production",
-      "--config",
-      input.bunfigPath,
+      `--config=${input.bunfigPath}`,
       "--linker",
       "hoisted",
       ...os.flatMap((value) => ["--os", value]),
