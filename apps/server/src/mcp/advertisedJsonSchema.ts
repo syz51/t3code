@@ -104,3 +104,44 @@ const compact = (schema: Json, optional: boolean): Json => {
  */
 export const advertisedJsonSchema = (tool: Tool.Any) =>
   compact(Tool.getJsonSchema(tool), false) as ReturnType<typeof Tool.getJsonSchema>;
+
+export interface UnknownKey {
+  readonly path: string;
+  readonly known: ReadonlyArray<string>;
+}
+
+/**
+ * Keys in `value` that `schema` never lists, so a misnamed argument fails instead of vanishing.
+ * Objects with index signatures stay open. A union counts the object branch that fits best.
+ */
+export const unknownKeys = (schema: Json, value: Json, path = ""): Array<UnknownKey> => {
+  if (!Predicate.isObject(schema)) return [];
+  const branches = Array.isArray(schema.anyOf) ? schema.anyOf : schema.oneOf;
+  if (Array.isArray(branches)) {
+    const objectBranches = branches.filter(
+      (branch) =>
+        Predicate.isObject(branch) &&
+        (branch.type === undefined || branch.type === (Array.isArray(value) ? "array" : "object")),
+    );
+    let best: Array<UnknownKey> | undefined;
+    for (const branch of objectBranches) {
+      const found = unknownKeys(branch, value, path);
+      if (best === undefined || found.length < best.length) best = found;
+    }
+    return best ?? [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => unknownKeys(schema.items, item, `${path}[${index}]`));
+  }
+  if (!Predicate.isObject(value) || !Predicate.isObject(schema.properties)) return [];
+  const properties = schema.properties;
+  const open =
+    (schema.additionalProperties !== undefined && schema.additionalProperties !== false) ||
+    schema.patternProperties !== undefined ||
+    schema.propertyNames !== undefined;
+  return Object.entries(value).flatMap(([key, item]) => {
+    const keyPath = path === "" ? key : `${path}.${key}`;
+    if (Object.hasOwn(properties, key)) return unknownKeys(properties[key], item, keyPath);
+    return open ? [] : [{ path: keyPath, known: Object.keys(properties) }];
+  });
+};

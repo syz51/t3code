@@ -270,6 +270,12 @@ const layerRecordingTools = (calls: Array<unknown>) => {
     OrchestratorToolkit.tools.t3_thread_read,
     OrchestratorToolkit.tools.t3_thread_wait,
     ProjectToolkit.tools.t3_project_update,
+    // The real parameters without the launch services, which the recording handler never uses.
+    Tool.make("t3_thread_launch", {
+      parameters: ProjectToolkit.tools.t3_thread_launch.parametersSchema,
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
   );
   const record = McpToolAccess.reads((params: unknown) =>
     Effect.sync(() => calls.push(params)).pipe(
@@ -285,6 +291,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_thread_read: record,
       t3_thread_wait: record,
       t3_project_update: record,
+      t3_thread_launch: record,
     }),
   ).pipe(
     Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
@@ -520,6 +527,11 @@ it.effect("checks each preview_act action against that action's own input", () =
 
       yield* callTool("preview_act", { action: "type", selector: "#name", text: "Ada" });
       expect(inputs.at(-2)).toEqual({ selector: "#name", text: "Ada" });
+
+      const before = inputs.length;
+      const snapshot = yield* callTool("preview_snapshot", { tabID: "tab-1" }).pipe(Effect.flip);
+      expect(String(snapshot)).toContain('Unknown key "tabID"');
+      expect(inputs).toHaveLength(before);
     }),
   ).pipe(Effect.provide(layerTest)),
 );
@@ -538,6 +550,26 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     expect(calls[1]).toEqual(calls[0]);
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
+  }).pipe(Effect.provide(layerRecordingTools(calls)));
+});
+
+it.effect("rejects keys a tool does not advertise and names them", () => {
+  const calls: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const launch = yield* callTool("t3_thread_launch", { title: "Fix", prompt: "Do it" }).pipe(
+      Effect.flip,
+    );
+    expect(String(launch)).toContain('Unknown key "prompt"');
+    expect(String(launch)).toContain("message");
+    const nested = yield* callTool("delegate_task", {
+      task: "Inspect",
+      target: { model: null, isolation: "worktree" },
+    }).pipe(Effect.flip);
+    expect(String(nested)).toContain('Unknown key "target.isolation"');
+    expect(calls).toEqual([]);
+
+    yield* callTool("t3_thread_launch", { title: "Fix", message: "Do it" });
+    expect(calls).toEqual([{ title: "Fix", message: "Do it" }]);
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
 

@@ -40,7 +40,7 @@ import {
   MAX_REPORTED_DEPTH,
   toolOutcome,
 } from "../telemetry/ProviderDimensions.ts";
-import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
+import { advertisedJsonSchema, unknownKeys } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
@@ -1056,6 +1056,35 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
   return yield* registration.pipe(Effect.provideService(McpServer.McpServer, tracingServer));
 });
 
+/** Rejects arguments the advertised input schema does not list; decoding alone drops them silently. */
+const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <A, E, R>(
+  registration: Effect.Effect<A, E, R>,
+) {
+  const server = yield* McpServer.McpServer;
+  const checkingServer = McpServer.McpServer.of({
+    ...server,
+    addTool: Effect.fn("McpServer.addTool")(function (options) {
+      const { name, inputSchema } = options.tool;
+      return server.addTool({
+        ...options,
+        handle: (payload) => {
+          const unknown = unknownKeys(inputSchema, payload ?? {});
+          if (unknown.length === 0) return options.handle(payload);
+          const message = unknown
+            .map(({ path, known }) => `Unknown key "${path}". Known keys: ${known.join(", ")}.`)
+            .join(" ");
+          return Effect.fail(
+            new McpSchema.InvalidParams({
+              message: `Invalid parameters for tool '${name}': ${message}`,
+            }),
+          );
+        },
+      });
+    }),
+  });
+  return yield* registration.pipe(Effect.provideService(McpServer.McpServer, checkingServer));
+});
+
 /** `McpServer.registerToolkit` advertises the full codec schema; agents get the compact one. */
 const withAdvertisedSchemas = Effect.fn("McpHttpServer.withAdvertisedSchemas")(function* <
   Tools extends Record<string, Tool.Any>,
@@ -1109,7 +1138,9 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
   Layer.effectDiscard(
     withToolAnalytics(
       withToolSpans(
-        withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+        withKnownKeys(
+          withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+        ),
       ),
     ),
   ).pipe(
@@ -1126,7 +1157,7 @@ const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R, 
   register: Effect.Effect<A, E, R>,
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) =>
-  Layer.effectDiscard(withToolAnalytics(withToolSpans(register))).pipe(
+  Layer.effectDiscard(withToolAnalytics(withToolSpans(withKnownKeys(register)))).pipe(
     Layer.provide(McpToolAccess.HandlersLayer.layer(handlers)),
   );
 
