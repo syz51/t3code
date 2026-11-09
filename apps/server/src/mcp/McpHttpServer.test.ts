@@ -161,13 +161,17 @@ const recordSpans = () => {
   return { tracer, spans, order };
 };
 
-const callTool = (name: string, args: Record<string, unknown>) =>
+const callTool = (
+  name: string,
+  args: Record<string, unknown>,
+  scope: McpInvocationContext.McpInvocationScope = invocation,
+) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     return yield* server
       .callTool({ name, arguments: args })
       .pipe(
-        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
   });
@@ -527,11 +531,6 @@ it.effect("checks each preview_act action against that action's own input", () =
 
       yield* callTool("preview_act", { action: "type", selector: "#name", text: "Ada" });
       expect(inputs.at(-2)).toEqual({ selector: "#name", text: "Ada" });
-
-      const before = inputs.length;
-      const snapshot = yield* callTool("preview_snapshot", { tabID: "tab-1" }).pipe(Effect.flip);
-      expect(String(snapshot)).toContain('Unknown key "tabID"');
-      expect(inputs).toHaveLength(before);
     }),
   ).pipe(Effect.provide(layerTest)),
 );
@@ -553,25 +552,45 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
 
-it.effect("rejects keys a tool does not advertise and names them", () => {
+it.effect("rejects keys a tool does not declare and names them", () => {
   const calls: Array<unknown> = [];
   return Effect.gen(function* () {
     const launch = yield* callTool("t3_thread_launch", { title: "Fix", prompt: "Do it" }).pipe(
       Effect.flip,
     );
-    expect(String(launch)).toContain('Unknown key "prompt"');
-    expect(String(launch)).toContain("message");
+    expect(String(launch)).toContain('Expected no excess property\n  at ["prompt"]');
     const nested = yield* callTool("delegate_task", {
       task: "Inspect",
       target: { model: null, isolation: "worktree" },
     }).pipe(Effect.flip);
-    expect(String(nested)).toContain('Unknown key "target.isolation"');
+    expect(String(nested)).toContain('at ["target"]["isolation"]');
     expect(calls).toEqual([]);
 
     yield* callTool("t3_thread_launch", { title: "Fix", message: "Do it" });
-    expect(calls).toEqual([{ title: "Fix", message: "Do it" }]);
+    // A linked environment checked the call against its own, possibly newer, schema.
+    const linked = { sessionId: "peer", label: "laptop", access: "auto" as const, linked: true };
+    yield* callTool(
+      "t3_thread_launch",
+      { title: "Fix", message: "Do it", addedLater: true },
+      { ...invocation, client: linked },
+    );
+    expect(calls).toEqual([
+      { title: "Fix", message: "Do it" },
+      { title: "Fix", message: "Do it" },
+    ]);
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
+
+it.effect("rejects keys an image tool does not declare", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const inputs = yield* serveSnapshots("mcp-snapshot-keys-client", {});
+      const snapshot = yield* callTool("preview_snapshot", { tabID: "tab-1" }).pipe(Effect.flip);
+      expect(String(snapshot)).toContain('at ["tabID"]');
+      expect(inputs).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layerTest)),
+);
 
 it.effect(
   "clamps t3_thread_read page sizes above their maximum instead of rejecting the call",

@@ -40,7 +40,7 @@ import {
   MAX_REPORTED_DEPTH,
   toolOutcome,
 } from "../telemetry/ProviderDimensions.ts";
-import { advertisedJsonSchema, unknownKeys } from "./advertisedJsonSchema.ts";
+import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
@@ -1056,29 +1056,62 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
   return yield* registration.pipe(Effect.provideService(McpServer.McpServer, tracingServer));
 });
 
-/** Rejects arguments the advertised input schema does not list; decoding alone drops them silently. */
-const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <A, E, R>(
-  registration: Effect.Effect<A, E, R>,
-) {
+const strictDecoding = { onExcessProperty: "error", errors: "all" } as const;
+
+/** Decoding drops keys a tool does not declare, so a misnamed argument would vanish without an error. */
+const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <
+  Tools extends Record<string, Tool.Any>,
+  A,
+  E,
+  R,
+>(toolkit: Toolkit.Toolkit<Tools>, registration: Effect.Effect<A, E, R>) {
   const server = yield* McpServer.McpServer;
+  const decoders = new Map(
+    Object.values(toolkit.tools).map((tool) => [
+      tool.name,
+      // Tool parameters are JSON structs; their decoding needs no services.
+      Schema.decodeUnknownEffect(Schema.toCodecJson(tool.parametersSchema)) as (
+        input: unknown,
+        options?: typeof strictDecoding,
+      ) => Effect.Effect<unknown, Schema.SchemaError>,
+    ]),
+  );
   const checkingServer = McpServer.McpServer.of({
     ...server,
     addTool: Effect.fn("McpServer.addTool")(function (options) {
-      const { name, inputSchema } = options.tool;
+      const { name } = options.tool;
+      const decode = decoders.get(name);
+      if (decode === undefined) return server.addTool(options);
       return server.addTool({
         ...options,
-        handle: (payload) => {
-          const unknown = unknownKeys(inputSchema, payload ?? {});
-          if (unknown.length === 0) return options.handle(payload);
-          const message = unknown
-            .map(({ path, known }) => `Unknown key "${path}". Known keys: ${known.join(", ")}.`)
-            .join(" ");
-          return Effect.fail(
-            new McpSchema.InvalidParams({
-              message: `Invalid parameters for tool '${name}': ${message}`,
-            }),
-          );
-        },
+        handle: (payload) =>
+          Effect.withFiber((fiber) => {
+            const caller = Context.getOrUndefined(
+              fiber.context,
+              McpInvocationContext.McpInvocationContext,
+            );
+            // A linked environment forwards calls its own server checked, maybe with keys this version lacks.
+            if (caller?.client?.linked === true) return options.handle(payload);
+            const input = payload ?? {};
+            return decode(input, strictDecoding).pipe(
+              Effect.matchEffect({
+                onSuccess: () => options.handle(payload),
+                // Only excess keys fail here; the tool's own decode reports any other problem as before.
+                onFailure: (strict) =>
+                  decode(input).pipe(
+                    Effect.matchEffect({
+                      onSuccess: () =>
+                        Effect.fail(
+                          new McpSchema.InvalidParams({
+                            message: `Invalid parameters for tool '${name}': ${strict.message}`,
+                          }),
+                        ),
+                      onFailure: () => options.handle(payload),
+                    }),
+                  ),
+              }),
+            );
+          }),
       });
     }),
   });
@@ -1139,6 +1172,7 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
     withToolAnalytics(
       withToolSpans(
         withKnownKeys(
+          toolkit,
           withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
         ),
       ),
@@ -1154,16 +1188,17 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
   );
 
 const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R, EX, RX>(
+  toolkit: Toolkit.Toolkit<Tools>,
   register: Effect.Effect<A, E, R>,
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) =>
-  Layer.effectDiscard(withToolAnalytics(withToolSpans(withKnownKeys(register)))).pipe(
+  Layer.effectDiscard(withToolAnalytics(withToolSpans(withKnownKeys(toolkit, register)))).pipe(
     Layer.provide(McpToolAccess.HandlersLayer.layer(handlers)),
   );
 
 export const layerHtmlToolkit = Layer.mergeAll(
   toolkitRegistration(HtmlRenderToolkit, HtmlHandlers.layerRender),
-  imageToolRegistration(registerHtmlPreview(), HtmlHandlers.layerPreview),
+  imageToolRegistration(HtmlPreviewToolkit, registerHtmlPreview(), HtmlHandlers.layerPreview),
 ).pipe(Layer.provide(HtmlRender.layer));
 
 const layerPreviewStandardToolkitRegistration = toolkitRegistration(
@@ -1172,6 +1207,7 @@ const layerPreviewStandardToolkitRegistration = toolkitRegistration(
 );
 
 const layerPreviewSnapshotRegistration = imageToolRegistration(
+  PreviewSnapshotToolkit,
   registerPreviewSnapshot(),
   PreviewHandlers.layerSnapshot,
 );
@@ -1221,6 +1257,7 @@ const layerDeviceStandardToolkitRegistration = toolkitRegistration(
 );
 
 const layerDeviceScreenshotRegistration = imageToolRegistration(
+  DeviceScreenshotToolkit,
   registerDeviceScreenshot(),
   DeviceHandlers.layerScreenshot,
 );

@@ -374,7 +374,7 @@ it.effect("rejects an unknown organize target instead of archiving the calling t
     expect(dispatched).toEqual([]);
     expect(outcome).toMatchObject({
       _tag: "Failure",
-      failure: { message: expect.stringContaining('Unknown key "threadIds"') },
+      failure: { message: expect.stringContaining("Expected no excess property") },
     });
   }).pipe(
     Effect.provide(
