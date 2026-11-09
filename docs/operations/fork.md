@@ -194,7 +194,8 @@ T3CODE_DESKTOP_VERSION=0.1.8-fork.$(date +%Y%m%d) \
 
 It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
 about a minute. Do not open it from Finder while Nightly runs. To try it beside Nightly, give it
-its own home folder, so it uses its own Electron data folder, single-instance lock and state:
+its own home folder, so it uses its own Electron data folder, single-instance lock and state.
+That home has no provider logins, so it suits a launch check, not agent turns:
 
 ```sh
 mkdir -p /tmp/t3-fork-home
@@ -236,7 +237,7 @@ quits or hands off to the one already running.
 There are two ways to use a fork build daily:
 
 - **Replace Nightly.** Keep the same `~/.t3` state and update by syncing `fork`, rebuilding and
-  swapping again. See [Switch to the fork build](#switch-to-the-fork-build).
+  replacing the app. See [Switch to the fork build](#switch-to-the-fork-build).
 - **Run beside Nightly.** This needs fork patches to the bundle id (`DESKTOP_APP_ID` in
   `scripts/build-desktop-artifact.ts`), the Electron data folder (`DesktopUserData.ts`), the URL
   schemes and the default state folder (`DesktopStatePaths.ts`). Updates are rebuilds as above.
@@ -269,8 +270,8 @@ To roll back:
 3. Open Nightly. Its updater brings it up to date.
 
 The rollback restores the database backup only when the fork ran newer migrations than the backup
-holds, because Nightly cannot read a database migrated past it. It keeps the fork's database
+holds. Nightly starts on a newer database but does not know its schema. It keeps the fork's database
 beside the backup as `statev2.fork.sqlite`. Otherwise it keeps the current database, with the work
-done on the fork. Pass `--restore-db` to restore the backup anyway, or a backup folder to roll back
-to an older swap. If the fork app fails to start, its recovery page offers to download its own
+done on the fork. Pass `--restore-db` to restore the backup anyway. Pass a backup folder when `latest` does not
+point at the swap to undo. If the fork app fails to start, its recovery page offers to download its own
 version from upstream releases. No such release exists, so roll back instead.

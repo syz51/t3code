@@ -4,38 +4,43 @@
 # Usage: scripts/fork-app-rollback.sh [--dry-run] [--restore-db] [backup dir]
 set -euo pipefail
 
+fail() {
+  echo "fork-app-rollback: $*" >&2
+  exit 1
+}
+
 dry_run=0
 restore_db=auto
-while [[ "${1:-}" == --* ]]; do
-  case "$1" in
+backup_arg=""
+for arg in "$@"; do
+  case "$arg" in
     --dry-run) dry_run=1 ;;
     --restore-db) restore_db=yes ;;
+    --*) fail "unknown option $arg" ;;
     *)
-      echo "fork-app-rollback: unknown option $1" >&2
-      exit 1
+      [[ -z "$backup_arg" ]] || fail "pass at most one backup folder"
+      backup_arg="$arg"
       ;;
   esac
-  shift
 done
 
 apps_dir="${T3_SWAP_APPS_DIR:-/Applications}"
 state_db="${T3_SWAP_STATE_DB:-$HOME/.t3/userdata/statev2.sqlite}"
 backup_root="${T3_SWAP_BACKUP_ROOT:-$HOME/.t3-swap-backup}"
-backup_dir="$(cd "${1:-$backup_root/latest}" && pwd -P)"
+backup_arg="${backup_arg:-$backup_root/latest}"
+[[ -d "$backup_arg" ]] || fail "no backup folder at $backup_arg"
+backup_dir="$(CDPATH='' cd "$backup_arg" && pwd -P)"
 nightly_backup="$backup_dir/T3 Code (Nightly).app"
 nightly_app="$apps_dir/T3 Code (Nightly).app"
+lsregister="${T3_SWAP_LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
 
-fail() {
-  echo "fork-app-rollback: $*" >&2
-  exit 1
-}
 run() {
   echo "+ $*"
   if [[ $dry_run -eq 0 ]]; then "$@"; fi
 }
-# pgrep -f takes a regex, and app names contain parentheses.
+# Matches the app and its helpers. pgrep -f takes a regex, and app names contain parentheses.
 # shellcheck disable=SC2009
-running_from() { ps -axo command= | grep -F "$1/Contents/MacOS/" | grep -v grep || true; }
+running_from() { ps -axo command= | grep -F "$1/Contents/" | grep -v grep || true; }
 refuse() {
   if [[ $dry_run -eq 1 ]]; then echo "The real rollback would stop here: $*"; else fail "$*"; fi
 }
@@ -43,10 +48,13 @@ last_migration() { sqlite3 "file:$1?mode=ro" "SELECT coalesce(max(migration_id),
 
 [[ -f "$backup_dir/swap.env" ]] || fail "$backup_dir has no swap.env; pass the backup folder the swap printed"
 fork_app_name="$(sed -n 's/^fork_app=//p' "$backup_dir/swap.env")"
+[[ "$fork_app_name" == *.app && "$fork_app_name" != */* ]] ||
+  fail "swap.env names no fork app: '$fork_app_name'"
 fork_app="$apps_dir/$fork_app_name"
 [[ -d "$nightly_backup" ]] || fail "no Nightly app in $backup_dir"
 [[ -f "$backup_dir/statev2.sqlite" ]] || fail "no database backup in $backup_dir"
 [[ ! -e "$nightly_app" ]] || fail "$nightly_app already exists"
+[[ -f "$state_db" ]] || fail "no database at $state_db; copy $backup_dir/statev2.sqlite there"
 
 echo "Backup:   $backup_dir"
 echo "Fork app: $fork_app"
@@ -61,21 +69,25 @@ if [[ $restore_db == auto ]]; then
   if ((current > backed_up)); then restore_db=yes; else restore_db=no; fi
 fi
 
-if [[ -d "$fork_app" ]]; then
-  run mv "$fork_app" "$backup_dir/$fork_app_name"
-fi
 if [[ $restore_db == yes ]]; then
+  # Copy first, so a failed copy leaves the current database in place.
+  run cp "$backup_dir/statev2.sqlite" "$state_db.rollback"
   # Keep the fork's database beside the backup instead of deleting it.
   for suffix in "" -wal -shm; do
     if [[ -e "$state_db$suffix" ]]; then
       run mv "$state_db$suffix" "$backup_dir/statev2.fork.sqlite$suffix"
     fi
   done
-  run cp "$backup_dir/statev2.sqlite" "$state_db"
+  run mv "$state_db.rollback" "$state_db"
 else
   echo "Keeping the current database: Nightly reads it, and it holds the work done on the fork."
 fi
+if [[ -d "$fork_app" ]]; then
+  run mv "$fork_app" "$backup_dir/$fork_app_name"
+  run "$lsregister" -u "$backup_dir/$fork_app_name" || echo "warning: lsregister failed"
+fi
 run mv "$nightly_backup" "$nightly_app"
+run "$lsregister" -f "$nightly_app" || echo "warning: lsregister failed"
 
 echo
 if [[ $dry_run -eq 1 ]]; then

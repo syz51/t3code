@@ -192,10 +192,11 @@ var x = 1;
     const source =
       region("../../node_modules/.pnpm/effect@4.0.0/node_modules/effect/dist/index.js") +
       region("../../node_modules/.pnpm/yaml@2.4.0/node_modules/yaml/dist/index.js") +
+      region("../../node_modules/.bun/left-pad@1.3.0/node_modules/left-pad/index.js") +
       region("../../src/server/main.ts");
     const result = findInlinedExternalPackages(source);
 
-    assert.deepStrictEqual(result.inlinedPackages, ["effect", "yaml"]);
+    assert.deepStrictEqual(result.inlinedPackages, ["effect", "left-pad", "yaml"]);
     assert.deepStrictEqual(result.inlined, []);
   });
 

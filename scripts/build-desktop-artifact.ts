@@ -1591,13 +1591,13 @@ export function createStageWorkspaceConfig(input: {
   };
 }
 
-// bun takes pnpm-workspace.yaml's settings from package.json and the target platform from flags.
 export function createStageBunInstall(input: {
   readonly platform: typeof BuildPlatform.Type;
   readonly arch: typeof BuildArch.Type;
   readonly trustedDependencies: ReadonlyArray<string>;
   readonly patchedDependencies: Record<string, string>;
   readonly overrides: Record<string, string>;
+  readonly bunfigPath: string;
 }) {
   const { supportedArchitectures, patchedDependencies, overrides, packageExtensions } =
     createStageWorkspaceConfig(input);
@@ -1610,9 +1610,12 @@ export function createStageBunInstall(input: {
       packageExtensions,
     },
     // electron-builder and server.asar need physical packages, not links into bun's store.
+    // The stage is outside the repo, so it names the repo's bunfig.toml for minimumReleaseAge.
     args: [
       "install",
       "--production",
+      "--config",
+      input.bunfigPath,
       "--linker",
       "hoisted",
       ...os.flatMap((value) => ["--os", value]),
@@ -3126,6 +3129,7 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
     trustedDependencies: input.trustedDependencies,
     patchedDependencies: sidecarPatchedDependencies,
     overrides: input.overrides,
+    bunfigPath: path.join(input.repoRoot, "bunfig.toml"),
   });
   const sidecarPackageJson = {
     name: "t3code-server",
@@ -3595,7 +3599,6 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       }),
     });
   }
-  // The fork installs with bun, which reads these from package.json instead of pnpm-workspace.yaml.
   const workspaceCatalog = rootPackageJson.workspaces.catalog;
   const workspaceOverrides = rootPackageJson.overrides;
   const workspacePatchedDependencies = rootPackageJson.patchedDependencies;
@@ -3873,6 +3876,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     trustedDependencies: workspaceTrustedDependencies,
     patchedDependencies: stagePatchedDependencies,
     overrides: resolvedOverrides,
+    bunfigPath: path.join(repoRoot, "bunfig.toml"),
   });
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
