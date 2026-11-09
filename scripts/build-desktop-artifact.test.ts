@@ -27,7 +27,7 @@ import {
   BundleNotSelfContainedError,
   BuildCommandFailedError,
   parseWslRuntimeArchiveMembers,
-  readWorkspaceConfig,
+  createStageBunInstall,
   createBuildConfig,
   DESKTOP_FILE_EXCLUSIONS,
   InvalidMacPasskeyRpDomainError,
@@ -547,24 +547,28 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
-  // pnpm writes "set this to true or false" placeholders into allowBuilds when a
-  // tarball changes. pnpm ignores them, but the release build decode rejects them.
-  it.effect("decodes the repo allowBuilds and every file: tarball it names exists", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const { allowBuilds = {} } = yield* readWorkspaceConfig();
-      const repoRoot = path.join(import.meta.dirname, "..");
-      for (const key of Object.keys(allowBuilds)) {
-        const tarball = key.split("@file:")[1]?.replace(/\(patch_hash=[a-f0-9]+\)$/, "");
-        if (tarball === undefined) continue;
-        assert.isTrue(
-          yield* fs.exists(path.join(repoRoot, tarball)),
-          `allowBuilds names a missing tarball: ${key}`,
-        );
-      }
-    }),
-  );
+  it("passes the target platform to the staged bun install", () => {
+    const stage = (platform: "mac" | "linux", arch: "arm64" | "universal") =>
+      createStageBunInstall({
+        platform,
+        arch,
+        trustedDependencies: ["node-pty"],
+        patchedDependencies: {},
+        overrides: {},
+      }).args;
+    const prefix = ["install", "--production", "--linker", "hoisted"];
+    assert.deepStrictEqual(stage("mac", "arm64"), [...prefix, "--os", "darwin", "--cpu", "arm64"]);
+    assert.deepStrictEqual(stage("mac", "universal"), [...prefix, "--os", "darwin", "--cpu", "*"]);
+    assert.deepStrictEqual(stage("linux", "arm64"), [
+      ...prefix,
+      "--os",
+      "linux",
+      "--cpu",
+      "arm64",
+      "--libc",
+      "glibc",
+    ]);
+  });
 
   it("stages only the externals of both bundles in merged packages", () => {
     assert.deepStrictEqual(

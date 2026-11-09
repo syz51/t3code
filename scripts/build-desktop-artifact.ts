@@ -15,7 +15,6 @@ import {
   type DirectoryRecord,
 } from "@electron/asar";
 
-import { fromYaml } from "@t3tools/shared/schemaYaml";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/relayAuth";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -68,14 +67,6 @@ const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
 
-const WorkspaceConfig = Schema.Struct({
-  catalog: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
-});
-type WorkspaceConfig = typeof WorkspaceConfig.Type;
-
 const StageWorkspaceConfig = Schema.Struct({
   supportedArchitectures: Schema.Struct({
     os: Schema.Array(Schema.String),
@@ -114,16 +105,6 @@ const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknow
 const decodeReleasePackageManifest = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
-const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
-const encodeStageWorkspaceConfig = Schema.encodeEffect(fromYaml(StageWorkspaceConfig));
-
-export const readWorkspaceConfig = Effect.fn("readWorkspaceConfig")(function* () {
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const repoRoot = yield* RepoRoot;
-  const workspaceYaml = yield* fs.readFileString(path.join(repoRoot, "pnpm-workspace.yaml"));
-  return yield* decodeWorkspaceConfig(workspaceYaml);
-});
 
 interface DesktopBuildIconAssets {
   readonly macIconPng: string;
@@ -1610,6 +1591,38 @@ export function createStageWorkspaceConfig(input: {
   };
 }
 
+// bun takes pnpm-workspace.yaml's settings from package.json and the target platform from flags.
+export function createStageBunInstall(input: {
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+  readonly trustedDependencies: ReadonlyArray<string>;
+  readonly patchedDependencies: Record<string, string>;
+  readonly overrides: Record<string, string>;
+}) {
+  const { supportedArchitectures, patchedDependencies, overrides, packageExtensions } =
+    createStageWorkspaceConfig(input);
+  const { os, cpu, libc = [] } = supportedArchitectures;
+  return {
+    packageJson: {
+      ...(overrides ? { overrides } : {}),
+      ...(patchedDependencies ? { patchedDependencies } : {}),
+      trustedDependencies: input.trustedDependencies,
+      packageExtensions,
+    },
+    // electron-builder and server.asar need physical packages, not links into bun's store.
+    args: [
+      "install",
+      "--production",
+      "--linker",
+      "hoisted",
+      ...os.flatMap((value) => ["--os", value]),
+      "--cpu",
+      (cpu.length === 1 && cpu[0]) || "*",
+      ...libc.flatMap((value) => ["--libc", value]),
+    ],
+  };
+}
+
 export function createStagePatchedDependencies(
   patchedDependencies: Record<string, string>,
   dependencies: Record<string, unknown>,
@@ -2115,7 +2128,7 @@ const findStorePackageDirectory = Effect.fn("findStorePackageDirectory")(functio
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const storeDir = path.join(repoRoot, "node_modules/.pnpm");
+  const storeDir = path.join(repoRoot, "node_modules/.bun");
   const exists = (candidate: string) =>
     fs.exists(candidate).pipe(Effect.orElseSucceed(() => false));
   if (!(yield* exists(storeDir))) return null;
@@ -3086,7 +3099,7 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
   readonly appVersion: string;
   readonly runtimeExternalDependencies: Record<string, string>;
   readonly fffNodeVersion: string;
-  readonly allowBuilds: Record<string, boolean>;
+  readonly trustedDependencies: ReadonlyArray<string>;
   readonly patchedDependencies: Record<string, string>;
   readonly overrides: Record<string, string>;
   readonly asarPath: string;
@@ -3107,46 +3120,38 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
     input.patchedDependencies,
     sidecarDependencies,
   );
+  const sidecarInstall = createStageBunInstall({
+    platform: "win",
+    arch: input.arch,
+    trustedDependencies: input.trustedDependencies,
+    patchedDependencies: sidecarPatchedDependencies,
+    overrides: input.overrides,
+  });
   const sidecarPackageJson = {
     name: "t3code-server",
     version: input.appVersion,
     private: true,
     packageManager: rootPackageJson.packageManager,
     dependencies: sidecarDependencies,
+    ...sidecarInstall.packageJson,
   };
   const sidecarPackageJsonString = yield* encodeJsonString(sidecarPackageJson);
   yield* fs.writeFileString(
     path.join(serverStageDir, "package.json"),
     `${sidecarPackageJsonString}\n`,
   );
-  const sidecarWorkspaceConfig = {
-    ...createStageWorkspaceConfig({
-      platform: "win",
-      arch: input.arch,
-      allowBuilds: input.allowBuilds,
-      patchedDependencies: sidecarPatchedDependencies,
-      overrides: input.overrides,
-    }),
-    // server.asar cannot carry pnpm symlinks or junctions; install physical hoisted dependencies.
-    nodeLinker: "hoisted" as const,
-  };
-  const sidecarWorkspaceConfigString = yield* encodeStageWorkspaceConfig(sidecarWorkspaceConfig);
-  yield* fs.writeFileString(
-    path.join(serverStageDir, "pnpm-workspace.yaml"),
-    sidecarWorkspaceConfigString,
-  );
   if (Object.keys(sidecarPatchedDependencies).length > 0) {
     yield* fs.copy(path.join(input.repoRoot, "patches"), path.join(serverStageDir, "patches"));
   }
 
   yield* Effect.log("[desktop-artifact] Installing server sidecar runtime externals...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installCommand = yield* resolveSpawnCommand("bun", sidecarInstall.args);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: serverStageDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod (server sidecar)", verbose: input.verbose },
+    { label: `bun ${sidecarInstall.args.join(" ")} (server sidecar)`, verbose: input.verbose },
   );
 
   yield* Effect.log("[desktop-artifact] Packing server.asar...");
@@ -3590,11 +3595,11 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       }),
     });
   }
-  const workspaceConfig = yield* readWorkspaceConfig();
-  const workspaceCatalog = workspaceConfig.catalog ?? {};
-  const workspaceOverrides = workspaceConfig.overrides ?? {};
-  const workspacePatchedDependencies = workspaceConfig.patchedDependencies ?? {};
-  const workspaceAllowBuilds = workspaceConfig.allowBuilds ?? {};
+  // The fork installs with bun, which reads these from package.json instead of pnpm-workspace.yaml.
+  const workspaceCatalog = rootPackageJson.workspaces.catalog;
+  const workspaceOverrides = rootPackageJson.overrides;
+  const workspacePatchedDependencies = rootPackageJson.patchedDependencies;
+  const workspaceTrustedDependencies = rootPackageJson.trustedDependencies;
 
   const platformConfig = PLATFORM_CONFIG[options.platform];
   if (!platformConfig) {
@@ -3617,7 +3622,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     catch: (cause) =>
       new DesktopBuildDependencyResolutionError({
         kind: "workspace-overrides",
-        manifestPath: "pnpm-workspace.yaml",
+        manifestPath: "package.json",
         cause,
       }),
   });
@@ -3862,6 +3867,13 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     options.platform === "win"
       ? path.join(stageAppDir, WINDOWS_SERVER_RESOURCE_SOURCE_DIR, WINDOWS_SERVER_ASAR_RESOURCE)
       : undefined;
+  const stageInstall = createStageBunInstall({
+    platform: options.platform,
+    arch: options.arch,
+    trustedDependencies: workspaceTrustedDependencies,
+    patchedDependencies: stagePatchedDependencies,
+    overrides: resolvedOverrides,
+  });
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
     version: appVersion,
@@ -3897,35 +3909,24 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     devDependencies: {
       electron: electronVersion,
     },
+    ...stageInstall.packageJson,
   };
 
   const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
   yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
-  const stageWorkspaceConfig = createStageWorkspaceConfig({
-    platform: options.platform,
-    arch: options.arch,
-    allowBuilds: workspaceAllowBuilds,
-    patchedDependencies: stagePatchedDependencies,
-    overrides: resolvedOverrides,
-  });
-  const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
-  yield* fs.writeFileString(
-    path.join(stageAppDir, "pnpm-workspace.yaml"),
-    stageWorkspaceConfigString,
-  );
 
   if (Object.keys(stagePatchedDependencies).length > 0) {
     yield* fs.copy(path.join(repoRoot, "patches"), path.join(stageAppDir, "patches"));
   }
 
   yield* Effect.log("[desktop-artifact] Installing staged production dependencies...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installCommand = yield* resolveSpawnCommand("bun", stageInstall.args);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: stageAppDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod", verbose: options.verbose },
+    { label: `bun ${stageInstall.args.join(" ")}`, verbose: options.verbose },
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
   yield* stageKeyringNativeBinaries(stageAppDir, options.platform, options.arch);
@@ -3939,7 +3940,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       appVersion,
       runtimeExternalDependencies: resolvedServerRuntimeExternalDependencies,
       fffNodeVersion: serverPackageJson.dependencies["@ff-labs/fff-node"],
-      allowBuilds: workspaceAllowBuilds,
+      trustedDependencies: workspaceTrustedDependencies,
       patchedDependencies: workspacePatchedDependencies,
       overrides: resolvedOverrides,
       asarPath: windowsServerAsarPath,
