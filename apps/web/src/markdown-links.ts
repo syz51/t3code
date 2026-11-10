@@ -43,6 +43,7 @@ export function resolveInlineCodeFileLinkMeta(
   codeText: string,
   cwd?: string,
   baseDir: string | undefined = cwd,
+  rootDir: string | undefined = cwd,
 ): MarkdownFileLinkMeta | null {
   const candidate = inlineCodeFilePathCandidate(codeText);
   if (candidate === null) return null;
@@ -50,19 +51,19 @@ export function resolveInlineCodeFileLinkMeta(
   return resolveMarkdownFileLinkMeta(
     candidate,
     cwd,
-    inlineCodePathNamesFromWorkspaceRoot(candidate, cwd, baseDir) ? cwd : baseDir,
+    inlineCodePathNamesFromWorkspaceRoot(candidate, rootDir, baseDir) ? rootDir : baseDir,
   );
 }
 
 function inlineCodePathNamesFromWorkspaceRoot(
   candidate: string,
-  cwd: string | undefined,
+  rootDir: string | undefined,
   baseDir: string | undefined,
 ): boolean {
-  if (!cwd || !baseDir || !isRelativeFilePath(candidate)) return false;
+  if (!rootDir || !baseDir || !isRelativeFilePath(candidate)) return false;
   if (/^(?:~|\.{1,2})\//.test(candidate)) return false;
   if (!splitFilePathPosition(candidate).path.includes("/")) return false;
-  return workspaceRelativeFilePath(baseDir, cwd) !== null;
+  return workspaceRelativeFilePath(baseDir, rootDir) !== null;
 }
 
 export function resolveMarkdownFileLinkMeta(

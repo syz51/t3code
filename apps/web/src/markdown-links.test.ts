@@ -54,6 +54,16 @@ describe("relative links inside a rendered host file", () => {
       workspaceRelativePath: "docs/src/main.ts",
     });
   });
+
+  it("name files in an agent's worktree inside cwd when it is the root", () => {
+    const worktree = "/repo/.claude/worktrees/feature";
+    expect(
+      resolveInlineCodeFileLinkMeta("scripts/run.ts", "/repo", worktree, worktree),
+    ).toMatchObject({
+      filePath: `${worktree}/scripts/run.ts`,
+      workspaceRelativePath: ".claude/worktrees/feature/scripts/run.ts",
+    });
+  });
 });
 
 describe("resolveInlineCodeFileLinkMeta", () => {

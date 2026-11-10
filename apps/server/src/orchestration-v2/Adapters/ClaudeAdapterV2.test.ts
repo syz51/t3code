@@ -10354,6 +10354,130 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect("stamps assistant messages with the folder the main agent works in", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const worktreePath = "/workspace/.claude/worktrees/feature";
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-worktree-cwd"),
+            text: "Work in a worktree.",
+            attachments: [],
+          }),
+        );
+        const toolCall = (id: string, name: string, parent: string | null = null) =>
+          claudeSdkFrame({
+            type: "assistant",
+            message: {
+              model: "claude-sonnet-4-6",
+              id: `msg_${id}`,
+              type: "message",
+              role: "assistant",
+              content: [{ type: "tool_use", id, name, input: {} }],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 1, output_tokens: 1 },
+            },
+            parent_tool_use_id: parent,
+            uuid: `${id}-call`,
+            session_id: WAKE_NATIVE_SESSION,
+          });
+        const toolResult = (
+          id: string,
+          result: { readonly is_error: true } | { readonly tool_use_result: object },
+          parent: string | null = null,
+        ) =>
+          claudeSdkFrame({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: id,
+                  content: "is_error" in result ? "Worktree exists" : "ok",
+                  ...("is_error" in result ? { is_error: true } : {}),
+                },
+              ],
+            },
+            parent_tool_use_id: parent,
+            uuid: `${id}-result`,
+            session_id: WAKE_NATIVE_SESSION,
+            ...("tool_use_result" in result ? { tool_use_result: result.tool_use_result } : {}),
+          });
+        const say = (text: string) => makeAssistantTextFrame({ uuid: `say-${text}`, text });
+        const entered = { tool_use_result: { worktreePath, worktreeBranch: "worktree-feature" } };
+        yield* Queue.offerAll(harness.sdkMessages, [
+          // A restarted session reports the worktree it resumed in.
+          claudeSdkFrame({
+            type: "system",
+            subtype: "init",
+            cwd: worktreePath,
+            uuid: "worktree-init",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          say("Resumed."),
+          toolCall("toolu_exit", "ExitWorktree"),
+          toolResult("toolu_exit", {
+            tool_use_result: { action: "keep", originalCwd: "/workspace", worktreePath },
+          }),
+          say("Back."),
+          toolCall("toolu_refused", "EnterWorktree"),
+          toolResult("toolu_refused", { is_error: true }),
+          say("Refused."),
+          makeSubagentTaskStartedFrame({
+            taskId: "agent-worktree",
+            toolUseId: "toolu_agent",
+            uuid: "worktree-agent-started",
+          }),
+          toolCall("toolu_agent_enter", "EnterWorktree", "toolu_agent"),
+          toolResult("toolu_agent_enter", entered, "toolu_agent"),
+          makeSubagentNotificationFrame({
+            taskId: "agent-worktree",
+            toolUseId: "toolu_agent",
+            summary: "Done.",
+            uuid: "worktree-agent-done",
+          }),
+          say("Subagent moved."),
+          toolCall("toolu_enter", "EnterWorktree"),
+          toolResult("toolu_enter", entered),
+          say("In it."),
+          makeResultFrame({ uuid: "worktree-result", result: "In it." }),
+        ]);
+        yield* harness.awaitTerminal(1);
+
+        assert.deepEqual(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? [[event.turnItem.text, event.turnItem.workingDirectory]]
+              : [],
+          ),
+          [
+            ["Resumed.", worktreePath],
+            ["Back.", undefined],
+            ["Refused.", undefined],
+            ["Done.", undefined],
+            ["Subagent moved.", undefined],
+            ["In it.", worktreePath],
+          ],
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   it.effect("lets the native SDK acknowledge Stop before closing its own query", () =>
     Effect.scoped(
       Effect.gen(function* () {

@@ -33,6 +33,12 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
   );
   const text = liveText ?? row.message.text;
   const messageText = text || (row.message.streaming ? "" : "(empty response)");
+  const item = row.projectedItem?.item;
+  // Views without the thread folder link no files, so they get no agent folder either.
+  const workingDirectory =
+    ctx.markdownCwd !== undefined && item?.type === "assistant_message"
+      ? item.workingDirectory
+      : undefined;
 
   return (
     <>
@@ -49,6 +55,7 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
             <ChatMarkdown
               text={messageText}
               cwd={ctx.markdownCwd}
+              workingDirectory={workingDirectory}
               threadRef={ctx.threadRef ?? undefined}
               isStreaming={Boolean(row.message.streaming)}
               lineBreaks={shouldPreserveAssistantLineBreaks(messageText)}
