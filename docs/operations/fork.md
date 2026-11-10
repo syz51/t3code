@@ -7,49 +7,54 @@ This fork (`syz51/t3code`) is tested next to the installed T3 Code app. The inst
 
 - `main` mirrors `upstream/main` (`pingdotgg/t3code`). It never carries fork commits, so it
   only fast-forwards.
-- `fork` is `upstream/main` plus the fork's patches. Keep them few and small, and keep
-  fork-only material in fork-only files such as this one, so rebases stay clean.
+- `fork` is `upstream/main` plus the fork's patches, joined by merge commits. Keep the patches
+  few and small, and keep fork-only material in fork-only files such as this one, so merges
+  stay clean.
 - `fork` installs with bun instead of upstream's pnpm. See [Package manager](#package-manager).
 - Patch work branches start from `fork`. A patch meant for upstream starts from `main` instead,
   and lands on `fork` once upstream merges it, or as a cherry-pick until then.
 
 ## Sync with upstream
 
+A sync merges `upstream/main` into a branch from `fork` and lands it through a PR, so CI runs
+before `fork` changes. `fork` is never rebased or force-pushed.
+
 ```sh
 git fetch upstream main
+git fetch origin
 git push origin upstream/main:main
-git switch fork
-git rebase upstream/main
-bun scripts/fork-ci-runners.ts
-bun install --frozen-lockfile
-bun run typecheck:bun
-git push --force-with-lease=fork:<old fork sha> origin fork
+git switch -c fork-sync-<yyyymmdd> origin/fork
+git merge --no-ff upstream/main
 ```
 
-`fork-ci-runners.ts` maps runners in workflows that upstream added since the last sync. When it
-changes files, commit them as `ci(fork): run new workflows on GitHub-hosted runners`.
+Resolve conflicts as below, then:
 
-`typecheck:bun` typechecks every package without Vite+. It is the only check here: CI runs on PRs
-to `fork`, not on this push, and lint, format, knip and tests still need Vite+ (see
-[Package manager](#package-manager)). Where Vite+ is installed, also run
-`vp run check:changed upstream/main` before pushing.
+```sh
+bun scripts/fork-ci-runners.ts
+bun install --frozen-lockfile
+vp run check:changed upstream/main
+git push -u origin fork-sync-<yyyymmdd>
+gh pr create --repo syz51/t3code --base fork --head fork-sync-<yyyymmdd>
+```
 
-The bun conversion is four commits, from "build: switch the fork's package manager from pnpm to
-bun" to "docs(fork): sync upstream with bun …". They edit upstream files, so they conflict
-whenever upstream changes those files.
+Fix CI failures on the branch. Merge the PR with a merge commit (`gh pr merge --merge`), never a
+squash, so `fork` keeps upstream's history and the next merge finds the right base. Then rebuild
+the fork app (see [Desktop app](#desktop-app)).
 
-Later `fix(fork)` and `ci(fork)` commits that edit the same files follow the same rules as the
-commit they fix.
+On macOS, some server tests fail locally because temporary paths resolve to `/private/var` or
+the file system ignores case. CI runs them on Linux; trust its result there.
 
-The first commit conflicts whenever upstream changes `package.json`, `pnpm-lock.yaml` or
-`pnpm-workspace.yaml`. Never merge `bun.lock`, `bunfig.toml` or the converted `package.json` by
-hand, in that commit or any later one. Regenerate them from upstream's files:
+### Package files
+
+`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` and `.pnpmfile.cjs` conflict whenever
+upstream changes them. Never merge `bun.lock`, `bunfig.toml` or the converted `package.json` by
+hand. Regenerate them from upstream's files:
 
 ```sh
 git checkout upstream/main -- package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs
 bun scripts/fork-convert-to-bun.ts
+bun install
 git add -A package.json bun.lock bunfig.toml pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs
-git rebase --continue
 ```
 
 The script migrates upstream's lockfile and workspace into `package.json` and `bun.lock`,
@@ -57,35 +62,38 @@ writes `bunfig.toml`, formats both as `vp fmt` does, and deletes the pnpm files.
 fails when bun still warns, for example about a patch that no longer applies to a new version.
 Fix that in `package.json` and run `bun install`.
 
-The other three commits conflict when upstream edits a workflow, script or doc they change. Keep
-upstream's change and redo the commit's edit in it: `bun install` for pnpm installs, `bun.lock`
-for `pnpm-lock.yaml`, and `package.json` for `pnpm-workspace.yaml`. A filtered bun install leaves
-out the root package, which owns `vite-plus`, so add `--filter=@t3tools/monorepo` to every
-filtered install; without it `vp` cannot load the task graph. `apps/mobile/eas.json` pins
-the same bun version as `packageManager`; update both together.
+### Workflows, scripts and docs
 
-The commit "ci(fork): run upstream's workflows on GitHub-hosted runners" maps upstream's
-Blacksmith runner labels, which the fork has no installation for, to GitHub-hosted runners. It
-scales each mapped job's timeouts by the vCPUs it loses, because the hosted runners have 3 or 4.
-A reusable workflow takes the largest loss among the runners its callers pass. Each mapped line
-keeps upstream's label or timeout in a `# fork-mapped:` or `# fork-scaled:` comment, so a rerun
-rescales from upstream's value. It also makes Agent Context Budget compare with the PR's base
-branch, because `fork` lags `main` until the sync. It conflicts when upstream edits a `runs-on`
-or `timeout-minutes` line or that budget fetch. Keep the rebased file and rerun the script:
+The fork's bun edits conflict when upstream edits the same lines. Keep upstream's change and redo
+the fork's edit in it: `bun install` for pnpm installs, `bun.lock` for `pnpm-lock.yaml`, and
+`package.json` for `pnpm-workspace.yaml`. A filtered bun install leaves out the root package,
+which owns `vite-plus`, so add `--filter=@t3tools/monorepo` to every filtered install; without
+it `vp` cannot load the task graph. `apps/mobile/eas.json` pins the same bun version as
+`packageManager`; update both together.
 
-```sh
-git checkout --ours -- <conflicting workflow files>
-bun scripts/fork-ci-runners.ts
-git add .github/workflows
-git rebase --continue
-```
+Upstream also adds steps that merge cleanly but still use pnpm or corepack. After each merge,
+`git grep -n 'pnpm\|corepack' -- .github` must find only comments; convert the rest the same way.
+
+`fork-ci-runners.ts` maps upstream's Blacksmith runner labels, which the fork has no
+installation for, to GitHub-hosted runners. It scales each mapped job's timeouts by the vCPUs it
+loses, because the hosted runners have 3 or 4. A reusable workflow takes the largest loss among
+the runners its callers pass. Each mapped line keeps upstream's label or timeout in a
+`# fork-mapped:` or `# fork-scaled:` comment, so a rerun rescales from upstream's value. The
+script also makes Agent Context Budget compare with the PR's base branch, because `fork` lags
+`main` until the sync.
+
+A `runs-on` or `timeout-minutes` line conflicts when upstream edits it. In each conflict hunk,
+keep upstream's side, then rerun the script. Do not check out a whole workflow file from either
+side: that drops either upstream's changes or the fork's bun edits elsewhere in the file.
 
 The script fails when a label names an OS it has no runner for, or when upstream changed the
 budget fetch. Add the runner to `hostedRunners` or redo the edit by hand.
 
-When the rebase conflicts in any other patch, run `git rebase --abort` and leave `fork` as it was. File a board task
-that names the conflicting patch, its files and the upstream commit it conflicts with. When a
-check fails, file a task with the failing check and its output, and do not push.
+### Other conflicts
+
+Resolve a conflict in another fork patch by keeping upstream's behavior and redoing the patch on
+top. When that needs a design choice, run `git merge --abort` and file a board task that names
+the patch, its files and the upstream commit it conflicts with.
 
 ## State retention
 
