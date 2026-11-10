@@ -122,14 +122,14 @@ for (const dir of (pkg.workspaces.packages as Array<string>).flatMap((glob) =>
   const { dependencies, devDependencies } = JSON.parse(NodeFS.readFileSync(manifest, "utf8"));
   for (const [name, spec] of Object.entries({ ...dependencies, ...devDependencies })) {
     const tarball = (spec as string).match(/^file:(.+\.tgz)$/)?.[1];
-    if (tarball === undefined || `${name}@${tarball}` in pkg.patchedDependencies) continue;
+    if (tarball === undefined || `${name}@${tarball}` in (pkg.patchedDependencies ?? {})) continue;
     lock = lock.replaceAll(`["${name}@${tarball}"`, `["${name}@${NodePath.join(dir, tarball)}"`);
   }
 }
 NodeFS.writeFileSync("bun.lock", lock);
 install();
 
-// Format package.json as `vp fmt` does (oxfmt with sortPackageJson), with the lockfile's oxfmt.
+// Format as `vp fmt` does (oxfmt with sortPackageJson), with the lockfile's oxfmt.
 const oxfmtVersion = NodeFS.readFileSync("bun.lock", "utf8").match(
   /"oxfmt": \["oxfmt@([^"]+)"/,
 )![1];
@@ -140,7 +140,14 @@ const formatConfig = NodePath.join(
 NodeFS.writeFileSync(formatConfig, JSON.stringify({ sortPackageJson: {} }));
 const format = NodeChildProcess.spawnSync(
   "bunx",
-  [`oxfmt@${oxfmtVersion}`, "-c", formatConfig, "--ignore-path=/dev/null", "package.json"],
+  [
+    `oxfmt@${oxfmtVersion}`,
+    "-c",
+    formatConfig,
+    "--ignore-path=/dev/null",
+    "package.json",
+    "bunfig.toml",
+  ],
   { encoding: "utf8" },
 );
 NodeFS.rmSync(NodePath.dirname(formatConfig), { recursive: true });

@@ -50,7 +50,7 @@ git rebase --continue
 ```
 
 The script migrates upstream's lockfile and workspace into `package.json` and `bun.lock`,
-writes `bunfig.toml`, formats `package.json` as `vp fmt` does, and deletes the pnpm files. It
+writes `bunfig.toml`, formats both as `vp fmt` does, and deletes the pnpm files. It
 fails when bun still warns, for example about a patch that no longer applies to a new version.
 Fix that in `package.json` and run `bun install`.
 
