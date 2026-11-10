@@ -38,8 +38,8 @@ jobs:
   publish:
     name: Validate and publish
     if: github.repository == 'pingdotgg/t3code'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60 # fork-scaled: 30
     container:
       image: archlinux:base-devel
 

@@ -40,8 +40,8 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60 # fork-scaled: 30
     environment:
       name: relay-preview-cleanup
     env:
@@ -74,6 +74,7 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+              - --filter=@t3tools/monorepo
 
       # Destroy also runs the preview tunnel sweep, which is part of the stack.
       - name: Destroy preview stage
@@ -101,8 +102,8 @@ jobs:
   list_closed_previews:
     name: List closed relay previews
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     outputs:
       numbers: ${{ steps.list.outputs.numbers }}
     steps:
@@ -125,8 +126,8 @@ jobs:
     name: Retry teardown for PR ${{ matrix.number }}
     needs: list_closed_previews
     if: github.ref == 'refs/heads/main' && needs.list_closed_previews.outputs.numbers != '[]'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60 # fork-scaled: 30
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -187,6 +188,7 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+              - --filter=@t3tools/monorepo
 
       - name: Destroy preview stage
         if: steps.eligible.outputs.eligible == 'yes'

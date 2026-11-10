@@ -3,9 +3,7 @@
 linker = "isolated"
 # @cursor/sdk finds its platform package (sandbox helper, rg, tree-sitter) by
 # walking up from the entry script for node_modules/@cursor/sdk-<platform>-<arch>.
-publicHoistPattern = [
-  "@cursor/sdk-*",
-]
+publicHoistPattern = ["@cursor/sdk-*"]
 # pnpm's default: resolve only versions published at least a day ago. Bun exempts
 # every version of an excluded package; pnpm exempts only the listed version.
 minimumReleaseAge = 86400
