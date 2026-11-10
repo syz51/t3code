@@ -8,6 +8,7 @@ publicHoistPattern = ["@cursor/sdk-*"]
 # every version of an excluded package; pnpm exempts only the listed version.
 minimumReleaseAge = 86400
 minimumReleaseAgeExcludes = [
+  "@anthropic-ai/claude-agent-sdk",
   "@effect/tsgo",
   "@effect/tsgo-darwin-arm64",
   "@effect/tsgo-darwin-x64",
@@ -16,4 +17,7 @@ minimumReleaseAgeExcludes = [
   "@effect/tsgo-linux-x64",
   "@effect/tsgo-win32-arm64",
   "@effect/tsgo-win32-x64",
+  "@legendapp/list",
+  "@pierre/diffs",
+  "@pierre/highlights",
 ]
