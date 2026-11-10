@@ -279,7 +279,10 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
       server
         .callTool({
           name,
-          arguments: { path: "/t3-missing-dir/revenue.html", title: "Revenue", height: 240 },
+          arguments: {
+            path: "/t3-missing-dir/revenue.html",
+            ...(name === "html_render" ? { title: "Revenue", height: 240 } : {}),
+          },
         })
         .pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
