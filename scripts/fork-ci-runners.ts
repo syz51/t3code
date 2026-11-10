@@ -10,6 +10,7 @@ const hostedRunners: Record<string, { label: string; vcpus: number }> = {
   "ubuntu-2404": { label: "ubuntu-24.04", vcpus: 4 },
   "ubuntu-2404-arm": { label: "ubuntu-24.04-arm", vcpus: 4 },
   "macos-26": { label: "macos-26", vcpus: 3 },
+  "macos-27": { label: "macos-26", vcpus: 3 },
   "windows-2025": { label: "windows-2025", vcpus: 4 },
 };
 // GitHub cancels a hosted job after six hours.
