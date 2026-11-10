@@ -2421,6 +2421,15 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      if (
+        input.isolation !== "worktree" &&
+        (input.baseRef !== undefined || input.startFromOrigin === true)
+      ) {
+        return yield* failure(
+          "invalid_request",
+          '`baseRef` and `startFromOrigin` choose where a new checkout starts, so they need isolation "worktree".',
+        );
+      }
       const environmentId =
         input.target === undefined
           ? undefined
@@ -2486,14 +2495,22 @@ const make = Effect.gen(function* () {
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
+        const startFromOrigin = input.startFromOrigin === true;
+        // A local base resolves where the parent works, so `HEAD` and relative refs mean its commit.
+        const localRef = startFromOrigin ? "HEAD" : (input.baseRef ?? "HEAD");
         const base = yield* gitDriver
           .resolveCommit({
             cwd: parent.thread.worktreePath ?? project.workspaceRoot,
-            revision: "HEAD",
+            revision: localRef,
           })
           .pipe(
             Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
+              failure(
+                "invalid_request",
+                localRef === "HEAD"
+                  ? "Unable to resolve the parent checkout commit."
+                  : `Base ref "${localRef}" does not resolve to a commit in the parent checkout. No task was created. Pass a branch, tag, or commit that exists there, or set startFromOrigin:true if it exists only on a remote.`,
+              ),
             ),
           );
         // Launch preparation creates the worktree from the project root, so a
@@ -2511,7 +2528,28 @@ const make = Effect.gen(function* () {
               ),
             );
         }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        if (startFromOrigin) {
+          const strategy = {
+            type: "worktree" as const,
+            baseRef: input.baseRef ?? (yield* resolveScheduledTaskBaseRef(project.workspaceRoot)),
+            startFromOrigin: true,
+          };
+          yield* threadLaunch
+            .checkWorktreeBase({ projectId: project.id, workspaceStrategy: strategy })
+            .pipe(
+              Effect.mapError((error) =>
+                failure(
+                  "invalid_request",
+                  input.baseRef === undefined
+                    ? `Project "${project.title}" (${project.workspaceRoot}) has no remote default branch and no local main or master. No task was created. Pass baseRef.`
+                    : `${error.message} No task was created. Pass a branch, tag, or commit that exists there; the project has no usable remote to fetch it from.`,
+                ),
+              ),
+            );
+          workspaceStrategy = strategy;
+        } else {
+          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        }
       }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its

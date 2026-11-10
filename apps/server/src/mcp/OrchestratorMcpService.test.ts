@@ -10,6 +10,7 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   type OrchestratorMcpCapabilitiesResult,
+  type OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpTarget,
   type OrchestrationV2ThreadShell,
   type ScheduledTask,
@@ -3352,6 +3353,200 @@ describe("OrchestratorMcpService provider resolution", () => {
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
     }),
   );
+
+  describe("worktree isolation base", () => {
+    const workspaceRoot = "/repo";
+    const parentWorktree = "/repo-worktrees/parent";
+    const task = {
+      id: taskId,
+      threadId: parentThreadId,
+      origin: "app_owned",
+      childThreadId,
+      providerInstanceId: codexInstanceId,
+      model: "gpt-5.4",
+      status: "running",
+      result: null,
+    };
+    const withParentWorktree = (projection: OrchestrationV2ThreadProjection) =>
+      ({
+        ...projection,
+        thread: { ...projection.thread, worktreePath: parentWorktree },
+      }) as OrchestrationV2ThreadProjection;
+    // The parent checkout sits behind the remote, and HEAD means different commits in it and the root.
+    const parentCommits: Record<string, string> = {
+      HEAD: "parent-sha",
+      "HEAD~1": "parent-prev",
+      "release/1.2": "release-sha",
+    };
+    const delegate = (
+      input: Partial<OrchestratorMcpDelegateTaskInput>,
+      { knownBase = true, foreignParent = false } = {},
+    ) =>
+      Effect.gen(function* () {
+        const commands: Array<{ readonly workspaceStrategy?: unknown }> = [];
+        const checked: Array<unknown> = [];
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            assertProviderInstanceEnabled: () => Effect.void,
+            getThreadRecords: (threadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? withParentWorktree(parentProjection(commands.length > 0 ? [task] : []))
+                  : childProjection,
+              ),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command as { readonly workspaceStrategy?: unknown });
+                return {
+                  sequence: 1,
+                  storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
+                } as never;
+              }),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({
+            getById: () =>
+              Effect.succeedSome({ id: projectId, title: "Repo", workspaceRoot } as never),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        const service = OrchestratorMcpService.layer.pipe(
+          Layer.provide(
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+              checkWorktreeBase: (input) =>
+                Effect.sync(() => checked.push(input)).pipe(
+                  Effect.andThen(
+                    knownBase
+                      ? Effect.void
+                      : Effect.fail(
+                          new ThreadLaunchService.ThreadLaunchBaseRefError({
+                            projectId,
+                            projectTitle: "Repo",
+                            workspaceRoot,
+                            baseRef: "gone",
+                          }),
+                        ),
+                  ),
+                ),
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(GitVcsDriver.GitVcsDriver)({
+              resolvePrimaryRemoteName: () => Effect.succeed("origin"),
+              resolveDefaultBranchName: () => Effect.succeed("main"),
+              resolveCommit: ({ cwd, revision }) => {
+                const commitSha =
+                  revision === "refs/remotes/origin/main"
+                    ? "remote-head"
+                    : cwd === parentWorktree
+                      ? parentCommits[revision]
+                      : revision === "HEAD"
+                        ? "root-sha"
+                        : foreignParent
+                          ? undefined
+                          : revision;
+                return commitSha === undefined
+                  ? Effect.fail(
+                      new GitCommandError({
+                        operation: "resolveCommit",
+                        command: "git rev-parse",
+                        cwd,
+                        detail: "unknown revision",
+                      }),
+                    )
+                  : Effect.succeed({ commitSha });
+              },
+            }),
+          ),
+          Layer.provide(dependencies),
+        );
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service),
+        );
+        const result = yield* mcp
+          .delegateTask(scope, { task: "Fix the bug.", mode: "async", ...input })
+          .pipe(Effect.result);
+        return { result, commands, checked };
+      });
+
+    it.effect.each([
+      {
+        name: "starts from the parent commit by default",
+        input: {},
+        strategy: { type: "worktree", baseRef: "parent-sha", startFromOrigin: false },
+      },
+      {
+        name: "starts from the fetched default branch with startFromOrigin",
+        input: { startFromOrigin: true },
+        strategy: { type: "worktree", baseRef: "origin/main", startFromOrigin: true },
+      },
+      {
+        name: "starts from a given baseRef, resolved in the parent checkout",
+        input: { baseRef: "HEAD~1" },
+        strategy: { type: "worktree", baseRef: "parent-prev", startFromOrigin: false },
+      },
+      {
+        name: "ignores startFromOrigin false",
+        input: { baseRef: "release/1.2", startFromOrigin: false },
+        strategy: { type: "worktree", baseRef: "release-sha", startFromOrigin: false },
+      },
+      {
+        name: "fetches a given baseRef with startFromOrigin",
+        input: { baseRef: "release/1.2", startFromOrigin: true },
+        strategy: { type: "worktree", baseRef: "release/1.2", startFromOrigin: true },
+      },
+    ])("$name", ({ input, strategy }) =>
+      Effect.gen(function* () {
+        const { result, commands, checked } = yield* delegate({ isolation: "worktree", ...input });
+        assert.isTrue(result._tag === "Success");
+        assert.deepEqual(commands[0]?.workspaceStrategy, strategy);
+        // Only a fetched base needs the launch check; a local one was resolved to a commit.
+        assert.deepEqual(
+          checked,
+          strategy.startFromOrigin ? [{ projectId, workspaceStrategy: strategy }] : [],
+        );
+      }),
+    );
+
+    it.effect.each([
+      { name: "an unknown local baseRef", input: { isolation: "worktree", baseRef: "gone" } },
+      {
+        name: "an unknown fetched baseRef",
+        input: { isolation: "worktree", baseRef: "gone", startFromOrigin: true },
+        options: { knownBase: false },
+      },
+      {
+        name: "a fetched base for a parent in another repository",
+        input: { isolation: "worktree", startFromOrigin: true },
+        options: { foreignParent: true },
+      },
+      { name: "baseRef without worktree isolation", input: { baseRef: "release/1.2" } },
+      { name: "startFromOrigin without worktree isolation", input: { startFromOrigin: true } },
+    ] as const)("refuses $name before creating a task", ({ input, ...rest }) =>
+      Effect.gen(function* () {
+        const { result, commands } = yield* delegate(
+          input,
+          "options" in rest ? rest.options : undefined,
+        );
+        assert.isTrue(result._tag === "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.code, "invalid_request");
+        assert.deepEqual(commands, []);
+      }),
+    );
+  });
 
   describe("resolveRuntimeMode", () => {
     const muse = {
