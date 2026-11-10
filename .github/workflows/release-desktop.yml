@@ -156,7 +156,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/monorepo
           save-install-cache: ${{ inputs.save_install_cache }}
 
       # The CLI archive and the staged app install without a lockfile, so they

@@ -66,6 +66,7 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+              - --filter=@t3tools/monorepo
 
       - name: Deploy production relay stage
         run: vp run --filter t3code-relay deploy --stage prod --yes --no-input ${{ inputs.force && '--force' || '' }}

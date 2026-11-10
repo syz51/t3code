@@ -417,7 +417,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=t3code-relay...
+          install-args: --filter=t3code-relay... --filter=@t3tools/monorepo
 
       # The deployed stack's outputs, read from Alchemy's state store without
       # planning or applying. Select the backend explicitly to avoid loading
@@ -527,7 +527,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       - name: Download relay client tracing config
         uses: actions/download-artifact@v8
@@ -803,7 +803,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       # Overlaps the artifact downloads. The wait below ends it before any
       # workspace script runs, so the Play key lives only in this process.
@@ -1131,7 +1131,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts... --filter=@t3tools/web...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/web... --filter=@t3tools/monorepo
 
       - name: Download relay client tracing config
         uses: actions/download-artifact@v8
@@ -1299,7 +1299,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/marketing...
+          install-args: --filter=@t3tools/marketing... --filter=@t3tools/monorepo
 
       - id: deploy
         name: Build staged deployment
@@ -1423,7 +1423,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code... --filter=@t3tools/monorepo
 
       - id: update_versions
         name: Update version strings
@@ -1483,7 +1483,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       - name: Read published release notes
         if: needs.preflight.outputs.is_prerelease == 'true'

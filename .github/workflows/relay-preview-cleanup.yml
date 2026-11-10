@@ -74,6 +74,7 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+              - --filter=@t3tools/monorepo
 
       # Destroy also runs the preview tunnel sweep, which is part of the stack.
       - name: Destroy preview stage
@@ -187,6 +188,7 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+              - --filter=@t3tools/monorepo
 
       - name: Destroy preview stage
         if: steps.eligible.outputs.eligible == 'yes'

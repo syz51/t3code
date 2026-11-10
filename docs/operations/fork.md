@@ -56,7 +56,9 @@ Fix that in `package.json` and run `bun install`.
 
 The other three commits conflict when upstream edits a workflow, script or doc they change. Keep
 upstream's change and redo the commit's edit in it: `bun install` for pnpm installs, `bun.lock`
-for `pnpm-lock.yaml`, and `package.json` for `pnpm-workspace.yaml`. `apps/mobile/eas.json` pins
+for `pnpm-lock.yaml`, and `package.json` for `pnpm-workspace.yaml`. A filtered bun install leaves
+out the root package, which owns `vite-plus`, so add `--filter=@t3tools/monorepo` to every
+filtered install; without it `vp` cannot load the task graph. `apps/mobile/eas.json` pins
 the same bun version as `packageManager`; update both together.
 
 The commit "ci(fork): run upstream's workflows on GitHub-hosted runners" maps upstream's

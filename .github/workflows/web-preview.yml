@@ -63,6 +63,7 @@ jobs:
             args:
               - --filter=@t3tools/scripts...
               - --filter=@t3tools/web...
+              - --filter=@t3tools/monorepo
 
       - id: deploy
         name: Deploy preview

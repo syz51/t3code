@@ -71,6 +71,7 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
+              - --filter=@t3tools/monorepo
 
       - name: Fingerprint merge result
         if: steps.changes.outputs.relevant == 'true'
@@ -90,7 +91,7 @@ jobs:
           # Re-sync node_modules to the base commit's lockfile before
           # fingerprinting — a dep-changing PR must not fingerprint the base
           # against head's installed packages.
-          bun install --frozen-lockfile --filter=@t3tools/mobile...
+          bun install --frozen-lockfile --filter=@t3tools/mobile... --filter=@t3tools/monorepo
           cd apps/mobile
           for platform in ios android; do
             npx expo-updates fingerprint:generate --platform "$platform" > "$RUNNER_TEMP/fp/base/$platform.json"
