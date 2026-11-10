@@ -249,6 +249,17 @@ export class UnsupportedHostBuildPlatformError extends Schema.TaggedError<Unsupp
   }
 }
 
+export class ForkBuildMissingConnectConfigError extends Schema.TaggedError<ForkBuildMissingConnectConfigError>()(
+  "ForkBuildMissingConnectConfigError",
+  {
+    version: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Fork build ${this.version} has no T3CODE_CLERK_PUBLISHABLE_KEY, so T3 Connect would not work. Run \`cp .env.example .env\` first.`;
+  }
+}
+
 export class UnsupportedDesktopBuildArchitectureError extends Schema.TaggedError<UnsupportedDesktopBuildArchitectureError>()(
   "UnsupportedDesktopBuildArchitectureError",
   {
@@ -1734,6 +1745,10 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     });
   }
   const version = mergeOptions(input.buildVersion, env.version, undefined);
+  // A fork build replaces Nightly, so without the public T3 Connect config it strands every relay environment.
+  if (version?.includes("-fork.") && !loadRepoEnv({ repoRoot }).T3CODE_CLERK_PUBLISHABLE_KEY) {
+    return yield* new ForkBuildMissingConnectConfigError({ version });
+  }
   const releaseDir = resolveBooleanFlag(input.mockUpdates, env.mockUpdates)
     ? "release-mock"
     : "release";
