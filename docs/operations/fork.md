@@ -201,9 +201,14 @@ with the installed app. Stop the server with Ctrl+C.
 ## Desktop app
 
 ```sh
+cp .env.example .env
 T3CODE_DESKTOP_VERSION=0.1.8-fork.$(date +%Y%m%d) \
   vp run dist:desktop:artifact --platform mac --target dir --arch arm64 --output-dir ~/.t3-fork/build
 ```
+
+`.env` carries the public T3 Connect config that official builds bake in. Without it, the app
+never loads a T3 Connect sign-in and every relay environment shows "still loading its T3 Connect
+sign-in". A fork version refuses to build without it.
 
 It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
 about a minute. Do not open it from Finder while Nightly runs. To try it beside Nightly, give it
