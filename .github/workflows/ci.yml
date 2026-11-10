@@ -22,7 +22,7 @@ jobs:
   # open: if the diff cannot be resolved, everything runs.
   changes:
     name: Changes
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       typecheck: ${{ steps.detect.outputs.typecheck }}
@@ -63,8 +63,8 @@ jobs:
       contents: read
       id-token: write
     name: Lint
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -119,8 +119,8 @@ jobs:
     name: Build and Typecheck
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -177,7 +177,7 @@ jobs:
       - name: Finish installing browser secret helper build libraries
         id: apt
         if: ${{ !cancelled() && needs.changes.outputs.build != 'false' }}
-        timeout-minutes: 10
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
@@ -224,12 +224,12 @@ jobs:
 
       - name: Boot the built web client
         if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
-        timeout-minutes: 6
+        timeout-minutes: 6 # fork-scaled: 3
         run: node apps/web/scripts/verify-built-boot.ts
 
       - name: Typecheck
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        timeout-minutes: 10
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/typecheck-status"; do sleep 1; done
           cat "$RUNNER_TEMP/typecheck.log"
@@ -248,8 +248,8 @@ jobs:
     name: Test
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -296,7 +296,7 @@ jobs:
         run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs
 
       - name: Finish installing browser secret helper build libraries
-        timeout-minutes: 10
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
@@ -330,8 +330,8 @@ jobs:
     name: Test Web
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -388,7 +388,7 @@ jobs:
       contents: read
       id-token: write
     name: Test Server ${{ matrix.shard }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-4vcpu-ubuntu-2404
     # Shards take 2-5 minutes. When the shared task cache throttles reads, each
     # failed fetch stalls vp for 15-90s, which pushed shards past 10 minutes.
     timeout-minutes: 20
@@ -504,7 +504,7 @@ jobs:
     name: Rust
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -537,8 +537,8 @@ jobs:
     name: Mobile Native Static Analysis
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
-    runs-on: macos-26
-    timeout-minutes: 20
+    runs-on: macos-26 # fork-mapped: blacksmith-6vcpu-macos-26
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -571,8 +571,8 @@ jobs:
     name: Release Smoke
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -611,7 +611,7 @@ jobs:
         mobile_native_static_analysis,
         release_smoke,
       ]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Require every job to pass

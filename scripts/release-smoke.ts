@@ -57,7 +57,6 @@ const workspaceFiles = [
   "scripts/package.json",
   // Bun requires every workspace that package.json names without a glob.
   "evals/package.json",
-  "oxlint-plugin-t3code/package.json",
 ] as const;
 
 function copyWorkspaceManifestFixture(targetRoot: string): void {

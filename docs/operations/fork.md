@@ -38,9 +38,12 @@ The bun conversion is four commits, from "build: switch the fork's package manag
 bun" to "docs(fork): sync upstream with bun …". They edit upstream files, so they conflict
 whenever upstream changes those files.
 
+Later `fix(fork)` and `ci(fork)` commits that edit the same files follow the same rules as the
+commit they fix.
+
 The first commit conflicts whenever upstream changes `package.json`, `pnpm-lock.yaml` or
 `pnpm-workspace.yaml`. Never merge `bun.lock`, `bunfig.toml` or the converted `package.json` by
-hand. Regenerate them from upstream's files:
+hand, in that commit or any later one. Regenerate them from upstream's files:
 
 ```sh
 git checkout upstream/main -- package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs
@@ -63,10 +66,12 @@ the same bun version as `packageManager`; update both together.
 
 The commit "ci(fork): run upstream's workflows on GitHub-hosted runners" maps upstream's
 Blacksmith runner labels, which the fork has no installation for, to GitHub-hosted runners. It
-scales each mapped job's timeouts by the vCPUs it loses, because the hosted runners have 3 or 4. It
-also makes Agent Context Budget compare with the PR's base branch, because `fork` lags `main`
-until the sync. It conflicts when upstream edits a `runs-on` line or that budget fetch. Keep the
-rebased file and rerun the script:
+scales each mapped job's timeouts by the vCPUs it loses, because the hosted runners have 3 or 4.
+A reusable workflow takes the largest loss among the runners its callers pass. Each mapped line
+keeps upstream's label or timeout in a `# fork-mapped:` or `# fork-scaled:` comment, so a rerun
+rescales from upstream's value. It also makes Agent Context Budget compare with the PR's base
+branch, because `fork` lags `main` until the sync. It conflicts when upstream edits a `runs-on`
+or `timeout-minutes` line or that budget fetch. Keep the rebased file and rerun the script:
 
 ```sh
 git checkout --ours -- <conflicting workflow files>

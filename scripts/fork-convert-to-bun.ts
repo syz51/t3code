@@ -105,15 +105,20 @@ for (const [, patch, name, version] of migration.matchAll(
 pkg.trustedDependencies = trusted.toSorted();
 NodeFS.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
 
-const warnings = install()
-  .split("\n")
-  .filter((line) => line.startsWith("warn:"));
-if (warnings.length > 0) throw new Error(`bun still warns:\n${warnings.join("\n")}`);
+const installWithoutWarnings = () => {
+  const warnings = install()
+    .split("\n")
+    .filter((line) => line.startsWith("warn:"));
+  if (warnings.length > 0) throw new Error(`bun still warns:\n${warnings.join("\n")}`);
+};
+installWithoutWarnings();
 
 // The isolated linker reads a workspace's file: tarball from the repo root, so an install with a
 // cold cache fails with ENOENT. Bun keeps a root-relative path once the lockfile has it.
 // Patched tarballs install by another route and keep the path their patch key names.
-let lock = NodeFS.readFileSync("bun.lock", "utf8");
+const migratedLock = NodeFS.readFileSync("bun.lock", "utf8");
+let lock = migratedLock;
+const rootedTarballs: Array<string> = [];
 for (const dir of (pkg.workspaces.packages as Array<string>).flatMap((glob) =>
   NodeFS.globSync(glob),
 )) {
@@ -123,11 +128,20 @@ for (const dir of (pkg.workspaces.packages as Array<string>).flatMap((glob) =>
   for (const [name, spec] of Object.entries({ ...dependencies, ...devDependencies })) {
     const tarball = (spec as string).match(/^file:(.+\.tgz)$/)?.[1];
     if (tarball === undefined || `${name}@${tarball}` in (pkg.patchedDependencies ?? {})) continue;
-    lock = lock.replaceAll(`["${name}@${tarball}"`, `["${name}@${NodePath.join(dir, tarball)}"`);
+    const rooted = `["${name}@${NodePath.join(dir, tarball)}"`;
+    lock = lock.replaceAll(`["${name}@${tarball}"`, rooted);
+    rootedTarballs.push(rooted);
   }
 }
-NodeFS.writeFileSync("bun.lock", lock);
-install();
+if (lock !== migratedLock) {
+  NodeFS.writeFileSync("bun.lock", lock);
+  installWithoutWarnings();
+}
+const finalLock = NodeFS.readFileSync("bun.lock", "utf8");
+const unrooted = rootedTarballs.filter((entry) => !finalLock.includes(entry));
+if (unrooted.length > 0) {
+  throw new Error(`bun.lock lacks the root-relative tarball entries:\n${unrooted.join("\n")}`);
+}
 
 // Format as `vp fmt` does (oxfmt with sortPackageJson), with the lockfile's oxfmt.
 const oxfmtVersion = NodeFS.readFileSync("bun.lock", "utf8").match(

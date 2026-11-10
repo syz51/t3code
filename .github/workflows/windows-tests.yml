@@ -26,8 +26,8 @@ permissions:
 jobs:
   test:
     name: Test (${{ inputs.package || 'all non-server' }})
-    runs-on: windows-2025
-    timeout-minutes: 90
+    runs-on: windows-2025 # fork-mapped: blacksmith-8vcpu-windows-2025
+    timeout-minutes: 90 # fork-scaled: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6

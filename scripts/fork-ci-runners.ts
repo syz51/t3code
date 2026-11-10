@@ -14,31 +14,61 @@ const hostedRunners: Record<string, { label: string; vcpus: number }> = {
 };
 // GitHub cancels a hosted job after six hours.
 const maxTimeoutMinutes = 360;
+// Mapped lines keep upstream's value in these comments, so a rerun after a sync rescales from it.
+const mappedMarker = " # fork-mapped: ";
+const scaledMarker = " # fork-scaled: ";
+
+const labelLine = new RegExp(
+  `^(\\s*(?:runs-on|runner):\\s*)(?:[\\w.-]+${mappedMarker})?(blacksmith-(\\d+)vcpu-([a-z0-9-]+))\\s*$`,
+  "gm",
+);
+const timeoutLine = new RegExp(`^(\\s*timeout-minutes:\\s*)(.+?)(?:${scaledMarker}(.+))?$`, "gm");
 
 const workflowDir = ".github/workflows";
-for (const name of NodeFS.readdirSync(workflowDir)) {
-  if (!/\.ya?ml$/.test(name)) continue;
-  const file = NodePath.join(workflowDir, name);
+const files = NodeFS.readdirSync(workflowDir)
+  .filter((name) => /\.ya?ml$/.test(name))
+  .map((name) => NodePath.join(workflowDir, name));
+const jobsOf = (text: string) => text.split(/^(?= {2}[\w-]+:\s*(?:#.*)?$)/m);
+
+// Upstream sizes each job's timeouts for its runner, so scale them by the vCPUs the job loses.
+const slowdownOf = (file: string, job: string) => {
+  let slowdown = 1;
+  for (const [line, , , vcpus, os] of job.matchAll(labelLine)) {
+    const runner = hostedRunners[os!];
+    if (runner === undefined) throw new Error(`${file}: no GitHub-hosted runner for ${line}`);
+    slowdown = Math.max(slowdown, Math.ceil(Number(vcpus) / runner.vcpus));
+  }
+  return slowdown;
+};
+
+// A reusable workflow runs on the `runner` its callers pass, so it takes their largest slowdown.
+const callerSlowdowns = new Map<string, number>();
+for (const file of files) {
+  for (const job of jobsOf(NodeFS.readFileSync(file, "utf8"))) {
+    const called = job.match(/^\s*uses:\s*\.\/(\.github\/workflows\/[\w.-]+)\s*$/m)?.[1];
+    if (called === undefined) continue;
+    callerSlowdowns.set(called, Math.max(callerSlowdowns.get(called) ?? 1, slowdownOf(file, job)));
+  }
+}
+
+for (const file of files) {
   const text = NodeFS.readFileSync(file, "utf8");
-  // Upstream sizes each job's timeouts for its runner, so scale them by the vCPUs the job loses.
-  const mapped = text
-    .split(/^(?= {2}[\w-]+:\s*$)/m)
+  const mapped = jobsOf(text)
     .map((job) => {
-      let slowdown = 1;
-      const relabeled = job.replace(
-        /^(\s*(?:runs-on|runner):\s*)blacksmith-(\d+)vcpu-([a-z0-9-]+)/gm,
-        (line, prefix: string, vcpus: string, os: string) => {
-          const runner = hostedRunners[os];
-          if (runner === undefined) throw new Error(`${file}: no GitHub-hosted runner for ${line}`);
-          slowdown = Math.max(slowdown, Math.ceil(Number(vcpus) / runner.vcpus));
-          return `${prefix}${runner.label}`;
-        },
-      );
-      return relabeled.replace(
-        /^(\s*timeout-minutes:\s*)(\d+)/gm,
-        (_, prefix: string, minutes: string) =>
-          `${prefix}${Math.min(Number(minutes) * slowdown, maxTimeoutMinutes)}`,
-      );
+      const slowdown = Math.max(slowdownOf(file, job), callerSlowdowns.get(file) ?? 1);
+      return job
+        .replace(labelLine, (_, prefix: string, label: string, _vcpus: string, os: string) => {
+          return `${prefix}${hostedRunners[os]!.label}${mappedMarker}${label}`;
+        })
+        .replace(timeoutLine, (_, prefix: string, current: string, upstream?: string) => {
+          const minutes = upstream ?? current;
+          if (slowdown === 1) return `${prefix}${minutes}`;
+          // Scales each number, so `${{ cond && 70 || 30 }}` scales both branches.
+          const scaled = minutes.replace(/\b\d+\b/g, (value) =>
+            String(Math.min(Number(value) * slowdown, maxTimeoutMinutes)),
+          );
+          return `${prefix}${scaled}${scaledMarker}${minutes}`;
+        });
     })
     .join("");
   if (mapped !== text) NodeFS.writeFileSync(file, mapped);
