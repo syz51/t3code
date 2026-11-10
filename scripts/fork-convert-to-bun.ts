@@ -110,6 +110,25 @@ const warnings = install()
   .filter((line) => line.startsWith("warn:"));
 if (warnings.length > 0) throw new Error(`bun still warns:\n${warnings.join("\n")}`);
 
+// The isolated linker reads a workspace's file: tarball from the repo root, so an install with a
+// cold cache fails with ENOENT. Bun keeps a root-relative path once the lockfile has it.
+// Patched tarballs install by another route and keep the path their patch key names.
+let lock = NodeFS.readFileSync("bun.lock", "utf8");
+for (const dir of (pkg.workspaces.packages as Array<string>).flatMap((glob) =>
+  NodeFS.globSync(glob),
+)) {
+  const manifest = NodePath.join(dir, "package.json");
+  if (!NodeFS.existsSync(manifest)) continue;
+  const { dependencies, devDependencies } = JSON.parse(NodeFS.readFileSync(manifest, "utf8"));
+  for (const [name, spec] of Object.entries({ ...dependencies, ...devDependencies })) {
+    const tarball = (spec as string).match(/^file:(.+\.tgz)$/)?.[1];
+    if (tarball === undefined || `${name}@${tarball}` in pkg.patchedDependencies) continue;
+    lock = lock.replaceAll(`["${name}@${tarball}"`, `["${name}@${NodePath.join(dir, tarball)}"`);
+  }
+}
+NodeFS.writeFileSync("bun.lock", lock);
+install();
+
 // Format package.json as `vp fmt` does (oxfmt with sortPackageJson), with the lockfile's oxfmt.
 const oxfmtVersion = NodeFS.readFileSync("bun.lock", "utf8").match(
   /"oxfmt": \["oxfmt@([^"]+)"/,
