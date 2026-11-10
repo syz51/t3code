@@ -41,6 +41,10 @@ Fix CI failures on the branch. Merge the PR with a merge commit (`gh pr merge --
 squash, so `fork` keeps upstream's history and the next merge finds the right base. Then rebuild
 the fork app (see [Desktop app](#desktop-app)).
 
+Agent Context Budget fails when upstream grew the agent context since the last sync. When
+`git diff upstream/main -- apps/server/src/provider/agentContextBudget.json` is empty, the growth
+is upstream's: add the `agent-context-increase` label to the PR.
+
 On macOS, some server tests fail locally because temporary paths resolve to `/private/var` or
 the file system ignores case. CI runs them on Linux; trust its result there.
 
