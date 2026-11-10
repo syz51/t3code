@@ -326,7 +326,7 @@ jobs:
     needs: [resolve, build]
     if: needs.resolve.outputs.eligible == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     # Its own group, so a publish never cancels a newer commit's signing job
     # (they would share the build group) and is never cancelled mid-upload.
     # preview_eligible's head check keeps a superseded publish from landing.

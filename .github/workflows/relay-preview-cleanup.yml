@@ -41,7 +41,7 @@ jobs:
       issues: write
       pull-requests: write
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     environment:
       name: relay-preview-cleanup
     env:
@@ -102,7 +102,7 @@ jobs:
     name: List closed relay previews
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       numbers: ${{ steps.list.outputs.numbers }}
     steps:
@@ -126,7 +126,7 @@ jobs:
     needs: list_closed_previews
     if: github.ref == 'refs/heads/main' && needs.list_closed_previews.outputs.numbers != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 4

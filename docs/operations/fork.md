@@ -61,6 +61,7 @@ the same bun version as `packageManager`; update both together.
 
 The commit "ci(fork): run upstream's workflows on GitHub-hosted runners" maps upstream's
 Blacksmith runner labels, which the fork has no installation for, to GitHub-hosted runners. It
+scales each mapped job's timeouts by the vCPUs it loses, because the hosted runners have 3 or 4. It
 also makes Agent Context Budget compare with the PR's base branch, because `fork` lags `main`
 until the sync. It conflicts when upstream edits a `runs-on` line or that budget fetch. Keep the
 rebased file and rerun the script:
