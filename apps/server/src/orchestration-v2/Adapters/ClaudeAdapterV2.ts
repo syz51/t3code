@@ -3689,6 +3689,7 @@ const ClaudeToolResultMetadata = Schema.Struct({
   ),
 });
 const isClaudeToolResultMetadata = Schema.is(ClaudeToolResultMetadata);
+const isClaudeEnterWorktreeResult = Schema.is(Schema.Struct({ worktreePath: Schema.String }));
 
 function claudeToolNonExecutionKind(message: SDKMessage, toolUseId: string) {
   return isClaudeToolResultMetadata(message)
@@ -4203,6 +4204,7 @@ function buildAssistantArtifacts(input: {
   readonly ordinal: number;
   readonly startedAt: DateTime.Utc;
   readonly completedAt: DateTime.Utc;
+  readonly workingDirectory: string | undefined;
 }): {
   readonly node: OrchestrationV2ExecutionNode;
   readonly message: OrchestrationV2ConversationMessage;
@@ -4277,6 +4279,7 @@ function buildAssistantArtifacts(input: {
       messageId,
       text: input.text,
       streaming: false,
+      ...(input.workingDirectory === undefined ? {} : { workingDirectory: input.workingDirectory }),
     },
   };
 }
@@ -5242,6 +5245,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const subagentToolCalls = new Map<string, ActiveClaudeToolCall>();
         const pendingSubagentLaunchesByToolUseId = new Map<string, PendingClaudeSubagentLaunch>();
         const settledTurnByNativeThread = new Map<string, ActiveClaudeTurnContext>();
+        // Set while the main agent works in a worktree it entered; its links resolve there.
+        const agentCwdByNativeThread = new Map<string, string>();
         const subagentStopOutcomes = new Map<
           string,
           Deferred.Deferred<ProviderAdapter.ProviderAdapterV2SubagentOutcome>
@@ -8034,6 +8039,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ordinal,
               startedAt: input.context.startedAt,
               completedAt: input.completedAt,
+              workingDirectory: agentCwdByNativeThread.get(input.context.nativeThreadId),
             });
             yield* Effect.all(
               [
@@ -8273,6 +8279,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ordinal,
             startedAt: now,
             completedAt: now,
+            workingDirectory: agentCwdByNativeThread.get(input.context.nativeThreadId),
           });
           yield* Effect.all(
             [
@@ -9800,14 +9807,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 (toolCall.toolName.startsWith("mcp__") ? withoutForgedMcpApp(output) : output),
               completedAt: yield* DateTime.now,
             });
-            // Subagents write to the session's shared task store, so their
-            // task tools update the parent turn's list. Failed or never-run
-            // calls changed nothing.
-            if (
+            // Failed or never-run calls changed nothing.
+            const executed =
               claudeToolNonExecutionKind(message, toolResult.tool_use_id) === undefined &&
-              !isClaudeToolResultError(toolResult) &&
-              CLAUDE_TASK_TOOL_NAMES.has(toolCall.toolName)
-            ) {
+              !isClaudeToolResultError(toolResult);
+            if (executed && parentToolUseId === null) {
+              if (toolCall.toolName === "ExitWorktree") {
+                agentCwdByNativeThread.delete(liveQuery.nativeThreadId);
+              } else if (
+                toolCall.toolName === "EnterWorktree" &&
+                output.type === "structured_tool_use_result" &&
+                isClaudeEnterWorktreeResult(output.value)
+              ) {
+                agentCwdByNativeThread.set(liveQuery.nativeThreadId, output.value.worktreePath);
+              }
+            }
+            // Subagents write to the session's shared task store, so their
+            // task tools update the parent turn's list.
+            if (executed && CLAUDE_TASK_TOOL_NAMES.has(toolCall.toolName)) {
               const taskLists = yield* Ref.get(taskListsByNativeThread);
               const knownTaskList = taskLists.get(liveQuery.nativeThreadId);
               const outputValue = claudeNativeToolOutputValue(output);
@@ -11043,6 +11060,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       message.permissionMode ?? context.openedPermissionMode;
                     context.receivedInit = true;
                     context.capabilities = new Set(message.capabilities ?? []);
+                  }
+                  // Each turn's init names the folder the agent works in, also after a restart.
+                  if (message.type === "system" && message.subtype === "init") {
+                    if (
+                      message.cwd === turnInput.runtimePolicy.cwd ||
+                      message.cwd === resolvedTurnCwd
+                    ) {
+                      agentCwdByNativeThread.delete(nativeThreadId);
+                    } else {
+                      agentCwdByNativeThread.set(nativeThreadId, message.cwd);
+                    }
                   }
                   if (
                     message.type === "system" &&
