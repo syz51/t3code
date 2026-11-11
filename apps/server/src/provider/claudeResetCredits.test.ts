@@ -6,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse, UrlParams } from "effect/http";
+import * as TestClock from "effect/testing/TestClock";
 import { describe, expect, it } from "vite-plus/test";
 
 import * as ClaudeResetCredits from "./claudeResetCredits.ts";
@@ -87,7 +88,16 @@ describe("claudeResetCreditsToContract", () => {
   });
 });
 
-effectIt.layer(NodeServices.layer)("readClaudeResetCredits", (it) => {
+const usageAnswer = {
+  cedar_ember: { eligible: true, next_grant_id: "grant_a", grants: [grant({})] },
+};
+const makeReader = (configDir: string, client: HttpClient.HttpClient, platform = "linux") =>
+  ClaudeResetCredits.makeClaudeResetCreditsReader(configDir).pipe(
+    Effect.provideService(HostProcess.Platform, platform as NodeJS.Platform),
+    Effect.provideService(HttpClient.HttpClient, client),
+  );
+
+effectIt.layer(NodeServices.layer)("makeClaudeResetCreditsReader", (it) => {
   it.effect("reads the grants with the CLI's request", () =>
     Effect.gen(function* () {
       const { configDir } = yield* writeLogin;
@@ -98,35 +108,55 @@ effectIt.layer(NodeServices.layer)("readClaudeResetCredits", (it) => {
         expect(request.headers.authorization).toBe("Bearer oauth-token");
         expect(request.headers["anthropic-beta"]).toBe("oauth-2025-04-20");
         expect(request.headers["user-agent"]).toBe("claude-cli/2.1.0 (external, cli)");
-        return Effect.succeed(
-          HttpClientResponse.fromWeb(
-            request,
-            Response.json({
-              cedar_ember: { eligible: true, next_grant_id: "grant_a", grants: [grant({})] },
-            }),
-          ),
-        );
+        return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json(usageAnswer)));
       });
-      const credits = yield* ClaudeResetCredits.readClaudeResetCredits(configDir, "2.1.0").pipe(
-        Effect.provideService(HostProcess.Platform, "linux"),
-        Effect.provideService(HttpClient.HttpClient, client),
-      );
-      expect(credits).toEqual({ availableCount: 1, nextCreditId: "grant_a" });
+      const reader = yield* makeReader(configDir, client);
+      expect(yield* reader.read("2.1.0")).toEqual({ availableCount: 1, nextCreditId: "grant_a" });
     }),
   );
 
   it.effect("reads nothing from keychain logins or failed requests", () =>
     Effect.gen(function* () {
       const { configDir } = yield* writeLogin;
-      const darwin = yield* ClaudeResetCredits.readClaudeResetCredits(configDir, "2.1.0").pipe(
-        Effect.provideService(HostProcess.Platform, "darwin"),
-        Effect.provideService(HttpClient.HttpClient, refuseRequests),
+      const darwin = yield* makeReader(configDir, refuseRequests, "darwin");
+      const limited = yield* makeReader(configDir, respond(429, {}));
+      expect([yield* darwin.read("2.1.0"), yield* limited.read("2.1.0")]).toEqual([
+        undefined,
+        undefined,
+      ]);
+    }),
+  );
+
+  it.effect("asks the usage endpoint once per five minutes, and again when invalidated", () =>
+    Effect.gen(function* () {
+      const { configDir } = yield* writeLogin;
+      const statuses = [429, 200, 200, 200];
+      let requests = 0;
+      const client = HttpClient.make((request) =>
+        Effect.sync(() =>
+          HttpClientResponse.fromWeb(
+            request,
+            Response.json(usageAnswer, { status: statuses[requests++]! }),
+          ),
+        ),
       );
-      const limited = yield* ClaudeResetCredits.readClaudeResetCredits(configDir, "2.1.0").pipe(
-        Effect.provideService(HostProcess.Platform, "linux"),
-        Effect.provideService(HttpClient.HttpClient, respond(429, {})),
-      );
-      expect([darwin, limited]).toEqual([undefined, undefined]);
+      const reader = yield* makeReader(configDir, client);
+      const credits = { availableCount: 1, nextCreditId: "grant_a" };
+
+      expect(yield* reader.read("2.1.0")).toBeUndefined();
+      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      yield* TestClock.adjust("4 minutes");
+      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(requests).toBe(2);
+
+      yield* reader.invalidate;
+      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(requests).toBe(3);
+
+      yield* TestClock.adjust("5 minutes");
+      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(requests).toBe(4);
     }),
   );
 });
