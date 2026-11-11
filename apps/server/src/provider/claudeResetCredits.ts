@@ -3,8 +3,11 @@ import type {
   ServerProviderResetCredits,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Cache from "effect/Cache";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -150,27 +153,56 @@ const withClaudeHeaders = (token: string, version: string) =>
     "user-agent": `claude-cli/${version} (external, cli)`,
   });
 
-export const readClaudeResetCredits = Effect.fn("readClaudeResetCredits")(
-  function* (configDir: string, version: string) {
-    const token = yield* readAccessToken(configDir);
-    if (!token) return undefined;
-    const client = yield* HttpClient.HttpClient;
-    const response = yield* client.execute(
-      HttpClientRequest.get(`${API_BASE}/api/oauth/usage`, {
-        urlParams: { cedar_ember: "1", skip_spend: "1" },
-      }).pipe(withClaudeHeaders(token, version)),
-    );
-    const body = yield* HttpClientResponse.schemaBodyJson(UsageResponse)(
-      yield* HttpClientResponse.filterStatusOk(response),
-    );
-    return claudeResetCreditsToContract(
+const fetchClaudeResetCredits = Effect.fn("readClaudeResetCredits")(function* (
+  configDir: string,
+  version: string,
+) {
+  const token = yield* readAccessToken(configDir);
+  if (!token) return { requested: false as const, credits: undefined };
+  const client = yield* HttpClient.HttpClient;
+  const response = yield* client.execute(
+    HttpClientRequest.get(`${API_BASE}/api/oauth/usage`, {
+      urlParams: { cedar_ember: "1", skip_spend: "1" },
+    }).pipe(withClaudeHeaders(token, version)),
+  );
+  const body = yield* HttpClientResponse.schemaBodyJson(UsageResponse)(
+    yield* HttpClientResponse.filterStatusOk(response),
+  );
+  return {
+    requested: true as const,
+    credits: claudeResetCreditsToContract(
       body.cedar_ember,
       DateTime.toEpochMillis(yield* DateTime.now),
-    );
-  },
-  Effect.timeout("10 seconds"),
-  Effect.orElseSucceed(() => undefined),
-);
+    ),
+  };
+}, Effect.timeout("10 seconds"));
+
+const RESET_CREDITS_TTL = Duration.minutes(5);
+
+/**
+ * The usage endpoint is rate-limited per account and shared with other readers,
+ * so an answer is kept for five minutes; failures and missing logins are retried.
+ */
+export const makeClaudeResetCreditsReader = Effect.fn("makeClaudeResetCreditsReader")(function* (
+  configDir: string,
+) {
+  const cache = yield* Cache.makeWith(
+    (version: string) => fetchClaudeResetCredits(configDir, version),
+    {
+      capacity: 1,
+      timeToLive: (exit) =>
+        Exit.isSuccess(exit) && exit.value.requested ? RESET_CREDITS_TTL : Duration.zero,
+    },
+  );
+  return {
+    read: (version: string) =>
+      Cache.get(cache, version).pipe(
+        Effect.map((result) => result.credits),
+        Effect.orElseSucceed(() => undefined),
+      ),
+    invalidate: Cache.invalidateAll(cache),
+  };
+});
 
 export const readClaudeOrganizationId = (accountConfigPath: string) =>
   readJson(Config, accountConfigPath).pipe(

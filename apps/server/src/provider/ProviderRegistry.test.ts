@@ -2249,6 +2249,19 @@ it.layer(
           ...initialProvider,
           checkedAt: "2026-04-14T00:01:00.000Z",
           models: [],
+          // Other local tools read usage from this file instead of asking the provider.
+          usageLimits: {
+            checkedAt: "2026-04-14T00:01:00.000Z",
+            windows: [
+              {
+                id: "seven_day",
+                kind: "weekly",
+                label: "Weekly",
+                usedPercent: 0,
+                resetsAt: "2026-04-21T00:00:00.000Z",
+              },
+            ],
+          },
         } satisfies ServerProvider;
         const changes = yield* PubSub.unbounded<ServerProvider>();
         const instance = {
