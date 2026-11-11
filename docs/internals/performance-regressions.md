@@ -139,9 +139,10 @@ the server then waited seconds for reads that take milliseconds. Two rules keep 
 server and clients:
 
 - Sessions without a running turn count against a budget that follows host memory: one per
-  4 GiB, at least two. Over it, the least recently active sessions without background work
-  release before the idle timeout. A session active in the last minute is exempt, because a
-  session opened for a turn has no running turn until that turn starts.
+  4 GiB, at least two. Over it, the least recently active sessions without background work or a
+  pending live request release before the idle timeout. A session active in the last minute is
+  exempt, because a session opened for a turn has no running turn until that turn starts. While
+  the count stays over the budget, the check repeats each minute.
 - Claude and Codex processes start at a lower scheduling priority than the server. Their builds
   and tests inherit it, so many threads at once slow each other down first. The other providers
   keep the server's priority.

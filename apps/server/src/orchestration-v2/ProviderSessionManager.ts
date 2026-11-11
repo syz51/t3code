@@ -453,6 +453,7 @@ export const layerWithOptions = (
       const maxIdlePinMs = Math.max(0, options.maxIdlePinMs ?? DEFAULT_MAX_IDLE_PIN_MS);
       const maxIdleSessions = Math.max(0, options.maxIdleSessions ?? defaultMaxIdleSessions());
       const idleTrim = yield* Semaphore.make(1);
+      const idleTrimRetryPending = yield* Ref.make(false);
       interface PreparedMcpCredential {
         readonly mcpCredentialId: string | undefined;
         readonly issued: boolean;
@@ -1171,6 +1172,16 @@ export const layerWithOptions = (
           ),
         );
 
+      const probePendingBackgroundWork = (
+        runtime: LiveSessionEntry["runtime"],
+        onProbeFailure: boolean,
+      ) =>
+        runtime.hasPendingBackgroundWork === undefined
+          ? Effect.succeed(false)
+          : runtime.hasPendingBackgroundWork.pipe(
+              Effect.catchCause(() => Effect.succeed(onProbeFailure)),
+            );
+
       const releaseIfStillIdle = Effect.fn("ProviderSessionManager.releaseIfStillIdle")(
         function* (input: {
           readonly providerSessionId: ProviderSessionId;
@@ -1188,12 +1199,7 @@ export const layerWithOptions = (
           }
           // Capture runtime identity before yielding; replacements can reuse the session id.
           const probedRuntime = entry.runtime;
-          const hasPendingWork =
-            probedRuntime.hasPendingBackgroundWork === undefined
-              ? false
-              : yield* probedRuntime.hasPendingBackgroundWork.pipe(
-                  Effect.catchCause(() => Effect.succeed(false)),
-                );
+          const hasPendingWork = yield* probePendingBackgroundWork(probedRuntime, false);
           if (hasPendingWork) {
             const now = yield* Clock.currentTimeMillis;
             const pinnedSinceMs = entry.pinnedSinceMs ?? now;
@@ -1302,39 +1308,66 @@ export const layerWithOptions = (
       const scheduleIdleRelease = (providerSessionId: ProviderSessionId) =>
         withActivityError(providerSessionId, scheduleIdleReleaseInternal(providerSessionId));
 
+      // Checked under the request permit so a runless request mid-persist is not cancelled.
+      const hasUnfinishedRecords = (entry: LiveSessionEntry) => {
+        const providerSessionId = entry.runtime.providerSessionId;
+        return Effect.forEach(entry.attachedThreadIds, (threadId) =>
+          projectionStore.getThreadRecords(threadId, ["runtimeRequests", "providerThreads"], {
+            runtimeRequestStatuses: ["pending"],
+          }),
+        ).pipe(
+          Effect.map((projections) =>
+            projections.some(
+              (projection) =>
+                projection.runtimeRequests.some(
+                  (request) =>
+                    request.responseCapability.type === "live" &&
+                    request.responseCapability.providerSessionId === providerSessionId,
+                ) ||
+                projection.providerThreads.some(
+                  (providerThread) =>
+                    providerThread.providerSessionId === providerSessionId &&
+                    (providerThread.pendingBackgroundTasks ?? []).length > 0,
+                ),
+            ),
+          ),
+          Effect.orElseSucceed(() => true),
+        );
+      };
+
       // Many concurrent threads leave more warm sessions than the host can hold long before the
       // idle timeout, so the least recently used ones go first. Forked: a release can take seconds
       // and the caller is another session's event pump or open.
-      const trimIdleSessions = Effect.fn("ProviderSessionManager.trimIdleSessions")(function* () {
-        const idle = [...(yield* Ref.get(sessions)).values()]
-          .filter((entry) => entry.busyTurns.size === 0)
-          .sort((left, right) => left.lastActiveMs - right.lastActiveMs);
-        const settledBefore = (yield* Clock.currentTimeMillis) - IDLE_TRIM_GRACE_MS;
-        let excess = idle.length - maxIdleSessions;
-        for (const entry of idle) {
-          if (excess <= 0 || entry.lastActiveMs > settledBefore) return;
-          const hasPendingWork =
-            entry.runtime.hasPendingBackgroundWork === undefined
-              ? false
-              : yield* entry.runtime.hasPendingBackgroundWork.pipe(
-                  Effect.catchCause(() => Effect.succeed(false)),
-                );
-          if (hasPendingWork) continue;
-          yield* releaseEntry({
-            providerSessionId: entry.runtime.providerSessionId,
-            reason: "idle_timeout",
-            onlyIfIdleGeneration: entry.idleGeneration,
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("orchestration-v2.driver-session.idle-trim-failed", {
-                providerSessionId: entry.runtime.providerSessionId,
-                cause,
-              }),
-            ),
-          );
-          excess -= 1;
-        }
-      }, idleTrim.withPermits(1));
+      const trimIdleSessions = Effect.fn("ProviderSessionManager.trimIdleSessions")(
+        function* (): Effect.fn.Return<void> {
+          const idle = [...(yield* Ref.get(sessions)).values()]
+            .filter((entry) => entry.busyTurns.size === 0)
+            .sort((left, right) => left.lastActiveMs - right.lastActiveMs);
+          const settledBefore = (yield* Clock.currentTimeMillis) - IDLE_TRIM_GRACE_MS;
+          let excess = idle.length - maxIdleSessions;
+          for (const entry of idle) {
+            if (excess <= 0 || entry.lastActiveMs > settledBefore) break;
+            if (yield* probePendingBackgroundWork(entry.runtime, true)) continue;
+            const providerSessionId = entry.runtime.providerSessionId;
+            yield* releaseEntry({
+              providerSessionId,
+              reason: "idle_timeout",
+              onlyIfIdleGeneration: entry.idleGeneration,
+              keepIf: hasUnfinishedRecords(entry),
+            }).pipe(logReleaseFailure(providerSessionId));
+            excess -= 1;
+          }
+          // Nothing else runs the trim once the grace or the background work of the rest ends.
+          if (excess > 0 && !(yield* Ref.getAndSet(idleTrimRetryPending, true))) {
+            yield* Effect.sleep(Duration.millis(IDLE_TRIM_GRACE_MS)).pipe(
+              Effect.andThen(Ref.set(idleTrimRetryPending, false)),
+              Effect.andThen(Effect.suspend(() => trimIdleSessions())),
+              Effect.forkIn(layerScope),
+            );
+          }
+        },
+        idleTrim.withPermits(1),
+      );
       const forkTrimIdleSessions = trimIdleSessions().pipe(
         Effect.forkIn(layerScope),
         Effect.asVoid,
@@ -1873,42 +1906,13 @@ export const layerWithOptions = (
         const providerSessionId = entry.runtime.providerSessionId;
         // Any activity during these reads bumps the generation and keeps the runtime.
         const generation = entry.idleGeneration;
-        const hasPendingWork =
-          entry.runtime.hasPendingBackgroundWork === undefined
-            ? false
-            : yield* entry.runtime.hasPendingBackgroundWork.pipe(
-                Effect.catchCause(() => Effect.succeed(true)),
-              );
-        if (hasPendingWork) return;
-        // Checked under the request permit so a runless request mid-persist is not cancelled.
-        const hasUnfinishedRecords = Effect.forEach(entry.attachedThreadIds, (threadId) =>
-          projectionStore.getThreadRecords(threadId, ["runtimeRequests", "providerThreads"], {
-            runtimeRequestStatuses: ["pending"],
-          }),
-        ).pipe(
-          Effect.map((projections) =>
-            projections.some(
-              (projection) =>
-                projection.runtimeRequests.some(
-                  (request) =>
-                    request.responseCapability.type === "live" &&
-                    request.responseCapability.providerSessionId === providerSessionId,
-                ) ||
-                projection.providerThreads.some(
-                  (providerThread) =>
-                    providerThread.providerSessionId === providerSessionId &&
-                    (providerThread.pendingBackgroundTasks ?? []).length > 0,
-                ),
-            ),
-          ),
-          Effect.orElseSucceed(() => true),
-        );
+        if (yield* probePendingBackgroundWork(entry.runtime, true)) return;
         yield* releaseEntry({
           providerSessionId,
           reason: "idle_timeout",
           detail: "Linked environments changed; reopening the provider session.",
           onlyIfIdleGeneration: generation,
-          keepIf: hasUnfinishedRecords,
+          keepIf: hasUnfinishedRecords(entry),
         }).pipe(logReleaseFailure(providerSessionId));
       });
 

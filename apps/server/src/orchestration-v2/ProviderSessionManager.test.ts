@@ -1118,25 +1118,35 @@ it.effect.each([false, true] as const)(
           yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
           return providerSessionId;
         });
+        const stopped = (threadId: ThreadId) =>
+          hasPendingBackgroundWork
+            ? Effect.void
+            : eventSink.stream({ threadId, eventType: "provider-session.updated" }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "provider-session.updated" &&
+                    stored.event.payload.status === "stopped",
+                ),
+                Stream.runHead,
+              );
         const first = yield* open(threadIds[0]!);
         yield* TestClock.adjust("1 second");
         const second = yield* open(threadIds[1]!);
-        // Past the grace that protects a session between its open and its first turn.
+        // The grace protects a session between its open and its first turn.
+        yield* TestClock.adjust("30 seconds");
+        assert.deepEqual(yield* Effect.forEach([first, second], (id) => manager.isLive(id)), [
+          true,
+          true,
+        ]);
+        // No open or turn end follows; the trim runs again once the grace is over.
         yield* TestClock.adjust("2 minutes");
+        yield* stopped(threadIds[0]!);
+        assert.deepEqual(yield* Effect.forEach([first, second], (id) => manager.isLive(id)), [
+          hasPendingBackgroundWork,
+          true,
+        ]);
         const third = yield* open(threadIds[2]!);
-
-        if (!hasPendingBackgroundWork) {
-          yield* Effect.forEach(threadIds.slice(0, 2), (threadId) =>
-            eventSink.stream({ threadId, eventType: "provider-session.updated" }).pipe(
-              Stream.filter(
-                (stored) =>
-                  stored.event.type === "provider-session.updated" &&
-                  stored.event.payload.status === "stopped",
-              ),
-              Stream.runHead,
-            ),
-          );
-        }
+        yield* stopped(threadIds[1]!);
         yield* TestClock.adjust("1 millis");
         assert.deepEqual(
           yield* Effect.forEach([first, second, third], (id) => manager.isLive(id)),
