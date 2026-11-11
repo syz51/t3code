@@ -260,15 +260,14 @@ function worktreeSettlementChain(
   return chain;
 }
 
-/** Squash/rebase merges require the merged PR to name this exact head commit. */
+/**
+ * Squash/rebase merges require the merged PR to name this exact head commit.
+ * `integrated` means the remote's default branch or the PR's base branch holds the head.
+ */
 export function storageCleanupPullRequestMerged(
-  pullRequest: Pick<
-    GitManager.GitBranchPullRequest,
-    "state" | "headRef" | "baseRef" | "headSha"
-  > | null,
+  pullRequest: Pick<GitManager.GitBranchPullRequest, "state" | "headRef" | "headSha"> | null,
   worktree: {
     readonly branch: string;
-    readonly defaultBranch: string;
     readonly headSha: string;
     readonly integrated: boolean;
   },
@@ -276,9 +275,7 @@ export function storageCleanupPullRequestMerged(
   return (
     pullRequest?.state === "merged" &&
     (worktree.integrated ||
-      (pullRequest.headRef === worktree.branch &&
-        pullRequest.baseRef === worktree.defaultBranch &&
-        pullRequest.headSha === worktree.headSha))
+      (pullRequest.headRef === worktree.branch && pullRequest.headSha === worktree.headSha))
   );
 }
 
@@ -1081,11 +1078,37 @@ const make = Effect.gen(function* () {
               { cwd: worktreePath, branch: thread.branch },
               { refresh: true },
             );
+            let merged = integrated;
+            // A repository can merge into a branch other than the remote's default one.
+            if (!merged && pullRequest?.state === "merged" && pullRequest.baseRef !== branch) {
+              const baseRef = `refs/remotes/${remote}/${pullRequest.baseRef}`;
+              const refreshed = refreshedDefaultRefs.get(repositoryCwd) ?? new Set<string>();
+              // A deleted base branch fails the fetch; the worktree then counts as not merged.
+              const fetched =
+                refreshed.has(baseRef) ||
+                (yield* git
+                  .fetchRemoteTrackingBranch({
+                    cwd: repositoryCwd,
+                    remoteName: remote,
+                    remoteBranch: pullRequest.baseRef,
+                  })
+                  .pipe(Effect.isSuccess));
+              if (fetched) {
+                refreshed.add(baseRef);
+                refreshedDefaultRefs.set(repositoryCwd, refreshed);
+                const inBase = yield* git.execute({
+                  operation: "StorageCleanup.integratedBranch",
+                  cwd: worktreePath,
+                  args: ["merge-base", "--is-ancestor", head.commitSha, baseRef],
+                  allowNonZeroExit: true,
+                });
+                merged = inBase.exitCode === 0;
+              }
+            }
             eligible = storageCleanupPullRequestMerged(pullRequest, {
               branch: thread.branch,
-              defaultBranch: branch,
               headSha: head.commitSha,
-              integrated,
+              integrated: merged,
             });
             if (eligible) removalReason = "pull request was merged";
           }
