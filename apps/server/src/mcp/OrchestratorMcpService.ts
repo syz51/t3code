@@ -2453,7 +2453,7 @@ const make = Effect.gen(function* () {
       ) {
         return yield* failure(
           "invalid_request",
-          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
+          "A local task runs in this thread's project, so omit target.projectId. For another project in this environment, use t3_thread_launch with its projectId and a worktree workspaceStrategy ({type: \"worktree\"}). target.environmentId only reaches a remote environment; this one's id changes nothing.",
         );
       }
       const parentRun = parent.runs
