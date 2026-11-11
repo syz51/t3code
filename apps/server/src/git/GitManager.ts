@@ -562,9 +562,9 @@ function parseCustomCommitMessage(raw: string): { subject: string; body: string 
 const PR_LOOKUP_CONFIG_PATTERN = "^(branch\\..*\\.(remote|merge)|remote\\..*\\.url)$";
 
 // Parses `git config -z --get-regexp` output. A later value wins, as `git config --get` reads it.
-function parseGitConfigEntries(stdout: string | null): ReadonlyMap<string, string> {
+function parseGitConfigEntries(stdout: string): ReadonlyMap<string, string> {
   const entries = new Map<string, string>();
-  for (const entry of (stdout ?? "").split("\u0000")) {
+  for (const entry of stdout.split("\u0000")) {
     const separator = entry.indexOf("\n");
     if (separator > 0) entries.set(entry.slice(0, separator), entry.slice(separator + 1).trim());
   }
@@ -1263,7 +1263,8 @@ export const make = Effect.gen(function* () {
       };
       return Effect.gen(function* () {
         // Read anew for each host query, so a query never runs on remembered config.
-        const readConfig = yield* readPrLookupConfig(cwd, Number.POSITIVE_INFINITY);
+        const snapshot = yield* readPrLookupConfig(cwd, Number.POSITIVE_INFINITY);
+        const readConfig = snapshot ?? readConfigPerKey(cwd);
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details, readConfig);
         if (!lookup) {
           return { latest: null, headContext };
@@ -1271,7 +1272,9 @@ export const make = Effect.gen(function* () {
         if (
           details.localBranchExists &&
           (details.upstreamRef === null || headContext.remoteName === null) &&
-          (yield* isUnpublishedBranch(headContext, cwd, readConfig))
+          // Without the snapshot the config is unsure, so the host decides.
+          snapshot !== null &&
+          (yield* isUnpublishedBranch(cwd, headContext, snapshot))
         ) {
           return { latest: null, headContext };
         }
@@ -1488,6 +1491,10 @@ export const make = Effect.gen(function* () {
 
   const readConfigValueNullable = (cwd: string, key: string) =>
     gitCore.readConfigValue(cwd, key).pipe(Effect.orElseSucceed(() => null));
+  const readConfigPerKey =
+    (cwd: string): GitConfigReader =>
+    (key) =>
+      readConfigValueNullable(cwd, key);
 
   // Whether the remote's host creates change requests in the only remote. A host's tools can let
   // configuration outside the remotes name another repository; the remote itself otherwise.
@@ -1861,8 +1868,8 @@ export const make = Effect.gen(function* () {
   });
 
   const isUnpublishedBranch = Effect.fn("isUnpublishedBranch")(function* (
-    headContext: Pick<BranchHeadContext, "headBranch" | "localBranch">,
     cwd: string,
+    headContext: Pick<BranchHeadContext, "headBranch" | "localBranch">,
     readConfig: GitConfigReader,
   ) {
     if (headContext.headBranch.length === 0) {
@@ -2507,7 +2514,7 @@ export const make = Effect.gen(function* () {
     prLookupGitStateByKey.set(entryKey, { readAtMs, readNumber, value });
     return value;
   });
-  // A failed read answers as unset config, as a failed read of one key did.
+  // Fails when git does, such as on a config larger than the output limit.
   const readPrLookupConfigEntries = (cwd: string, freshAfter: number | null) =>
     rememberPrLookupGitState(
       cwd,
@@ -2521,17 +2528,16 @@ export const make = Effect.gen(function* () {
           allowNonZeroExit: true,
         })
         .pipe(Effect.map((result) => result.stdout)),
-    ).pipe(
-      Effect.orElseSucceed(() => null),
-      Effect.map(parseGitConfigEntries),
-    );
+    ).pipe(Effect.map((stdout) => parseGitConfigEntries(stdout ?? "")));
+  // Null when the read fails; the caller then reads each key on its own.
   const readPrLookupConfig = (cwd: string, freshAfter: number | null) =>
     readPrLookupConfigEntries(cwd, freshAfter).pipe(
       Effect.map(
-        (entries): GitConfigReader =>
+        (entries): GitConfigReader | null =>
           (key) =>
             Effect.succeed(entries.get(key) || null),
       ),
+      Effect.orElseSucceed(() => null),
     );
   const settledPrLookupByBranchKey = new Map<
     string,
@@ -2553,7 +2559,7 @@ export const make = Effect.gen(function* () {
       remoteNameOverride: string | undefined,
       freshAfter: number | null,
     ) {
-      const readConfig = yield* readPrLookupConfig(cwd, freshAfter);
+      const readConfig = (yield* readPrLookupConfig(cwd, freshAfter)) ?? readConfigPerKey(cwd);
       const readRemoteUrlKey = (remoteName: string | null) =>
         remoteName === null
           ? Effect.succeed(null)
