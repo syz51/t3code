@@ -4357,6 +4357,185 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  /** A watch that has told its thread the first head's checks passed, on a host the test drives. */
+  const watchToldOfPassedHead = Effect.fn(function* (name: string, number: number) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make(`runtime-pull-request-watch-${name}`);
+    const projectId = ProjectId.make(`pr-watch-${name}-project`);
+    yield* seedProject({
+      projectId,
+      title: "Watch head change",
+      workspaceRoot: `/workspace/watch-${name}`,
+      defaultModelSelection: null,
+      createdAt: "2026-10-01T00:00:00.000Z",
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      createdBy: "user",
+      creationSource: "web",
+      commandId: CommandId.make(`pr-watch-${name}-create`),
+      threadId,
+      projectId,
+      title: "Watch head change",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+    });
+    const key = { host: "github.com", repository: "pingdotgg/t3code", number };
+    yield* orchestrator.dispatch({
+      type: "thread.pull-request.watch",
+      commandId: CommandId.make(`pr-watch-${name}-start`),
+      threadId,
+      ...key,
+      watching: true,
+      link: { url: `https://github.com/pingdotgg/t3code/pull/${number}`, source: "agent" },
+    });
+    const pullRequest: {
+      state: PullRequestDetail["state"];
+      headSha: string;
+      check: "pending" | "success";
+    } = { state: "open", headSha: "1111111aaa", check: "success" };
+    const reactor = yield* PullRequestWatchReactor.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(PullRequestService.PullRequestService)({
+            watchFingerprint: () =>
+              Effect.sync(() => ({
+                status: `${pullRequest.state} ${pullRequest.headSha} ${pullRequest.check}`,
+                remarks: "",
+              })),
+            invalidate: () => Effect.void,
+            detail: () =>
+              Effect.sync(() => ({
+                ...watchedPullRequestDetail({ projectId, number, at: "2026-10-02T12:00:00.000Z" }),
+                state: pullRequest.state,
+                headSha: pullRequest.headSha,
+                checks: [
+                  {
+                    name: "test",
+                    status: pullRequest.check,
+                    description: null,
+                    url: null,
+                    required: true,
+                  },
+                ],
+              })),
+            activity: () =>
+              Effect.succeed({
+                comments: [],
+                commentCount: 0,
+                commentsTruncated: false,
+                reviewThreads: [],
+                commits: [],
+              }),
+          }),
+        ),
+      ),
+    );
+    const wakes = Effect.map(
+      orchestrator.getThreadRecords(threadId, ["messages"]),
+      ({ messages }) =>
+        messages.flatMap((message) =>
+          message.notification == null ? [] : [`${message.notification.summary} | ${message.text}`],
+        ),
+    );
+    const watch = Effect.map(
+      orchestrator.getThreadShell(threadId),
+      (thread) => thread?.pullRequests?.[0]?.watch,
+    );
+    yield* reactor.sweep;
+    const told = yield* wakes;
+    assert.equal(told.length, 1);
+    assert.include(told[0], `#${number}: checks passed`);
+    assert.include(told[0], "on 1111111");
+    return { orchestrator, threadId, key, pullRequest, sweep: reactor.sweep, wakes, watch };
+  });
+
+  it.effect("follows a new head's checks and wakes when they finish", () =>
+    Effect.gen(function* () {
+      const { orchestrator, threadId, key, pullRequest, sweep, wakes, watch } =
+        yield* watchToldOfPassedHead("head-change", 31);
+
+      // `gh pr update-branch` makes a new head whose checks start over.
+      pullRequest.headSha = "2222222bbb";
+      pullRequest.check = "pending";
+      yield* TestClock.adjust("2 minutes");
+      yield* sweep;
+      assert.equal((yield* wakes).length, 1);
+      assert.equal((yield* watch)?.headSha, "2222222bbb");
+
+      pullRequest.check = "success";
+      yield* TestClock.adjust("2 minutes");
+      yield* sweep;
+      const told = yield* wakes;
+      assert.equal(told.length, 2);
+      assert.include(told[1], "#31: checks passed");
+      assert.include(told[1], "on 2222222");
+
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-watch-head-change-end"),
+        threadId,
+        ...key,
+        watching: false,
+      });
+    }),
+  );
+
+  it.effect.each(["host read", "link snapshot"] as const)(
+    "wakes with the merge after a head change, learned from the %s",
+    (source) =>
+      Effect.gen(function* () {
+        const name = `merge-${source === "host read" ? "read" : "snapshot"}`;
+        const { orchestrator, threadId, key, pullRequest, sweep, wakes, watch } =
+          yield* watchToldOfPassedHead(name, source === "host read" ? 32 : 33);
+
+        pullRequest.headSha = "2222222bbb";
+        pullRequest.check = "pending";
+        yield* TestClock.adjust("2 minutes");
+        yield* sweep;
+        assert.equal((yield* wakes).length, 1);
+
+        // Auto-merge lands as the new head's checks pass, so no sweep sees them passed and open.
+        pullRequest.check = "success";
+        pullRequest.state = "merged";
+        if (source === "link snapshot") {
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request-link.sync",
+            commandId: CommandId.make(`pr-watch-${name}-snapshot`),
+            threadId,
+            ...key,
+            snapshot: {
+              state: "merged",
+              title: "Watched pull request",
+              headBranch: "feature",
+              baseBranch: "main",
+              isDraft: false,
+              updatedAt: "2026-10-02T12:10:00.000Z",
+              syncedAt: "2026-10-02T12:10:00.000Z",
+              mergedAt: "2026-10-02T12:10:00.000Z",
+            },
+            stack: null,
+          });
+        }
+        yield* TestClock.adjust("2 minutes");
+        yield* sweep;
+        const told = yield* wakes;
+        assert.equal(told.length, 2);
+        assert.include(told[1], `#${key.number}: merged, stopped watching`);
+        assert.isUndefined(yield* watch);
+
+        // The merge is told once: the watch is over, so later sweeps stay quiet.
+        yield* TestClock.adjust("30 minutes");
+        yield* sweep;
+        assert.equal((yield* wakes).length, 2);
+      }),
+  );
+
   it.effect("reads each watched PR as soon as its own fingerprint lands", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

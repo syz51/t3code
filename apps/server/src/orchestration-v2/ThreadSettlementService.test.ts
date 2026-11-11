@@ -444,6 +444,32 @@ describe("resolveAutoSettlementAt", () => {
         },
       }),
     ).toEqual(at(-45 * 60 * 1_000));
+    // A watch still on a merged pull request owes the thread its merge wake.
+    const startedAt = DateTime.formatIso(at(-90 * 60 * 1_000));
+    expect(
+      ThreadSettlementService.resolveAutoSettlementAt({
+        ...input,
+        thread: {
+          ...input.thread,
+          pullRequests: [
+            {
+              ...link(2, at(-90 * 60 * 1_000), at(-40 * 60 * 1_000)),
+              watch: {
+                startedAt,
+                headSha: "abc1234def",
+                failedChecks: [],
+                passed: true,
+                passedChecks: ["test"],
+                remarksThrough: startedAt,
+                remarkIds: [],
+                conflicting: false,
+                wakes: 0,
+              },
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
   });
 });
 

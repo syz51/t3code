@@ -414,13 +414,29 @@ export const make = Effect.gen(function* () {
       Effect.tap(() => ended(target, "closed")),
     );
 
+  const merged = (target: WatchTarget) =>
+    record(target, null, {
+      text: `Pull request #${target.link.number} (${target.link.url}) was merged, so T3 Code stopped watching it.`,
+      notification: {
+        source: { kind: "monitor" },
+        outcome: "completed",
+        summary: `#${target.link.number}: merged, stopped watching`,
+      },
+    }).pipe(
+      Effect.tap(() => woke(target)),
+      // A thread that settled during the read takes no wake; its watch still ends.
+      Effect.catch(() => record(target, null)),
+      Effect.tap(() => ended(target, "merged")),
+    );
+
+  // A settled or subagent thread takes no wake, so those reasons come before a merge.
   const endsWithoutRead = ({ thread, link }: WatchTarget): WatchEndReason | undefined =>
-    link.snapshot?.state === "merged"
-      ? "merged"
-      : thread.settledOverride === "settled" || thread.settledAt !== null
-        ? "settled"
-        : thread.lineage.relationshipToParent === "subagent"
-          ? "subagent"
+    thread.settledOverride === "settled" || thread.settledAt !== null
+      ? "settled"
+      : thread.lineage.relationshipToParent === "subagent"
+        ? "subagent"
+        : link.snapshot?.state === "merged"
+          ? "merged"
           : undefined;
 
   const eachTarget = <E>(
@@ -531,9 +547,7 @@ export const make = Effect.gen(function* () {
     if (detail.state !== "open") {
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
-        detail.state === "closed"
-          ? closed(target)
-          : record(target, null).pipe(Effect.tap(() => ended(target, "merged"))),
+        detail.state === "closed" ? closed(target) : merged(target),
       );
     }
 
@@ -622,8 +636,10 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(
       ending,
       ([target, reason]) =>
-        record(target, null).pipe(
-          Effect.tap(() => ended(target, reason)),
+        (reason === "merged"
+          ? merged(target)
+          : record(target, null).pipe(Effect.tap(() => ended(target, reason)))
+        ).pipe(
           Effect.catchCause(
             logFailure("pull request watch stop failed", {
               threadId: target.thread.id,

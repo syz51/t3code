@@ -205,6 +205,12 @@ export function resolveAutoSettlementAt(input: {
   let pullRequest = input.pullRequest;
   const links = settlementPullRequestLinks(thread.pullRequests ?? []);
   if (links.some((link) => link.snapshot === null)) return null;
+  // A watch on a finished pull request owes the thread its merge or close wake. Settling first
+  // would refuse that wake; the watch ends with it, and that event sweeps this thread again.
+  const watchOwesWake = visibleThreadPullRequests(thread.pullRequests ?? []).some(
+    (link) => link.watch !== undefined && link.snapshot !== null && link.snapshot.state !== "open",
+  );
+  if (watchOwesWake) return null;
   // An open link means the pull request has not finished, so only inactivity
   // can settle the thread, never a merged or closed lookup.
   const hasOpenLink = links.some((link) => link.snapshot?.state === "open");
