@@ -4486,13 +4486,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect.each(["host read", "link snapshot"] as const)(
-    "wakes with the merge after a head change, learned from the %s",
-    (source) =>
+  it.effect.each([
+    { source: "host read", state: "merged", number: 32 },
+    { source: "link snapshot", state: "merged", number: 33 },
+    { source: "link snapshot", state: "closed", number: 34 },
+  ] as const)(
+    "wakes once when the pull request is $state after a head change, learned from the $source",
+    ({ source, state, number }) =>
       Effect.gen(function* () {
-        const name = `merge-${source === "host read" ? "read" : "snapshot"}`;
+        const name = `ends-${number}`;
         const { orchestrator, threadId, key, pullRequest, sweep, wakes, watch } =
-          yield* watchToldOfPassedHead(name, source === "host read" ? 32 : 33);
+          yield* watchToldOfPassedHead(name, number);
 
         pullRequest.headSha = "2222222bbb";
         pullRequest.check = "pending";
@@ -4502,7 +4506,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
 
         // Auto-merge lands as the new head's checks pass, so no sweep sees them passed and open.
         pullRequest.check = "success";
-        pullRequest.state = "merged";
+        pullRequest.state = state;
         if (source === "link snapshot") {
           yield* orchestrator.dispatch({
             type: "thread.pull-request-link.sync",
@@ -4510,14 +4514,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             threadId,
             ...key,
             snapshot: {
-              state: "merged",
+              state,
               title: "Watched pull request",
               headBranch: "feature",
               baseBranch: "main",
               isDraft: false,
               updatedAt: "2026-10-02T12:10:00.000Z",
               syncedAt: "2026-10-02T12:10:00.000Z",
-              mergedAt: "2026-10-02T12:10:00.000Z",
+              [state === "merged" ? "mergedAt" : "closedAt"]: "2026-10-02T12:10:00.000Z",
             },
             stack: null,
           });
@@ -4526,10 +4530,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         yield* sweep;
         const told = yield* wakes;
         assert.equal(told.length, 2);
-        assert.include(told[1], `#${key.number}: merged, stopped watching`);
+        assert.include(told[1], `#${number}: ${state}, stopped watching`);
         assert.isUndefined(yield* watch);
 
-        // The merge is told once: the watch is over, so later sweeps stay quiet.
+        // The end is told once: the watch is over, so later sweeps stay quiet.
         yield* TestClock.adjust("30 minutes");
         yield* sweep;
         assert.equal((yield* wakes).length, 2);

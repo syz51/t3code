@@ -424,19 +424,18 @@ export const make = Effect.gen(function* () {
       },
     }).pipe(
       Effect.tap(() => woke(target)),
-      // A thread that settled during the read takes no wake; its watch still ends.
-      Effect.catch(() => record(target, null)),
       Effect.tap(() => ended(target, "merged")),
     );
 
-  // A settled or subagent thread takes no wake, so those reasons come before a merge.
+  // A settled or subagent thread takes no wake, so those reasons come first. A finished snapshot
+  // ends the watch with its wake even while the host cannot be read.
   const endsWithoutRead = ({ thread, link }: WatchTarget): WatchEndReason | undefined =>
     thread.settledOverride === "settled" || thread.settledAt !== null
       ? "settled"
       : thread.lineage.relationshipToParent === "subagent"
         ? "subagent"
-        : link.snapshot?.state === "merged"
-          ? "merged"
+        : link.snapshot?.state === "merged" || link.snapshot?.state === "closed"
+          ? link.snapshot.state
           : undefined;
 
   const eachTarget = <E>(
@@ -638,7 +637,9 @@ export const make = Effect.gen(function* () {
       ([target, reason]) =>
         (reason === "merged"
           ? merged(target)
-          : record(target, null).pipe(Effect.tap(() => ended(target, reason)))
+          : reason === "closed"
+            ? closed(target)
+            : record(target, null).pipe(Effect.tap(() => ended(target, reason)))
         ).pipe(
           Effect.catchCause(
             logFailure("pull request watch stop failed", {
