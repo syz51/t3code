@@ -1937,7 +1937,13 @@ it.effect("a local task runs in this thread's project", () =>
         target: { projectId: "project:elsewhere" },
       });
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("invalid_request");
+      const refusal = JSON.stringify(result.content);
+      expect(refusal).toContain("invalid_request");
+      expect(refusal).toContain(
+        "use t3_thread_launch with its projectId and a worktree workspaceStrategy",
+      );
+      expect(refusal).toContain("target.environmentId only reaches a remote environment");
+      expect(refusal).not.toContain("pass target.environmentId");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
