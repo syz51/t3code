@@ -647,7 +647,8 @@ export function toDiff(diff: typeof GitCafeDiff.Type): ProviderDiffSlice {
 }
 
 function checkStatus(check: (typeof GitCafeChecks.Type.items)[number]): PullRequestCheck["status"] {
-  if (check.status !== "completed") return "pending";
+  // A finished run's status can lag at in_progress; a set conclusion is the result.
+  if (check.status !== "completed" && !check.conclusion) return "pending";
   switch (check.conclusion) {
     case "success":
       return "success";

@@ -264,6 +264,7 @@ it.effect("unlinks on startup and refuses to link when the policy turns Connect 
       [RELAY_URL_SECRET, encode("https://relay.test")],
     ]);
     const appliedConfigs: Array<unknown> = [];
+    let relayCatchUps = 0;
     const layerDependencies = Layer.mergeAll(
       Layer.mock(ServerSecretStore.ServerSecretStore)({
         get: (name) => Effect.succeed(Option.fromNullishOr(stored.get(name))),
@@ -271,7 +272,12 @@ it.effect("unlinks on startup and refuses to link when the policy turns Connect 
         remove: (name) => Effect.sync(() => void stored.delete(name)),
       }),
       Layer.mock(ServerEnvironment.ServerEnvironment)({}),
-      Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({}),
+      Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({
+        requestCatchUp: () =>
+          Effect.sync(() => {
+            relayCatchUps += 1;
+          }),
+      }),
       Layer.mock(ManagedEndpointRuntime.CloudManagedEndpointRuntime)({
         withLinkStateLock: (effect) => effect,
         applyConfig: (config) =>
@@ -303,6 +309,7 @@ it.effect("unlinks on startup and refuses to link when the policy turns Connect 
       const link = yield* CloudLink.CloudLink;
       assert.isFalse(stored.has(CLOUD_LINKED_USER_ID));
       assert.deepEqual(appliedConfigs, [null]);
+      assert.equal(relayCatchUps, 1);
 
       const applyError = yield* link.applyRelayConfig({} as never).pipe(Effect.flip);
       const mintError = yield* link.mintCredential({} as never).pipe(Effect.flip);
