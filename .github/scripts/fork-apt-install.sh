@@ -3,7 +3,7 @@
 # with a log instead of running into the step timeout. See docs/operations/fork.md.
 set -uo pipefail
 
-# The three calls together stay under the 10-minute step that waits for this script.
+# The four calls together stay under the 10-minute step that waits for this script.
 apt_get() {
   local limit=$1
   shift
@@ -15,14 +15,12 @@ apt_get() {
     "$@"
 }
 
-# apt-get update exits 0 when a server fails, so a failed index counts as a failure here.
-if ! apt_get 120 -o APT::Update::Error-Mode=any update; then
-  echo "fork-apt-install: apt-get update failed with the runner's mirrors; retrying with mirrors.edge.kernel.org only"
-  # A mirror outside ubuntu.com: the runner's mirrors and archive.ubuntu.com share that DNS zone.
-  sudo sed -i -E 's#^URIs: .*#URIs: https://mirrors.edge.kernel.org/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources
-  # Reads only the Ubuntu sources, so a stalled third-party repository cannot fail the retry.
-  apt_get 120 -o APT::Update::Error-Mode=any \
-    -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update || exit
-fi
+apt_get 90 update && apt_get 150 install -y "$@" && exit
 
-apt_get 240 install -y "$@"
+echo "fork-apt-install: failed with the runner's mirrors; retrying with mirrors.edge.kernel.org"
+# A mirror outside ubuntu.com: the runner's mirrors and archive.ubuntu.com share that DNS zone.
+sudo sed -i -E 's#^URIs: .*#URIs: https://mirrors.edge.kernel.org/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources
+# Reads only the Ubuntu sources, so a stalled third-party repository cannot fail the retry.
+apt_get 90 -o APT::Update::Error-Mode=any \
+  -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update &&
+  apt_get 150 install -y "$@"

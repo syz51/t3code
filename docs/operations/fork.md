@@ -100,9 +100,9 @@ In `ci.yml`, the two background installs of the browser secret helper libraries 
 `apt-get` directly. On the hosted runners `setup-apt-mirrors` changes nothing, because their
 sources already read a mirror list that names only `ubuntu.com` hosts, so one stalled zone
 stopped every job at the 10-minute wait without a log. The script limits each `apt-get` call and
-retries a failed `apt-get update` on a mirror outside that zone. After each merge,
-`git grep -c 'fork-apt:' .github/workflows/ci.yml` must print 2; when upstream edits those lines,
-keep its package list and pass it to the script.
+retries a failed update or install on a mirror outside that zone. After each merge,
+`git grep -c 'fork-apt:' .github/workflows/ci.yml` must print `.github/workflows/ci.yml:2`; when
+upstream edits those lines, keep its package list and pass it to the script.
 
 ### Other conflicts
 
