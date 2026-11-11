@@ -8,6 +8,8 @@ import {
   type PullRequestThreadCommentsResult,
   type ThreadPullRequestLink,
   type ThreadPullRequestWatch,
+  type ThreadPullRequestWatchEndReason,
+  type ThreadPullRequestWatchSkipReason,
 } from "@t3tools/contracts";
 import {
   normalizeThreadPullRequestKey,
@@ -98,14 +100,16 @@ interface ReadPlan {
 
 const watchKey = ({ thread, watch }: WatchTarget) => `${thread.id} ${watch.startedAt}`;
 
-type WatchEndReason =
-  | "merged"
-  | "closed"
-  | "unreadable"
-  | "comment-limit"
-  | "settled"
-  | "subagent"
-  | "stopped";
+type WatchEndReason = Exclude<
+  ThreadPullRequestWatchEndReason,
+  "archived" | "unwatched" | "unlinked"
+>;
+
+/** The cause of the unread stretch the link is in. One left open by an ended watch still counts. */
+const openSkip = ({ link }: WatchTarget) => {
+  const skipped = link.watchRecord?.skipped;
+  return skipped?.resumedAt === undefined ? skipped?.reason : undefined;
+};
 
 interface WatchLife {
   readonly threadId: string;
@@ -278,8 +282,17 @@ export const make = Effect.gen(function* () {
   const record = Effect.fn("PullRequestWatchReactor.record")(function* (
     target: WatchTarget,
     next: ThreadPullRequestWatch | null,
-    wake?: { readonly text: string; readonly notification: OrchestrationV2Notification },
-    endedWatch?: ThreadPullRequestWatch,
+    {
+      wake,
+      endedWatch,
+      endReason,
+      skip,
+    }: {
+      readonly wake?: { readonly text: string; readonly notification: OrchestrationV2Notification };
+      readonly endedWatch?: ThreadPullRequestWatch;
+      readonly endReason?: WatchEndReason;
+      readonly skip?: ThreadPullRequestWatchSkipReason | null;
+    } = {},
   ) {
     const uuid = yield* random.uuidV4();
     yield* engine.dispatch({
@@ -290,6 +303,8 @@ export const make = Effect.gen(function* () {
       startedAt: target.watch.startedAt,
       watch: next,
       ...(endedWatch === undefined ? {} : { endedWatch }),
+      ...(endReason === undefined ? {} : { endReason }),
+      ...(skip === undefined ? {} : { skip }),
       ...(wake === undefined
         ? {}
         : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
@@ -298,16 +313,36 @@ export const make = Effect.gen(function* () {
 
   const giveUp = (target: WatchTarget) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
-      notification: {
-        source: { kind: "monitor" },
-        outcome: "failed",
-        summary: `#${target.link.number}: stopped watching, could not read it`,
+      endReason: "unreadable",
+      wake: {
+        text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "failed",
+          summary: `#${target.link.number}: stopped watching, could not read it`,
+        },
       },
     }).pipe(
       Effect.tap(() => woke(target)),
-      Effect.catch(() => record(target, null)),
+      Effect.catch(() => record(target, null, { endReason: "unreadable" })),
       Effect.tap(() => ended(target, "unreadable")),
+    );
+
+  // One write when an unread stretch starts or changes cause, and one when it stops: a write per
+  // sweep would push a link update to every client every two minutes.
+  const noteSkip = (group: WatchGroup, skip: ThreadPullRequestWatchSkipReason | null) =>
+    Effect.forEach(
+      group.targets.filter((target) => openSkip(target) !== (skip ?? undefined)),
+      (target) =>
+        record(target, target.watch, { skip }).pipe(
+          Effect.catchCause(
+            logFailure("pull request watch skip record failed", {
+              threadId: target.thread.id,
+              pullRequest: group.key,
+            }),
+          ),
+        ),
+      { discard: true },
     );
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
@@ -403,11 +438,14 @@ export const make = Effect.gen(function* () {
 
   const closed = (target: WatchTarget) =>
     record(target, null, {
-      text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. Call watch_pull_request if it reopens.`,
-      notification: {
-        source: { kind: "monitor" },
-        outcome: "updated",
-        summary: `#${target.link.number}: closed, stopped watching`,
+      endReason: "closed",
+      wake: {
+        text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. Call watch_pull_request if it reopens.`,
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "updated",
+          summary: `#${target.link.number}: closed, stopped watching`,
+        },
       },
     }).pipe(
       Effect.tap(() => woke(target)),
@@ -416,11 +454,14 @@ export const make = Effect.gen(function* () {
 
   const merged = (target: WatchTarget) =>
     record(target, null, {
-      text: `Pull request #${target.link.number} (${target.link.url}) was merged, so T3 Code stopped watching it.`,
-      notification: {
-        source: { kind: "monitor" },
-        outcome: "completed",
-        summary: `#${target.link.number}: merged, stopped watching`,
+      endReason: "merged",
+      wake: {
+        text: `Pull request #${target.link.number} (${target.link.url}) was merged, so T3 Code stopped watching it.`,
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "completed",
+          summary: `#${target.link.number}: merged, stopped watching`,
+        },
       },
     }).pipe(
       Effect.tap(() => woke(target)),
@@ -482,7 +523,11 @@ export const make = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
     const last = lastReads.get(group.key);
     const plan = planRead(group, last, fingerprint, now);
-    if (!plan.detail) return;
+    if (!plan.detail) {
+      // A fingerprint answer shows the host reads again, though nothing there changed.
+      if (fingerprint !== null) yield* noteSkip(group, null);
+      return;
+    }
     if (
       last === undefined ||
       group.targets.some((target) => !last.watches.has(watchKey(target))) ||
@@ -515,17 +560,17 @@ export const make = Effect.gen(function* () {
       if (Cause.hasInterruptsOnly(read.cause)) return yield* Effect.failCause(read.cause);
       lastReads.delete(group.key);
       const reason = providerFailureReason(read.cause);
-      if (reason === "rate-limited") return;
+      if (reason === "rate-limited") return yield* noteSkip(group, reason);
       // Transport and host failures can outlast the failure limit; keep the watch for recovery.
       if (reason === "failed") {
         readFailures.delete(group.key);
+        yield* noteSkip(group, reason);
         return yield* Effect.failCause(read.cause);
       }
       const failures = (readFailures.get(group.key) ?? 0) + 1;
       readFailures.set(group.key, failures);
-      if (failures >= READ_FAILURE_LIMIT && (yield* eachTarget(group, giveUp))) {
-        readFailures.delete(group.key);
-      }
+      if (failures < READ_FAILURE_LIMIT) yield* noteSkip(group, reason ?? "failed");
+      else if (yield* eachTarget(group, giveUp)) readFailures.delete(group.key);
       return yield* Effect.failCause(read.cause);
     }
     readFailures.delete(group.key);
@@ -576,6 +621,7 @@ export const make = Effect.gen(function* () {
     });
     yield* eachTarget(group, (target) => {
       const report = evaluatePullRequestWatch(target.watch, detail, remarks, now);
+      const resumed = openSkip(target) === undefined ? undefined : { skip: null };
       if (report.changes.length > 0) {
         const wake = pullRequestWatchMessage({
           number: target.link.number,
@@ -587,14 +633,21 @@ export const make = Effect.gen(function* () {
         // An ending watch keeps what this pass saw, so watching again starts from it.
         return (
           report.exhausted
-            ? record(target, null, wake, report.next)
-            : record(target, report.next, wake)
+            ? record(target, null, {
+                wake,
+                endedWatch: report.next,
+                endReason: "comment-limit",
+                ...resumed,
+              })
+            : record(target, report.next, { wake, ...resumed })
         ).pipe(
           Effect.tap(() => woke(target)),
           Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
         );
       }
-      return watchesEqual(report.next, target.watch) ? Effect.void : record(target, report.next);
+      return watchesEqual(report.next, target.watch) && resumed === undefined
+        ? Effect.void
+        : record(target, report.next, resumed);
     });
   });
 
@@ -639,7 +692,9 @@ export const make = Effect.gen(function* () {
           ? merged(target)
           : reason === "closed"
             ? closed(target)
-            : record(target, null).pipe(Effect.tap(() => ended(target, reason)))
+            : record(target, null, { endReason: reason }).pipe(
+                Effect.tap(() => ended(target, reason)),
+              )
         ).pipe(
           Effect.catchCause(
             logFailure("pull request watch stop failed", {
@@ -659,7 +714,7 @@ export const make = Effect.gen(function* () {
         fingerprintOf(group).pipe(
           Effect.flatMap((fingerprint) =>
             fingerprint === "paused"
-              ? Effect.void
+              ? noteSkip(group, "rate-limited")
               : reads.withPermit(
                   readGroup(group, fingerprint).pipe(
                     Effect.catchCause(

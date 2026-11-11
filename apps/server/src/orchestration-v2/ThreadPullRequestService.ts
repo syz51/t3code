@@ -346,8 +346,17 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const worker = yield* makeDrainableWorker((request: RefreshRequest) =>
-    synchronize(request).pipe(
+  // One queued sync per thread, with the strongest refresh asked for while it waits.
+  // The entry leaves when the sync starts, so a later request queues a sync of its own.
+  const queuedThreadRefresh = new Map<ThreadId, boolean>();
+
+  const worker = yield* makeDrainableWorker((queued: RefreshRequest) => {
+    let request = queued;
+    if (queued.threadId !== null) {
+      request = { ...queued, refresh: queuedThreadRefresh.get(queued.threadId) ?? queued.refresh };
+      queuedThreadRefresh.delete(queued.threadId);
+    }
+    return synchronize(request).pipe(
       Effect.provideService(GitVcsDriver.BackgroundGitWork, true),
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
@@ -356,18 +365,25 @@ export const make = Effect.gen(function* () {
             cause: Cause.pretty(cause),
           }),
       ),
-    ),
-  );
+    );
+  });
+
+  const enqueueThread = (threadId: ThreadId, refresh: boolean) =>
+    Effect.suspend(() => {
+      const queued = queuedThreadRefresh.get(threadId);
+      queuedThreadRefresh.set(threadId, refresh || queued === true);
+      return queued === undefined ? worker.enqueue({ threadId, refresh }) : Effect.void;
+    });
 
   const processEvent = (event: OrchestrationV2DomainEvent) => {
     switch (event.type) {
       case "thread.created":
       case "thread.unarchived":
       case "thread.metadata-updated":
-        return worker.enqueue({ threadId: event.threadId, refresh: false });
+        return enqueueThread(event.threadId, false);
       case "thread.unsettled":
       case "checkpoint.captured":
-        return worker.enqueue({ threadId: event.threadId, refresh: true });
+        return enqueueThread(event.threadId, true);
       case "run.updated":
         if (
           event.payload.status === "completed" ||
@@ -375,7 +391,7 @@ export const make = Effect.gen(function* () {
           event.payload.status === "cancelled" ||
           event.payload.status === "interrupted"
         ) {
-          return worker.enqueue({ threadId: event.threadId, refresh: true });
+          return enqueueThread(event.threadId, true);
         }
         break;
     }

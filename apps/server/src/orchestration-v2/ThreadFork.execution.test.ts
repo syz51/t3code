@@ -197,7 +197,13 @@ it.effect("a persisted fork leaves PR watching with its parent until explicitly 
     const [forkLink] = fork.pullRequests ?? [];
     assert.isDefined(forkLink);
     assert.deepEqual(stoppedFork?.pullRequests, [
-      { ...forkLink, endedWatch: watchingFork.pullRequests[0].watch },
+      {
+        ...forkLink,
+        endedWatch: watchingFork.pullRequests[0].watch,
+        watchRecord: {
+          ended: { reason: "unwatched", at: DateTime.formatIso(yield* DateTime.now) },
+        },
+      },
     ]);
     assert.deepEqual(stoppedFork?.pendingBackgroundTasks, []);
     assert.deepEqual(yield* orchestrator.getThreadShell(sourceThreadId), parentBefore);

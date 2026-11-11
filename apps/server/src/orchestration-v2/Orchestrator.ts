@@ -36,6 +36,7 @@ import {
   type OrchestrationV2ServerCommand,
   type ThreadPullRequestLink,
   type ThreadPullRequestWatch,
+  type ThreadPullRequestWatchEndReason,
   type OrchestrationV2AppThread,
   type OrchestrationV2ContextHandoff,
   type OrchestrationV2ContextSourcePoint,
@@ -726,11 +727,22 @@ function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): 
 function withPullRequestWatch(
   link: ThreadPullRequestLink,
   watch: ThreadPullRequestWatch | undefined,
+  end?: { readonly reason: ThreadPullRequestWatchEndReason; readonly at: DateTime.Utc },
 ): ThreadPullRequestLink {
   const { watch: previous, endedWatch, ...rest } = link;
   if (watch !== undefined) return { ...rest, watch };
   const ended = previous ?? endedWatch;
-  return ended === undefined ? rest : { ...rest, endedWatch: ended };
+  return {
+    ...rest,
+    ...(ended !== undefined && { endedWatch: ended }),
+    ...(previous !== undefined &&
+      end !== undefined && {
+        watchRecord: {
+          ...link.watchRecord,
+          ended: { reason: end.reason, at: DateTime.formatIso(end.at) },
+        },
+      }),
+  };
 }
 
 function legacyPullRequestLink(
@@ -754,6 +766,7 @@ function legacyPullRequestLink(
         repositoryWebUrl: existing.repositoryWebUrl,
       }),
       ...(existing?.endedWatch && { endedWatch: existing.endedWatch }),
+      ...(existing?.watchRecord && { watchRecord: existing.watchRecord }),
     },
     existing?.watch,
   );
@@ -3792,7 +3805,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             archivedAt: now,
             titleRegeneration: null,
             guestShare: null,
-            pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
+            pullRequests: thread.pullRequests?.map((link) =>
+              withPullRequestWatch(link, undefined, { reason: "archived", at: now }),
+            ),
             updatedAt: now,
           };
         case "thread.unarchive":
@@ -3805,7 +3820,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             settledOverride: "settled",
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
-            pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
+            pullRequests: thread.pullRequests?.map((link) =>
+              withPullRequestWatch(link, undefined, { reason: "settled", at: now }),
+            ),
             unsettledAt: null,
             pinnedAt: null,
             pinOrderKey: null,
@@ -4068,7 +4085,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ? links.map((link) =>
                   link === existing
                     ? {
-                        ...withPullRequestWatch(link, undefined),
+                        ...withPullRequestWatch(link, undefined, { reason: "unlinked", at: now }),
                         source: "stack-dismissed" as const,
                       }
                     : link,
@@ -4128,6 +4145,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     snapshot: null,
                     stack: null,
                     ...(dismissed?.endedWatch && { endedWatch: dismissed.endedWatch }),
+                    ...(dismissed?.watchRecord && { watchRecord: dismissed.watchRecord }),
                   },
                 ]
               : linked;
@@ -4171,17 +4189,40 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     remarkIds: [],
                     wakes: 0,
                   });
-          if (watch === existing.watch && links === linked) return thread;
+          const skip =
+            command.type === "thread.pull-request-watch.sync" &&
+            existing.watch?.startedAt === command.startedAt
+              ? command.skip
+              : undefined;
+          if (watch === existing.watch && links === linked && skip === undefined) return thread;
           const final =
             command.type === "thread.pull-request-watch.sync" && watch === undefined
               ? command.endedWatch
               : undefined;
+          const endReason =
+            command.type === "thread.pull-request.watch" ? "unwatched" : command.endReason;
+          const next = withPullRequestWatch(
+            final ? { ...existing, watch: final } : existing,
+            watch,
+            endReason === undefined ? undefined : { reason: endReason, at: now },
+          );
+          const last = next.watchRecord?.skipped;
+          const open = last?.resumedAt === undefined ? last : undefined;
+          // A new cause keeps the time the unread stretch began.
+          const skipped =
+            skip === undefined
+              ? undefined
+              : skip !== null
+                ? { reason: skip, at: open?.at ?? startedAt }
+                : open && { ...open, resumedAt: startedAt };
           return {
             ...thread,
             pullRequests: links.map((link) =>
-              link === existing
-                ? withPullRequestWatch(final ? { ...link, watch: final } : link, watch)
-                : link,
+              link !== existing
+                ? link
+                : skipped === undefined
+                  ? next
+                  : { ...next, watchRecord: { ...next.watchRecord, skipped } },
             ),
             updatedAt: command.type === "thread.pull-request.watch" ? now : thread.updatedAt,
           };
@@ -11303,7 +11344,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: input.now,
         payload: {
           ...thread,
-          pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
+          pullRequests: pullRequests.map((link) =>
+            withPullRequestWatch(link, undefined, { reason: "stopped", at: input.now }),
+          ),
         },
       });
     }

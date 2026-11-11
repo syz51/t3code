@@ -3147,6 +3147,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const expected = before.pullRequests?.map(({ watch, ...link }) => ({
         ...link,
         endedWatch: watch,
+        watchRecord: { ended: { reason: "settled" as const, at: started.startedAt } },
       }));
       assert.deepEqual((yield* orchestrator.getThreadShell(threadId))?.pullRequests, expected);
       assert.isTrue((yield* maintenance.rebuild).valid);
@@ -3250,6 +3251,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
       });
       assert.isFalse(yield* watched);
+      assert.equal(
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watchRecord?.ended
+          ?.reason,
+        "archived",
+      );
       const refused = yield* orchestrator
         .dispatch({ ...watch, commandId: CommandId.make("pr-watch-archive-restart") })
         .pipe(Effect.flip);
@@ -3380,26 +3386,38 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         );
         yield* sweep;
         assert.deepEqual(yield* summaries, []);
+        const clock = Effect.map(DateTime.now, DateTime.formatIso);
         disconnected = true;
+        let firstFailureAt = "";
         for (let pass = 0; pass < 15; pass += 1) {
           genericFailure = reason === "failed" && (pass === 0 || (pass >= 2 && pass <= 8));
           yield* TestClock.adjust("2 minutes");
+          if (pass === 0) firstFailureAt = yield* clock;
           yield* sweep;
         }
 
+        const record = Effect.map(
+          orchestrator.getThreadShell(threadId),
+          (shell) => shell?.pullRequests?.[0]?.watchRecord,
+        );
         const thread = yield* orchestrator.getThreadShell(threadId);
         if (reason !== "failed") {
           assert.isUndefined(thread?.pullRequests?.[0]?.watch);
           assert.deepEqual(yield* summaries, ["#8: stopped watching, could not read it"]);
+          assert.equal((yield* record)?.ended?.reason, "unreadable");
           return;
         }
         assert.isDefined(thread?.pullRequests?.[0]?.watch);
         assert.deepEqual(yield* summaries, []);
+        // Fifteen failed sweeps leave one record, stamped by the first.
+        const skipped = { reason: "failed" as const, at: firstFailureAt };
+        assert.deepEqual((yield* record)?.skipped, skipped);
         disconnected = false;
         genericFailure = false;
         passed = true;
         yield* sweep;
         assert.deepEqual(yield* summaries, ["#8: checks passed"]);
+        assert.deepEqual((yield* record)?.skipped, { ...skipped, resumedAt: yield* clock });
         yield* TestClock.adjust("10 minutes");
         yield* sweep;
         assert.deepEqual(yield* summaries, ["#8: checks passed"]);
@@ -3413,6 +3431,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           watching: false,
         });
         yield* worker.drain();
+        assert.deepEqual((yield* record)?.ended, { reason: "unwatched", at: yield* clock });
       }),
   );
 
@@ -4538,6 +4557,163 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         yield* sweep;
         assert.equal((yield* wakes).length, 2);
       }),
+  );
+
+  it.effect("records a rate-limit pause once, when it lifts, and why the watch then ended", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-pull-request-watch-paused");
+      const projectId = ProjectId.make("pr-watch-paused-project");
+      yield* seedProject({
+        projectId,
+        title: "Watch paused",
+        workspaceRoot: "/workspace/watch-paused",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-paused-create"),
+        threadId,
+        projectId,
+        title: "Watch paused",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-watch-paused-start"),
+        threadId,
+        host: "github.com",
+        repository: "pingdotgg/t3code",
+        number: 31,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/31", source: "agent" },
+      });
+      let paused = false;
+      let broken = false;
+      let merged = false;
+      const host = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.mock(PullRequestService.PullRequestService)({
+          watchFingerprint: () =>
+            paused
+              ? Effect.fail(
+                  new PullRequestOperationError({
+                    operation: "watchFingerprint",
+                    detail: "rate limited",
+                    cause: new PullRequestProviderError({
+                      provider: SourceControlProviderKind.make("github"),
+                      operation: "watchFingerprint",
+                      reason: "rate-limited",
+                      detail: "rate limited",
+                    }),
+                  }),
+                )
+              : Effect.sync(() => ({
+                  status: merged ? "merged" : "open",
+                  remarks: broken ? "changed" : "none",
+                })),
+          invalidate: () => Effect.void,
+          detail: () =>
+            Effect.suspend(() =>
+              broken
+                ? Effect.fail(
+                    new PullRequestOperationError({
+                      operation: "detail",
+                      detail: "host broke",
+                      cause: new Error("host broke"),
+                    }),
+                  )
+                : Effect.void,
+            ).pipe(
+              Effect.as({
+                ...watchedPullRequestDetail({
+                  projectId,
+                  number: 31,
+                  at: "2026-10-02T12:00:00.000Z",
+                }),
+                state: merged ? ("merged" as const) : ("open" as const),
+                headSha: "abc1234def",
+                checks: [
+                  {
+                    name: "test",
+                    status: "pending" as const,
+                    description: null,
+                    url: null,
+                    required: true,
+                  },
+                ],
+              }),
+            ),
+          activity: () =>
+            Effect.succeed({
+              comments: [],
+              commentCount: 0,
+              commentsTruncated: false,
+              reviewThreads: [],
+              commits: [],
+            }),
+        }),
+      );
+      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const record = Effect.map(
+        orchestrator.getThreadShell(threadId),
+        (shell) => shell?.pullRequests?.[0]?.watchRecord,
+      );
+      const sweepLater = TestClock.adjust("2 minutes").pipe(
+        Effect.andThen(reactor.sweep),
+        Effect.andThen(worker.drain()),
+        Effect.andThen(Effect.map(DateTime.now, DateTime.formatIso)),
+      );
+      yield* reactor.sweep;
+      assert.isUndefined(yield* record);
+
+      paused = true;
+      const skipped = { reason: "rate-limited" as const, at: yield* sweepLater };
+      assert.deepEqual(yield* record, { skipped });
+      const pausedShell = yield* orchestrator.getThreadShell(threadId);
+      yield* sweepLater;
+      assert.deepEqual(yield* orchestrator.getThreadShell(threadId), pausedShell);
+
+      paused = false;
+      const resumed = { ...skipped, resumedAt: yield* sweepLater };
+      assert.deepEqual(yield* record, { skipped: resumed });
+
+      // A new cause keeps the time the stretch began, and a later watch closes the stretch.
+      paused = true;
+      const again = yield* sweepLater;
+      paused = false;
+      broken = true;
+      yield* sweepLater;
+      assert.deepEqual((yield* record)?.skipped, { reason: "failed", at: again });
+      for (const watching of [false, true]) {
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`pr-watch-paused-rewatch-${watching}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 31,
+          watching,
+        });
+      }
+      broken = false;
+      const reread = { reason: "failed" as const, at: again, resumedAt: yield* sweepLater };
+      assert.deepEqual((yield* record)?.skipped, reread);
+
+      merged = true;
+      const ended = { reason: "merged" as const, at: yield* sweepLater };
+      assert.isUndefined((yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch);
+      assert.deepEqual(yield* record, { skipped: reread, ended });
+    }),
   );
 
   it.effect("reads each watched PR as soon as its own fingerprint lands", () =>

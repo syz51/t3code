@@ -143,6 +143,8 @@ function entryOf(
     baseBranch: link.snapshot?.baseBranch ?? null,
     isDraft: link.snapshot?.isDraft ?? null,
     stack,
+    ...(link.watchRecord?.ended && { watchEnded: link.watchRecord.ended }),
+    ...(link.watchRecord?.skipped && { watchSkipped: link.watchRecord.skipped }),
   };
 }
 
