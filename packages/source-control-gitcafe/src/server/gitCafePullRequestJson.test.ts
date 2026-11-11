@@ -539,6 +539,8 @@ describe("toChecks", () => {
           check("completed", "cancelled"),
           check("completed", "action_required"),
           check("completed", "timed_out", "Lint"),
+          check("in_progress", "success", "Stuck"),
+          check("queued", "failure", "Stuck failure"),
         ],
         next: null,
       }),
@@ -548,10 +550,12 @@ describe("toChecks", () => {
       [
         ["completed-cancelled", "cancelled"],
         ["Lint", "failure"],
+        ["Stuck failure", "failure"],
         ["queued-null", "pending"],
         ["in_progress-null", "pending"],
         ["Build", "success"],
         ["completed-action_required", "action-required"],
+        ["Stuck", "success"],
       ],
     );
   });

@@ -318,21 +318,22 @@ export function originCheck(
   run: NonNullable<(typeof OriginCheckRunListSchema.Type)["checkRuns"]>[number],
 ): PullRequestCheck {
   const status: PullRequestCheckStatus =
-    run.status !== "completed"
-      ? run.status === "failing"
-        ? "failure"
-        : "pending"
-      : run.conclusion === "success"
-        ? "success"
-        : run.conclusion === "skipped"
-          ? "skipped"
-          : run.conclusion === "neutral" || run.conclusion === "stale"
-            ? "neutral"
-            : run.conclusion === "cancelled"
-              ? "cancelled"
-              : run.conclusion === "action_required"
-                ? "action-required"
-                : "failure";
+    // A finished run's status can lag at in_progress; a set conclusion is the result.
+    run.status === "failing"
+      ? "failure"
+      : run.status !== "completed" && !run.conclusion
+        ? "pending"
+        : run.conclusion === "success"
+          ? "success"
+          : run.conclusion === "skipped"
+            ? "skipped"
+            : run.conclusion === "neutral" || run.conclusion === "stale"
+              ? "neutral"
+              : run.conclusion === "cancelled"
+                ? "cancelled"
+                : run.conclusion === "action_required"
+                  ? "action-required"
+                  : "failure";
   return {
     name: run.name,
     status,
