@@ -51,7 +51,9 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { PreviewToolkit } from "./toolkits/preview/tools.ts";
+import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
+import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -269,12 +271,13 @@ it.effect.each([
     ),
 );
 
-const layerRecordingTools = (calls: Array<unknown>) => {
+const layerRecordingTools = (calls: Array<unknown>, forwarded?: Array<unknown>) => {
   const RecordingToolkit = Toolkit.make(
     OrchestratorToolkit.tools.delegate_task,
     OrchestratorToolkit.tools.t3_thread_read,
     OrchestratorToolkit.tools.t3_thread_wait,
     ProjectToolkit.tools.t3_project_update,
+    ThreadToolkit.tools.t3_thread_transfer,
     // Like the attachment tools, it takes a thread and reaches no other environment.
     Tool.make("local_thread_tool", {
       parameters: Schema.Struct({ threadId: Schema.String }),
@@ -302,6 +305,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_thread_read: record,
       t3_thread_wait: record,
       t3_project_update: record,
+      t3_thread_transfer: record,
       local_thread_tool: record,
       t3_thread_launch: record,
     }),
@@ -314,6 +318,13 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         Layer.mock(ProjectService.ProjectService)({}),
         NodeServices.layer,
         NodeCrypto.layer,
+        // Stands in for the linked environment, recording what goes there.
+        forwarded === undefined
+          ? Layer.empty
+          : Layer.mock(PeerForwarding.PeerForwarding)({
+              call: (_scope, _tool, _environmentId, params) =>
+                Effect.sync(() => forwarded.push(params)).pipe(Effect.as({} as never)),
+            }),
       ),
     ),
   );
@@ -632,6 +643,31 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
   }).pipe(Effect.provide(layerRecordingTools(calls)));
+});
+
+it.effect("takes a link as a transfer's target only in the environment the call goes to", () => {
+  const calls: Array<unknown> = [];
+  const forwarded: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const merge = { action: "merge_back", threadId: "thread-source" };
+    const linkIn = (environment: string) => `[Fix](t3-thread://v2/${environment}/thread-target)`;
+    for (const environment of [environmentId, "box"]) {
+      yield* callTool("t3_thread_transfer", { ...merge, targetThreadId: linkIn(environment) });
+      yield* callTool("t3_thread_transfer", {
+        ...merge,
+        environmentId: "box",
+        targetThreadId: linkIn(environment),
+      });
+    }
+    expect(calls).toEqual([
+      { ...merge, targetThreadId: "thread-target" },
+      { ...merge, targetThreadId: linkIn("box") },
+    ]);
+    expect(forwarded).toEqual([
+      { ...merge, environmentId: "box", targetThreadId: linkIn(environmentId) },
+      { ...merge, environmentId: "box", targetThreadId: "thread-target" },
+    ]);
+  }).pipe(Effect.provide(layerRecordingTools(calls, forwarded)));
 });
 
 it.effect("rejects keys a tool does not declare and names them", () => {
