@@ -574,7 +574,7 @@ function toCheckStatus(raw: CheckFields): PullRequestCheckStatus {
   if (conclusion === null && status !== undefined && status !== "COMPLETED" && status !== "") {
     return "pending";
   }
-  switch ((conclusion ?? raw.state)?.trim().toUpperCase()) {
+  switch ((conclusion ?? trimmed(raw.state))?.toUpperCase()) {
     case "SUCCESS":
       return "success";
     case "ACTION_REQUIRED":
