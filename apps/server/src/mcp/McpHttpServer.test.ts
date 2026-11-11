@@ -596,8 +596,18 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     yield* callTool("delegate_task", { task: "Inspect", target: {} });
     yield* callTool("delegate_task", { task: "Inspect", title: null, target: { model: null } });
     yield* callTool("t3_project_update", { projectId: "project-1", projectIcon: null });
+    // A result's `link` names its thread to the next call.
+    yield* callTool("t3_thread_read", {
+      threadId: `[Fix](t3-thread://v2/${environmentId}/${thread.threadId})`,
+    });
+    const elsewhere = yield* callTool("t3_thread_read", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+    });
+    // A link to a thread elsewhere sends the call to that environment, which this test has none of.
+    expect(JSON.stringify(elsewhere.content)).toContain("cannot reach linked environments");
 
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(6);
+    expect(calls[5]).toEqual(calls[0]);
     expect(calls[1]).toEqual(calls[0]);
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
@@ -611,6 +621,7 @@ it.effect("rejects keys a tool does not declare and names them", () => {
       Effect.flip,
     );
     expect(String(launch)).toContain('Expected no excess property\n  at ["prompt"]');
+    expect(String(launch)).toMatch(/It takes: .*\bmessage\b/);
     const nested = yield* callTool("delegate_task", {
       task: "Inspect",
       target: { model: null, isolation: "worktree" },

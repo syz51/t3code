@@ -38,6 +38,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
 import { advertisedJsonSchema } from "../../apps/server/src/mcp/advertisedJsonSchema.ts";
+import { compactToolResult } from "../../apps/server/src/mcp/compactResults.ts";
 import * as Contracts from "@t3tools/contracts";
 import {
   EnvironmentId,
@@ -1282,6 +1283,12 @@ const unsavedSecretNote = (Contracts as Record<string, unknown>).SECRET_REQUEST_
   | Readonly<Record<string, string>>
   | undefined;
 
+/** A thread or task result as T3 sends it: with its product fields, less what the transport cuts. */
+const asSent = (name: string, input: unknown, value: unknown, child: boolean): unknown => {
+  const whole = withProductFields(name, value, child);
+  return compactToolResult(name, input, whole) ?? whole;
+};
+
 /** Fields T3 adds to real thread and task results, applied to mocks and defaults alike. */
 const withProductFields = (name: string, value: unknown, child: boolean): unknown => {
   if (!isRecord(value)) return value;
@@ -1597,7 +1604,7 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
       call.id,
       name === "orchestrator_capabilities"
         ? capabilities(sample, mock)
-        : withProductFields(name, mock, testCase.setup.role === "delegated-child"),
+        : asSent(name, input, mock, testCase.setup.role === "delegated-child"),
     );
   }
   if (isT3Name(call.name)) {
@@ -1611,7 +1618,7 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
       call.id,
       name === "orchestrator_capabilities"
         ? capabilities(sample, value)
-        : withProductFields(name, value, testCase.setup.role === "delegated-child"),
+        : asSent(name, input, value, testCase.setup.role === "delegated-child"),
     );
   }
   if (call.name === "clock__curr_time")

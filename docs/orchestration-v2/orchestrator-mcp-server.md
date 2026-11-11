@@ -267,7 +267,7 @@ original brief, prior findings, responses, and unresolved objections. Track each
 round by its own `taskId` and use a distinct `clientRequestId` per round, stable
 across retries of that round.
 A follow-up that needs the same child's conversation goes through `t3_thread_send`
-on its `childThreadId`. After the original task completes, that follow-up runs as a
+on its thread, named by the result's `link`. After the original task completes, that follow-up runs as a
 fresh task in the child thread; it does not reopen the completed task or change its
 published result.
 
@@ -280,12 +280,19 @@ provider session. The request becomes the V2 command
 the timeout expires. A wait timeout does not cancel the child; the result sets
 `waitTimedOut: true`, and the caller can continue with `task_status`. A pending blocking
 question also ends the wait with `hasPendingQuestion: true` and `waitTimedOut: false`.
-If `hasPendingQuestion`, pass `threadId=childThreadId` to `t3_pending_request` with
+If `hasPendingQuestion`, pass the result's `link` as `threadId` to `t3_pending_request` with
 action `list`, `read` (with `requestId`), or `respond`, or ask the user; the task's completion still wakes this thread. A pending live approval for the
 task's own unfinished work also ends the wait. Its identity appears in `pendingApproval`;
 it grants no approval authority. Read the fresh full request in the child thread before
 responding, since the durable record can outlive its provider callback. Async questions
 do not end the wait.
+
+The service fills every field below. An agent's result leaves out null and false
+fields, the ids no tool takes as input (`childRunId`, `childNodeId`,
+`latestTerminalRunId`, the context transfer ids), and `childThreadId`, which
+`link` carries: every tool takes a thread's `link` as its `threadId`. The
+acknowledgement of a task that still runs also leaves out the model fields. A
+linked environment gets every field, because its version may require them.
 
 ```ts
 type DelegateTaskResult = {
@@ -388,8 +395,11 @@ bounded and offset-paginated. Deleted threads are never listed.
 
 ### `t3_thread_read`
 
-Reads the durable state, recent runs, and visible timeline of any thread in
-the environment by thread ID. A deleted thread returns `thread_not_found`. The
+Reads the status and visible timeline of any thread in the environment by
+thread ID or `link`. `include: ["thread"]` adds the thread record and
+`include: ["runs"]` its recent runs and each item's `runId`. Items leave out
+null fields, `messageId`, and `itemId` unless their text is cut off. A linked environment gets the whole
+result, as for `delegate_task`. A deleted thread returns `thread_not_found`. The
 default `messages` view returns user messages, assistant
 messages, and proposed plans. The `activity` view also returns summarized tool,
 reasoning, checkpoint, handoff, and runtime-request items. Large item text is
