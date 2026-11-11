@@ -375,6 +375,34 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(first.next, both, noRemarks).changes, []);
   });
 
+  it("reports passed where none is required once every check passes, and again after a re-run", () => {
+    const checks = (changes: PullRequestCheck["status"], test: PullRequestCheck["status"]) =>
+      detail({
+        checks: [check("changes", changes), check("lint", "skipped"), check("test", test)],
+      });
+    const passed = [{ kind: "checks-passed", count: 3, required: false }] as const;
+
+    // A job that never reports finished holds the gate until its re-run and the jobs after it pass.
+    const stuck = evaluatePullRequestWatch(watch(), checks("pending", "success"), noRemarks);
+    assert.deepEqual(stuck.changes, []);
+    const rerunning = evaluatePullRequestWatch(stuck.next, checks("success", "pending"), noRemarks);
+    assert.deepEqual(rerunning.changes, []);
+    const green = evaluatePullRequestWatch(rerunning.next, checks("success", "success"), noRemarks);
+    assert.deepEqual(green.changes, passed);
+    assert.deepEqual(
+      evaluatePullRequestWatch(green.next, checks("success", "success"), noRemarks).changes,
+      [],
+    );
+
+    // A re-run of one job after the notice is new work on the same head, so its pass is news.
+    const again = evaluatePullRequestWatch(green.next, checks("pending", "success"), noRemarks);
+    assert.deepEqual(again.changes, []);
+    assert.deepEqual(
+      evaluatePullRequestWatch(again.next, checks("success", "success"), noRemarks).changes,
+      passed,
+    );
+  });
+
   it("does not wake a watch saved before passed checks were recorded", () => {
     const green = detail({ checks: [{ ...check("test", "success"), required: true }] });
     const told = watch({ headSha: "aaaaaaaaaa", passed: true });
