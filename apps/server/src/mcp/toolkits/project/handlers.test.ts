@@ -50,6 +50,7 @@ const clientLaunchHarness = (input: {
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
+  readonly defaultWorkspaceStrategy?: ThreadLaunch.ThreadLaunchService["Service"]["defaultWorkspaceStrategy"];
   readonly hostedAppUrl?: string;
   /** The orchestrator refuses the new thread's mode, as under a managed ceiling. */
   readonly refusedByCeiling?: true;
@@ -112,6 +113,8 @@ const clientLaunchHarness = (input: {
     }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       checkWorktreeBase: input.checkWorktreeBase ?? (() => Effect.void),
+      defaultWorkspaceStrategy:
+        input.defaultWorkspaceStrategy ?? (() => Effect.succeed({ type: "root" })),
       launch: (launch) => {
         input.launched.push(launch);
         if (input.refusedByCeiling) {
@@ -526,6 +529,46 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
 
     expect((yield* launchFrom("main")).at(-1)?.result).toMatchObject({ projectId });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect("a launch without a workspace strategy follows the project's default", () =>
+  Effect.gen(function* () {
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+    const projectDefault = { type: "worktree", baseRef: "origin/main", startFromOrigin: true };
+    const checked: Array<unknown> = [];
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "auto",
+      launched,
+      defaultWorkspaceStrategy: () => Effect.succeed({ ...projectDefault, type: "worktree" }),
+      checkWorktreeBase: ({ workspaceStrategy }) =>
+        Effect.sync(() => {
+          checked.push(workspaceStrategy);
+        }),
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const launch = (input: object) =>
+      toolkit
+        .handle("t3_thread_launch", { title: "Fix", projectId, ...input })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    yield* launch({});
+    yield* launch({ workspaceStrategy: { type: "root" } });
+    // A retry replays the accepted launch, whatever the default is by then.
+    yield* launch({ clientRequestId: "fix-default" });
+    yield* launch({ clientRequestId: "fix-default" });
+
+    expect(launched.map((entry) => entry.workspaceStrategy)).toEqual([
+      projectDefault,
+      { type: "root" },
+      projectDefault,
+      { type: "root" },
+    ]);
+    expect(checked).toEqual([projectDefault, projectDefault]);
   }),
 );
 

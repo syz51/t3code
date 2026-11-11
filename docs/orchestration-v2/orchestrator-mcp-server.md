@@ -374,12 +374,13 @@ without a prompt remain idle.
 Launches one ordinary top-level thread through the app's launch service. Use an
 explicit `workspaceStrategy` to create a new worktree (`worktree` with `baseRef`),
 attach an existing checkout (`existing_worktree` with `worktreePath`), or use the
-project root (`root`, also the default). The thread is bound to that workspace
+project root (`root`). Without one, the project's new-thread setting decides: the
+project root, or a new worktree from the project's default branch. The thread is bound to that workspace
 before the agent starts. Creating a worktree in the task prompt does not update
 this binding.
 
 Pass the task in `message`. Project, model, and modes inherit when omitted;
-workspace does not. `scratch: true` launches without a project, in a folder of
+the caller's workspace does not. `scratch: true` launches without a project, in a folder of
 its own under the environment's Scratch project. For stacked PRs, use the parent branch as `baseRef` with
 `startFromOrigin: false`. The new thread may not run with broader runtime or
 interaction modes than the caller. As for `delegate_task`, a runtime mode the

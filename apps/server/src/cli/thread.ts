@@ -526,21 +526,27 @@ export const titleFromMessage = (message: string) => {
   return `${firstLine.slice(0, end).trimEnd()}…`;
 };
 
+/** No flag sends no strategy, so the server applies the project's new-thread default. */
 const launchWorkspaceStrategy = (input: {
   readonly worktree: Option.Option<string>;
   readonly branch: Option.Option<string>;
+  readonly local: boolean;
 }) =>
   Option.match(input.worktree, {
     onNone: () =>
       Option.isSome(input.branch)
         ? Effect.fail(new ThreadUsageError({ detail: "--branch needs --worktree <base-ref>." }))
-        : Effect.void,
+        : Effect.succeed(input.local ? { type: "root" as const } : undefined),
     onSome: (baseRef) =>
-      Effect.succeed({
-        type: "worktree" as const,
-        baseRef,
-        ...Option.match(input.branch, { onNone: () => ({}), onSome: (branch) => ({ branch }) }),
-      }),
+      input.local
+        ? Effect.fail(
+            new ThreadUsageError({ detail: "--local and --worktree choose different workspaces." }),
+          )
+        : Effect.succeed({
+            type: "worktree" as const,
+            baseRef,
+            ...Option.match(input.branch, { onNone: () => ({}), onSome: (branch) => ({ branch }) }),
+          }),
   });
 
 const jsonFlag = Flag.Boolean("json").pipe(
@@ -621,9 +627,15 @@ const threadStartCommand = Command.make("start", {
   ),
   worktree: Flag.String("worktree").pipe(
     Flag.withDescription(
-      "Run in a new git worktree based on this branch, tag, or commit, instead of the project folder.",
+      "Run in a new git worktree based on this branch, tag, or commit. Without --worktree or --local, the project's new-thread setting decides: the project folder, or a new worktree from the default branch.",
     ),
     Flag.optional,
+  ),
+  local: Flag.Boolean("local").pipe(
+    Flag.withDescription(
+      "Run in the project folder, even when the project starts new threads in a worktree.",
+    ),
+    Flag.withDefault(false),
   ),
   branch: Flag.String("branch").pipe(
     Flag.withDescription("Branch name for the new worktree."),

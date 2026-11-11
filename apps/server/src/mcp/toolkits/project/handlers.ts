@@ -152,9 +152,17 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             });
           yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
         }
+        // A replay keeps the workspace its first launch chose, so it reads no default.
+        const strategy =
+          input.workspaceStrategy ??
+          (replaying
+            ? ({ type: "root" } as const)
+            : yield* ThreadLaunch.ThreadLaunchService.pipe(
+                Effect.flatMap((launches) => launches.defaultWorkspaceStrategy(projectId)),
+                Effect.mapError(unavailable),
+              ));
         // Reject unresolved base refs before accepting a launch; worktree provisioning happens later.
-        const strategy = input.workspaceStrategy;
-        if (!replaying && strategy?.type === "worktree")
+        if (!replaying && strategy.type === "worktree")
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -233,7 +241,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           modelSelection,
           runtimeMode: startedRuntimeMode,
           interactionMode,
-          workspaceStrategy: input.workspaceStrategy ?? { type: "root" },
+          workspaceStrategy: strategy,
           ...(input.message === undefined && attachments.length === 0
             ? {}
             : {

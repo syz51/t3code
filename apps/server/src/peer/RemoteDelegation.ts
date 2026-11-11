@@ -272,6 +272,8 @@ const make = Effect.gen(function* () {
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),
           message: task,
+          // A task there runs in that project's checkout, whatever its new-thread default.
+          workspaceStrategy: { type: "root" },
           clientRequestId: `delegate:${scope.thread.threadId}:${key}`,
           // The thread there shows it is this thread's subagent, with a way back.
           delegatedFrom: {

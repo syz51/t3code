@@ -134,6 +134,80 @@ it.effect(
     ),
 );
 
+it.effect("start leaves the workspace to the project's default unless a flag chooses it", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs
+      .makeTempDirectoryScoped({ prefix: "t3-thread-workspace-" })
+      .pipe(Effect.flatMap((directory) => fs.realPath(directory)));
+    const baseDir = path.join(root, "state");
+    yield* persistServerRuntimeState({
+      path: path.join(baseDir, "userdata", "server-runtime.json"),
+      state: yield* makePersistedServerRuntimeState({
+        config: { host: "127.0.0.1", devUrl: undefined },
+        port: 3_773,
+      }),
+    });
+    const launches: Array<Record<string, unknown>> = [];
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          if (tool === "t3_project_list") {
+            return Effect.succeed({
+              structuredContent: {
+                projects: [
+                  { id: ProjectId.make("project-1"), title: "Project", workspaceRoot: root },
+                ],
+                nextCursor: null,
+              },
+            });
+          }
+          if (tool !== "t3_thread_launch") return Effect.die(`unexpected ${tool} call`);
+          launches.push(args);
+          return Effect.succeed({
+            structuredContent: { threadId, projectId: args.projectId, runId: null },
+          });
+        },
+      }),
+    );
+    const start = (...flags: ReadonlyArray<string>) =>
+      Command.runWith(threadCommand, { version: "0.0.0" })([
+        "start",
+        "project-1",
+        "Inspect this project",
+        "--base-dir",
+        baseDir,
+        ...flags,
+      ]);
+
+    yield* start();
+    yield* start("--local");
+    yield* start("--worktree", "origin/main", "--branch", "fix");
+    assert.deepStrictEqual(
+      launches.map((launch) => launch.workspaceStrategy),
+      [undefined, { type: "root" }, { type: "worktree", baseRef: "origin/main", branch: "fix" }],
+    );
+
+    yield* start("--local", "--worktree", "origin/main").pipe(Effect.exit);
+    assert.strictEqual(launches.length, 3);
+    assert.include(
+      (yield* TestConsole.errorLines).join("\n"),
+      "--local and --worktree choose different workspaces.",
+    );
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        NetService.layer,
+        ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+      ),
+    ),
+  ),
+);
+
 /** Answers each tool call with the next scripted response for that tool. */
 const scriptedTools = (script: Record<string, Array<unknown>>) => {
   const calls: Array<{ readonly tool: string; readonly args: unknown }> = [];

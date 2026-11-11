@@ -24,6 +24,7 @@ import {
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
   type ServerProvider,
+  type T3ProjectFile,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -61,6 +62,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -132,6 +134,8 @@ interface HarnessOptions {
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
+  readonly vcs?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
+  readonly projectFile?: T3ProjectFile;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -214,6 +218,10 @@ function makeHarness(options: HarnessOptions = {}) {
       removeWorktree,
       deleteLocalBranch,
       ...options.git,
+    }),
+    Layer.mock(GitVcsDriver.GitVcsDriver)(options.vcs ?? {}),
+    Layer.mock(T3ProjectFileLoader.T3ProjectFileLoader)({
+      load: () => Effect.succeed(Option.fromNullishOr(options.projectFile)),
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
       runForThread: runSetup,
@@ -2050,6 +2058,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
             ),
           ),
         checkWorktreeBase: launches.checkWorktreeBase,
+        defaultWorkspaceStrategy: launches.defaultWorkspaceStrategy,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,
       }),
@@ -2452,6 +2461,69 @@ it.effect.each([
       );
     }).pipe(Effect.provide(harness.layer));
   }),
+);
+
+const projectDefaultsToWorktree = {
+  projectSettingsFolded: true,
+  projectSettingsOverrides: { [projectId]: { defaultThreadEnvMode: "worktree" as const } },
+};
+const defaultBranchOnOrigin = {
+  resolvePrimaryRemoteName: () => Effect.succeed("origin"),
+  resolveDefaultBranchName: () => Effect.succeed("trunk"),
+  resolveCommit: ({ revision }: { readonly revision: string }) =>
+    revision === "refs/remotes/origin/trunk"
+      ? Effect.succeed({ commitSha: "trunk-sha" })
+      : Effect.fail(
+          new GitCommandError({
+            operation: "resolveCommit",
+            command: "git rev-parse",
+            cwd: "/repo",
+            detail: "unknown revision",
+          }),
+        ),
+} satisfies HarnessOptions["vcs"];
+const worktreeFromDefaultBranch = {
+  type: "worktree",
+  baseRef: "origin/trunk",
+  startFromOrigin: true,
+};
+
+it.effect.each([
+  {
+    name: "a project set to worktree starts from its default branch",
+    options: { serverSettings: projectDefaultsToWorktree },
+    expected: worktreeFromDefaultBranch,
+  },
+  {
+    name: "a t3.json default applies when no setting is stored",
+    options: { projectFile: { defaultThreadEnvMode: "worktree" } },
+    expected: worktreeFromDefaultBranch,
+  },
+  {
+    name: "a project without a default stays in its folder",
+    options: {},
+    expected: { type: "root" },
+  },
+  {
+    name: "a project with no commit to branch from stays in its folder",
+    options: { serverSettings: projectDefaultsToWorktree, hasCommit: () => Effect.succeed(false) },
+    expected: { type: "root" },
+  },
+] satisfies ReadonlyArray<{ name: string; options: HarnessOptions; expected: unknown }>)(
+  "default workspace strategy: $name",
+  (testCase) =>
+    Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      assert.deepEqual(yield* launches.defaultWorkspaceStrategy(projectId), testCase.expected);
+    }).pipe(
+      Effect.provide(
+        makeHarness({
+          hasCommit: () => Effect.succeed(true),
+          vcs: defaultBranchOnOrigin,
+          ...testCase.options,
+        }).layer,
+      ),
+    ),
 );
 
 it.effect("replays an accepted send after the project disables the instance", () => {
