@@ -4596,6 +4596,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         link: { url: "https://github.com/pingdotgg/t3code/pull/31", source: "agent" },
       });
       let paused = false;
+      let broken = false;
       let merged = false;
       const host = Layer.mergeAll(
         NodeServices.layer,
@@ -4615,27 +4616,42 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                     }),
                   }),
                 )
-              : Effect.sync(() => ({ status: merged ? "merged" : "open", remarks: "none" })),
+              : Effect.sync(() => ({
+                  status: merged ? "merged" : "open",
+                  remarks: broken ? "changed" : "none",
+                })),
           invalidate: () => Effect.void,
           detail: () =>
-            Effect.sync(() => ({
-              ...watchedPullRequestDetail({
-                projectId,
-                number: 31,
-                at: "2026-10-02T12:00:00.000Z",
+            Effect.suspend(() =>
+              broken
+                ? Effect.fail(
+                    new PullRequestOperationError({
+                      operation: "detail",
+                      detail: "host broke",
+                      cause: new Error("host broke"),
+                    }),
+                  )
+                : Effect.void,
+            ).pipe(
+              Effect.as({
+                ...watchedPullRequestDetail({
+                  projectId,
+                  number: 31,
+                  at: "2026-10-02T12:00:00.000Z",
+                }),
+                state: merged ? ("merged" as const) : ("open" as const),
+                headSha: "abc1234def",
+                checks: [
+                  {
+                    name: "test",
+                    status: "pending" as const,
+                    description: null,
+                    url: null,
+                    required: true,
+                  },
+                ],
               }),
-              state: merged ? ("merged" as const) : ("open" as const),
-              headSha: "abc1234def",
-              checks: [
-                {
-                  name: "test",
-                  status: "pending" as const,
-                  description: null,
-                  url: null,
-                  required: true,
-                },
-              ],
-            })),
+            ),
           activity: () =>
             Effect.succeed({
               comments: [],
@@ -4671,10 +4687,32 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const resumed = { ...skipped, resumedAt: yield* sweepLater };
       assert.deepEqual(yield* record, { skipped: resumed });
 
+      // A new cause keeps the time the stretch began, and a later watch closes the stretch.
+      paused = true;
+      const again = yield* sweepLater;
+      paused = false;
+      broken = true;
+      yield* sweepLater;
+      assert.deepEqual((yield* record)?.skipped, { reason: "failed", at: again });
+      for (const watching of [false, true]) {
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`pr-watch-paused-rewatch-${watching}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 31,
+          watching,
+        });
+      }
+      broken = false;
+      const reread = { reason: "failed" as const, at: again, resumedAt: yield* sweepLater };
+      assert.deepEqual((yield* record)?.skipped, reread);
+
       merged = true;
       const ended = { reason: "merged" as const, at: yield* sweepLater };
       assert.isUndefined((yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch);
-      assert.deepEqual(yield* record, { skipped: resumed, ended });
+      assert.deepEqual(yield* record, { skipped: reread, ended });
     }),
   );
 

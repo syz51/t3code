@@ -4189,7 +4189,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     remarkIds: [],
                     wakes: 0,
                   });
-          if (watch === existing.watch && links === linked) return thread;
+          const skip =
+            command.type === "thread.pull-request-watch.sync" &&
+            existing.watch?.startedAt === command.startedAt
+              ? command.skip
+              : undefined;
+          if (watch === existing.watch && links === linked && skip === undefined) return thread;
           const final =
             command.type === "thread.pull-request-watch.sync" && watch === undefined
               ? command.endedWatch
@@ -4201,17 +4206,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             watch,
             endReason === undefined ? undefined : { reason: endReason, at: now },
           );
-          const skip =
-            command.type === "thread.pull-request-watch.sync" &&
-            existing.watch?.startedAt === command.startedAt
-              ? command.skip
-              : undefined;
-          const open = next.watchRecord?.skipped;
+          const last = next.watchRecord?.skipped;
+          const open = last?.resumedAt === undefined ? last : undefined;
+          // A new cause keeps the time the unread stretch began.
           const skipped =
             skip === undefined
               ? undefined
               : skip !== null
-                ? { reason: skip, at: startedAt }
+                ? { reason: skip, at: open?.at ?? startedAt }
                 : open && { ...open, resumedAt: startedAt };
           return {
             ...thread,

@@ -105,14 +105,10 @@ type WatchEndReason = Exclude<
   "archived" | "unwatched" | "unlinked"
 >;
 
-/** The unread stretch this watch is in, as the link records it. */
-const openSkip = ({ link, watch }: WatchTarget) => {
+/** The cause of the unread stretch the link is in. One left open by an ended watch still counts. */
+const openSkip = ({ link }: WatchTarget) => {
   const skipped = link.watchRecord?.skipped;
-  return skipped !== undefined &&
-    skipped.resumedAt === undefined &&
-    Date.parse(skipped.at) >= Date.parse(watch.startedAt)
-    ? skipped.reason
-    : undefined;
+  return skipped?.resumedAt === undefined ? skipped?.reason : undefined;
 };
 
 interface WatchLife {
