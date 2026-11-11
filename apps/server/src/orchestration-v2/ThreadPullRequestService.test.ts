@@ -181,6 +181,135 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     ),
   );
 
+  it.effect("runs one refresh for a turn end, and one more for a refresh behind a sync", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = { ...threadShell("turn-end-thread"), branch: "feature/turn-end" };
+        const project: OrchestrationProjectShell = {
+          id: thread.projectId,
+          title: "Project",
+          workspaceRoot: "/workspace/project",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-08-01T00:00:00.000Z",
+          updatedAt: "2026-08-01T00:00:00.000Z",
+        };
+        const checkpointCaptured = {
+          type: "checkpoint.captured",
+          threadId: thread.id,
+        } as OrchestrationV2DomainEvent;
+        const runCompleted = {
+          type: "run.updated",
+          threadId: thread.id,
+          payload: { status: "completed" },
+        } as OrchestrationV2DomainEvent;
+        const activation = yield* Deferred.make<void>();
+        const sweepStarted = yield* Deferred.make<void>();
+        const releaseSweep = yield* Deferred.make<void>();
+        const turnEndQueued = yield* Deferred.make<void>();
+        const secondTurn = yield* Deferred.make<void>();
+        const secondSyncStarted = yield* Deferred.make<void>();
+        const lateRefreshQueued = yield* Deferred.make<void>();
+        const releaseSecondSync = yield* Deferred.make<void>();
+        let refreshLookups = 0;
+        // The stream pulls each step only after the service handled the events before it.
+        const step = (
+          after: Effect.Effect<unknown>,
+          ...events: ReadonlyArray<OrchestrationV2DomainEvent>
+        ) => Stream.unwrap(after.pipe(Effect.as(Stream.fromIterable(events))));
+        const dependencies = Layer.mergeAll(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            streamDomainEvents: step(
+              Deferred.await(sweepStarted),
+              checkpointCaptured,
+              runCompleted,
+            ).pipe(
+              Stream.concat(step(Deferred.succeed(turnEndQueued, undefined))),
+              Stream.concat(step(Deferred.await(secondTurn), checkpointCaptured)),
+              Stream.concat(step(Deferred.await(secondSyncStarted), runCompleted)),
+              Stream.concat(step(Deferred.succeed(lateRefreshQueued, undefined))),
+              Stream.concat(Stream.never),
+            ),
+            getPullRequestSnapshot: ({ threadId }) =>
+              (threadId === undefined
+                ? Deferred.succeed(sweepStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseSweep)),
+                  )
+                : Effect.void
+              ).pipe(
+                Effect.as({
+                  schemaVersion: 2,
+                  snapshotSequence: 1,
+                  threads: [thread],
+                  archivedThreads: [],
+                }),
+              ),
+          }),
+          Layer.mock(ProjectStore.ProjectStoreV2)({
+            listShells: () => Effect.succeed([project]),
+            getShell: () => Effect.succeedSome(project),
+          }),
+          Layer.mock(GitManager.GitManager)({
+            branchPullRequest: (_input, options) =>
+              Effect.gen(function* () {
+                if (!(options?.refresh ?? false)) return null;
+                refreshLookups += 1;
+                // Hold the first sync of the second turn; `succeed` is true once.
+                if (
+                  (yield* Deferred.isDone(secondTurn)) &&
+                  (yield* Deferred.succeed(secondSyncStarted, undefined))
+                ) {
+                  yield* Deferred.await(releaseSecondSync);
+                }
+                return null;
+              }),
+          }),
+          Layer.mock(PullRequestService.PullRequestService)({}),
+          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+            resolve: () =>
+              Effect.succeed({
+                canonicalKey: "github.com/acme/project",
+                locator: {
+                  source: "git-remote" as const,
+                  remoteName: "origin",
+                  remoteUrl: "git@github.com:acme/project.git",
+                },
+                provider: SourceControlProviderKind.make("github"),
+                owner: "acme",
+                name: "project",
+              }),
+          }),
+          Layer.mock(BackgroundPolicy.BackgroundPolicy)({}),
+          Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
+          Layer.succeed(
+            SecureRandom.SecureRandom,
+            SecureRandom.make((size) => new Uint8Array(size).fill(1)),
+          ),
+          FileSystem.layerNoop({}),
+          Path.layer,
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadPullRequestService.make;
+          yield* service.start();
+          yield* Deferred.succeed(activation, undefined);
+
+          // Both turn-end events queue while the startup sweep holds the worker.
+          yield* Deferred.await(turnEndQueued);
+          yield* Deferred.succeed(releaseSweep, undefined);
+          yield* service.drain;
+          expect(refreshLookups).toBe(1);
+
+          // A refresh that arrives while a sync runs may postdate that sync's lookup.
+          yield* Deferred.succeed(secondTurn, undefined);
+          yield* Deferred.await(lateRefreshQueued);
+          yield* Deferred.succeed(releaseSecondSync, undefined);
+          yield* service.drain;
+          expect(refreshLookups).toBe(3);
+        }).pipe(Effect.provide(dependencies));
+      }),
+    ),
+  );
+
   it.effect.each([
     {
       worktree: "a linked worktree",
