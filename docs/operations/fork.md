@@ -104,6 +104,16 @@ retries a failed update or install on a mirror outside that zone. After each mer
 `git grep -c 'fork-apt:' .github/workflows/ci.yml` must print `.github/workflows/ci.yml:2`; when
 upstream edits those lines, keep its package list and pass it to the script.
 
+In `scripts/check-changed.ts`, `comparisonBase` also tries each remote's `fork` branch, where
+upstream tries only each remote's `main`. With no ref, `vp run check:changed` compares against
+the candidate whose merge base has the fewest commits before `HEAD`. A branch from `fork` so
+compares against `origin/fork` and checks only its own changes, not the whole fork diff. A branch
+from a `main` still compares against that main, and a tie reports the main. A sync branch holds
+both histories, so pass `upstream/main` there as [Sync with upstream](#sync-with-upstream) says.
+After each merge, `git grep -c '"fork"' scripts/check-changed.ts` must print
+`scripts/check-changed.ts:1`; when upstream edits those lines, keep its change and add the `fork`
+candidates again.
+
 ### Other conflicts
 
 Resolve a conflict in another fork patch by keeping upstream's behavior and redoing the patch on
