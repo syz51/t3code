@@ -64,6 +64,8 @@ import {
   ThreadPullRequestSnapshot,
   ThreadPullRequestStack,
   ThreadPullRequestWatch,
+  ThreadPullRequestWatchEndReason,
+  ThreadPullRequestWatchSkipReason,
 } from "./threadPullRequest.ts";
 import {
   ProviderApprovalDecision,
@@ -3457,6 +3459,10 @@ const OrchestrationV2InternalCommand = Schema.Union([
     watch: Schema.NullOr(ThreadPullRequestWatch),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),
+    /** With `watch: null`, why the watch ended. */
+    endReason: Schema.optional(ThreadPullRequestWatchEndReason),
+    /** The failure that left this sweep unread, or null once the host is read again. */
+    skip: Schema.optional(Schema.NullOr(ThreadPullRequestWatchSkipReason)),
     wake: Schema.optional(
       Schema.Struct({
         messageId: MessageId,

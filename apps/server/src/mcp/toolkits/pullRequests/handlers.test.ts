@@ -618,7 +618,16 @@ describe("pull request toolkit handlers", () => {
           makeLink(1, { headBranch: "feat-a", baseBranch: "main", source: "created" }),
           makeLink(2, { headBranch: "feat-b", baseBranch: "feat-a", source: "agent" }),
           makeLink(9, { source: "stack-dismissed" }),
-          makeLink(10),
+          makeLink(10, {
+            watchRecord: {
+              ended: { reason: "merged", at: "2026-01-02T00:00:00.000Z" },
+              skipped: {
+                reason: "rate-limited",
+                at: "2026-01-01T12:00:00.000Z",
+                resumedAt: "2026-01-01T12:30:00.000Z",
+              },
+            },
+          }),
         ]),
       });
       const result = yield* harness.call("list_thread_pull_requests", {});
@@ -637,12 +646,25 @@ describe("pull request toolkit handlers", () => {
         isDraft: false,
         stack: { kind: "derived", position: 3, size: 3 },
       });
-      expect(result.pullRequests[3]).toMatchObject({
+      expect(result.pullRequests[3]).toEqual({
+        host: "github.com",
+        repository: "t3tools/t3code",
         number: 10,
+        url: "https://github.com/t3tools/t3code/pull/10",
+        source: "manual",
+        watching: false,
         state: null,
         title: null,
         headBranch: null,
+        baseBranch: null,
+        isDraft: null,
         stack: null,
+        watchEnded: { reason: "merged", at: "2026-01-02T00:00:00.000Z" },
+        watchSkipped: {
+          reason: "rate-limited",
+          at: "2026-01-01T12:00:00.000Z",
+          resumedAt: "2026-01-01T12:30:00.000Z",
+        },
       });
       expect(result.chains).toEqual([
         { kind: "derived", numbers: [1, 2, 3] },

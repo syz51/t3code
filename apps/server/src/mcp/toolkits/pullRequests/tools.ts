@@ -7,6 +7,7 @@ import {
   PullRequestReviewGuideRun,
   PullRequestState,
   ThreadPullRequestLinkSource,
+  ThreadPullRequestWatchRecord,
   TrimmedNonEmptyString,
   ThreadId,
 } from "@t3tools/contracts";
@@ -276,6 +277,10 @@ export const ThreadPullRequestEntry = Schema.Struct({
       size: Schema.Int,
     }),
   ),
+  /** Why and when the last watch ended. */
+  watchEnded: ThreadPullRequestWatchRecord.fields.ended,
+  /** The last stretch of sweeps that could not read the PR, so sent no wake. */
+  watchSkipped: ThreadPullRequestWatchRecord.fields.skipped,
 });
 export type ThreadPullRequestEntry = typeof ThreadPullRequestEntry.Type;
 

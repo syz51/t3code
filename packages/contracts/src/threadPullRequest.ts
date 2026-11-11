@@ -107,6 +107,47 @@ export const ThreadPullRequestWatch = Schema.Struct({
 });
 export type ThreadPullRequestWatch = typeof ThreadPullRequestWatch.Type;
 
+export const ThreadPullRequestWatchEndReason = Schema.Literals([
+  "merged",
+  "closed",
+  "unreadable",
+  "comment-limit",
+  "settled",
+  "subagent",
+  "archived",
+  "unwatched",
+  "unlinked",
+  "stopped",
+]);
+export type ThreadPullRequestWatchEndReason = typeof ThreadPullRequestWatchEndReason.Type;
+
+/** The host read failure that kept a sweep from checking the pull request. */
+export const ThreadPullRequestWatchSkipReason = Schema.Literals([
+  "missing-tool",
+  "unauthenticated",
+  "forbidden",
+  "rate-limited",
+  "not-found",
+  "failed",
+]);
+export type ThreadPullRequestWatchSkipReason = typeof ThreadPullRequestWatchSkipReason.Type;
+
+/** Why a watch last ended and last went unread. Logs rotate, so this is the durable trace. */
+export const ThreadPullRequestWatchRecord = Schema.Struct({
+  ended: Schema.optional(
+    Schema.Struct({ reason: ThreadPullRequestWatchEndReason, at: IsoDateTime }),
+  ),
+  /** Written when a run of unread sweeps starts and when it stops, never once per sweep. */
+  skipped: Schema.optional(
+    Schema.Struct({
+      reason: ThreadPullRequestWatchSkipReason,
+      at: IsoDateTime,
+      resumedAt: Schema.optional(IsoDateTime),
+    }),
+  ),
+});
+export type ThreadPullRequestWatchRecord = typeof ThreadPullRequestWatchRecord.Type;
+
 export const ThreadPullRequestLink = Schema.Struct({
   ...ThreadPullRequestKey.fields,
   url: TrimmedNonEmptyString,
@@ -119,5 +160,6 @@ export const ThreadPullRequestLink = Schema.Struct({
   watch: Schema.optional(ThreadPullRequestWatch),
   /** Resume from the ended watch to avoid duplicate notifications. */
   endedWatch: Schema.optional(ThreadPullRequestWatch),
+  watchRecord: Schema.optional(ThreadPullRequestWatchRecord),
 });
 export type ThreadPullRequestLink = typeof ThreadPullRequestLink.Type;
