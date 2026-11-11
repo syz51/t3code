@@ -117,6 +117,7 @@ import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as ShellThreadReads from "./orchestration-v2/ShellThreadReads.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
 import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
@@ -1124,6 +1125,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const shellThreadReads = yield* ShellThreadReads.ShellThreadReads;
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
     const projects = yield* ProjectStore.ProjectStoreV2;
     const projectService = yield* ProjectService.ProjectService;
@@ -1203,24 +1205,13 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
       const coalesced = coalesceShellApplicationEvents(events);
-      const threadIds = coalesced.flatMap((stored) =>
-        "aggregateKind" in stored ? [] : [stored.event.threadId],
+      const shells = yield* shellThreadReads.read(
+        coalesced.flatMap((stored) =>
+          "aggregateKind" in stored
+            ? []
+            : [{ threadId: stored.event.threadId, sequence: stored.sequence }],
+        ),
       );
-      // A failed batch can't name its thread, so the scalar reads below report which one is bad.
-      const batch =
-        threadIds.length > 1
-          ? yield* threadManagement
-              .getShellSnapshot({ threadIds })
-              .pipe(Effect.orElseSucceed(() => null))
-          : null;
-      const batchedShells =
-        batch === null
-          ? null
-          : new Map(
-              [...batch.threads, ...batch.archivedThreads].map(
-                (shell) => [shell.id, shell] as const,
-              ),
-            );
       return yield* Effect.forEach(
         coalesced,
         (stored) =>
@@ -1228,12 +1219,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const threadId = stored.event.threadId;
-            const shell =
-              batchedShells === null
-                ? yield* threadManagement.getThreadShell(threadId)
-                : (batchedShells.get(threadId) ?? null);
-            return shellStreamItemFromThreadShell({ stored, shell });
+            return shellStreamItemFromThreadShell({
+              stored,
+              shell: shells.get(stored.event.threadId) ?? null,
+            });
           }),
         { concurrency: 8 },
       );
