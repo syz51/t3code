@@ -15755,6 +15755,148 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each(["while it runs", "when it settles"] as const)(
+    "replaces a subagent's inherited effort with the one its transcript records, %s",
+    (moment) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const TASK_ID = "a1b2c3effort";
+          const TOOL_USE_ID = "toolu-effort-transcript";
+          const fileSystem = yield* FileSystem.FileSystem;
+          const configDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-claude-effort-",
+          });
+          const transcriptDir = NodePath.join(
+            configDir,
+            "projects",
+            "project",
+            WAKE_NATIVE_SESSION,
+            "subagents",
+          );
+          const writeTranscript = Effect.gen(function* () {
+            yield* fileSystem.makeDirectory(transcriptDir, { recursive: true });
+            yield* fileSystem.writeFileString(
+              NodePath.join(transcriptDir, `agent-${TASK_ID}.jsonl`),
+              `{"type":"assistant","effort":"xhigh","uuid":"effort-line-1","message":{"role":"assistant","id":"msg_effort_1","content":[{"type":"text","text":"Looking."}]}}\n`,
+            );
+          });
+          const harness = yield* makeWakeHarnessWithOptions({
+            environment: { CLAUDE_CONFIG_DIR: configDir },
+          });
+          const parentSelection = {
+            instanceId: CLAUDE_TEST_MODEL_SELECTION.instanceId,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "medium" }],
+          } satisfies ModelSelection;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt-subagent-transcript-effort"),
+              text: "Explore with a subagent.",
+              attachments: [],
+              modelSelection: parentSelection,
+            }),
+          );
+          const efforts = () =>
+            harness.events.flatMap((event) =>
+              event.type === "subagent.updated"
+                ? [getModelSelectionStringOptionValue(event.subagent.modelSelection, "effort")]
+                : [],
+            );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "assistant",
+              parent_tool_use_id: null,
+              message: {
+                model: parentSelection.model,
+                id: "msg_transcript_effort_launch",
+                type: "message",
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: TOOL_USE_ID,
+                    name: "Agent",
+                    input: {
+                      description: "Explore",
+                      subagent_type: "explorer",
+                      prompt: "Check one thing.",
+                    },
+                  },
+                ],
+              },
+              uuid: "00000000-0000-4000-8000-000000000231",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "task_started",
+              task_id: TASK_ID,
+              tool_use_id: TOOL_USE_ID,
+              description: "Explore",
+              task_type: "local_agent",
+              uuid: "00000000-0000-4000-8000-000000000232",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* writeTranscript;
+          // A subagent that sends no frame of its own is read when it settles.
+          if (moment === "while it runs") {
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "assistant",
+                parent_tool_use_id: TOOL_USE_ID,
+                message: {
+                  model: parentSelection.model,
+                  id: "msg_effort_1",
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "text", text: "Looking." }],
+                },
+                uuid: "00000000-0000-4000-8000-000000000233",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* harness.until(() => efforts().at(-1) === "xhigh");
+          }
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "task_notification",
+              task_id: TASK_ID,
+              tool_use_id: TOOL_USE_ID,
+              status: "completed",
+              output_file: "",
+              summary: "Explore",
+              uuid: "00000000-0000-4000-8000-000000000234",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* harness.until(() => efforts().at(-1) === "xhigh");
+          assert.equal(efforts()[0], "medium");
+          const childThreadEfforts = harness.events.flatMap((event) =>
+            event.type === "app_thread.created"
+              ? [getModelSelectionStringOptionValue(event.appThread.modelSelection, "effort")]
+              : [],
+          );
+          assert.deepEqual(childThreadEfforts, ["medium", "xhigh"]);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+      ),
+  );
+
   it.effect("extracts text from direct content-block subagent results", () =>
     Effect.scoped(
       Effect.gen(function* () {
