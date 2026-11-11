@@ -501,6 +501,27 @@ describe("AgentAwarenessRelay", () => {
     }),
   );
 
+  it.effect("reads the relay secrets once for a burst of publishes", () =>
+    Effect.gen(function* () {
+      const { relay, secretReads, currentShell, publications } = yield* makeTestRelay();
+      for (const title of ["One", "Two", "Three", "Four"]) {
+        yield* Ref.set(currentShell, shell({ title }));
+        yield* relay.publishThread(THREAD_ID);
+      }
+      assert.equal(publications.length, 4);
+      const relaySecrets = [
+        PUBLISH_AGENT_ACTIVITY_SECRET,
+        RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
+        RELAY_ISSUER_SECRET,
+        RELAY_URL_SECRET,
+      ];
+      assert.deepEqual(
+        secretReads.filter((name) => relaySecrets.includes(name)).toSorted(),
+        relaySecrets,
+      );
+    }),
+  );
+
   it.effect("republishes unchanged state with fresh credentials after relinking", () =>
     Effect.gen(function* () {
       const { relay, secrets, publications } = yield* makeTestRelay();
@@ -509,6 +530,7 @@ describe("AgentAwarenessRelay", () => {
         RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
         new TextEncoder().encode("credential-2"),
       );
+      yield* relay.requestCatchUp();
       yield* relay.publishThread(THREAD_ID);
       assert.equal(publications.length, 2);
       assert.equal(publications[0]?.authorization, "Bearer credential-1");
@@ -517,6 +539,8 @@ describe("AgentAwarenessRelay", () => {
         RELAY_URL_SECRET,
         new TextEncoder().encode("https://new-relay.example.test"),
       );
+      // Another process, such as the CLI, changed the link: no catch-up request arrives.
+      yield* TestClock.adjust("5 seconds");
       yield* relay.publishThread(THREAD_ID);
       assert.equal(publications.length, 3);
       assert.isTrue(publications[2]?.url.startsWith("https://new-relay.example.test/") ?? false);
