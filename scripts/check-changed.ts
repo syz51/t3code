@@ -157,11 +157,16 @@ export const comparisonBase = Effect.fn("checkChanged.comparisonBase")(function*
   const candidates = Option.isSome(explicitRef)
     ? [{ ref: explicitRef.value, rev: explicitRef.value }]
     : // A remote's `fork` branch is this fork's patch base. Mains come first, so a tie reports main.
-      (yield* gitLines(root, ["remote"]).pipe(
+      yield* gitLines(root, ["remote"]).pipe(
         Effect.map((names) =>
-          ["main", "fork"].flatMap((branch) => names.map((name) => name + "/" + branch)),
+          ["main", "fork"].flatMap((branch) =>
+            names.map((name) => ({
+              ref: name + "/" + branch,
+              rev: "refs/remotes/" + name + "/" + branch,
+            })),
+          ),
         ),
-      )).map((ref) => ({ ref, rev: "refs/remotes/" + ref }));
+      );
   let closest: { ref: string; base: string; ahead: number } | undefined;
   for (const { ref, rev } of candidates) {
     const base = yield* git(root, ["merge-base", "HEAD", rev]).pipe(
