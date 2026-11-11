@@ -197,6 +197,8 @@ function resolveAgentActivityPublishingStartupState(input: {
 const RELAY_AGENT_ACTIVITY_DETAIL_MAX_LENGTH = 160;
 const REDACTED_RELAY_AGENT_FAILURE_DETAIL = "The agent run failed.";
 const RELAY_AGENT_ACTIVITY_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+// The longest a relay setting changed by another process, such as `t3 connect`, stays unseen.
+const PUBLISH_SETTINGS_LIFETIME_MS = 5_000;
 
 function sanitizeRelayAgentActivityState(
   state: RelayAgentActivityState | null,
@@ -438,6 +440,36 @@ export const make = Effect.gen(function* () {
     Effect.map(isAgentActivityPublishingEnabledValue),
   );
 
+  // A publish reads the same four secret files, so a burst shares one read. The values stay in
+  // process memory. forgetPublishSettings drops them at once; the lifetime covers the other
+  // writer, the CLI in another process, which cannot reach this cache.
+  let publishSettings:
+    | {
+        readonly readAtMs: number;
+        readonly relayConfig: Effect.Success<typeof readRelayConfig>;
+      }
+    | undefined;
+  let publishSettingsGeneration = 0;
+  const forgetPublishSettings = () => {
+    publishSettings = undefined;
+    publishSettingsGeneration += 1;
+  };
+  // Null while publishing is off or the environment is unlinked.
+  const readPublishSettings = Effect.gen(function* () {
+    const readAtMs = (yield* DateTime.now).epochMilliseconds;
+    if (
+      publishSettings !== undefined &&
+      readAtMs - publishSettings.readAtMs < PUBLISH_SETTINGS_LIFETIME_MS
+    ) {
+      return publishSettings.relayConfig;
+    }
+    const generation = publishSettingsGeneration;
+    const relayConfig = (yield* readPublishAgentActivityEnabled) ? yield* readRelayConfig : null;
+    // A read that began before forgetPublishSettings may hold the values it replaced.
+    if (generation === publishSettingsGeneration) publishSettings = { readAtMs, relayConfig };
+    return relayConfig;
+  });
+
   const makeRelayClient = (relayConfig: {
     readonly url: string;
     readonly environmentCredential: string;
@@ -478,22 +510,14 @@ export const make = Effect.gen(function* () {
   });
 
   const publishThreadUnsafe = Effect.fn("publishThreadUnsafe")(function* (threadId: ThreadId) {
-    const publishAgentActivity = yield* readPublishAgentActivityEnabled;
-    if (!publishAgentActivity) {
-      yield* cancelPublishRetries;
-      yield* resetPublishedConnection;
-      yield* Effect.logDebug("agent activity publish skipped; publication disabled", {
-        threadId,
-      });
-      return;
-    }
-    const relayConfig = yield* readRelayConfig;
+    const relayConfig = yield* readPublishSettings;
     if (!relayConfig) {
       yield* cancelPublishRetries;
       yield* resetPublishedConnection;
-      yield* Effect.logDebug("agent activity publish skipped; relay link credentials unavailable", {
-        threadId,
-      });
+      yield* Effect.logDebug(
+        "agent activity publish skipped; publication disabled or relay link credentials unavailable",
+        { threadId },
+      );
       return;
     }
     if (
@@ -775,6 +799,8 @@ export const make = Effect.gen(function* () {
       Effect.tap(() => cancelPublishRetry(threadId)),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) return Effect.void;
+        // The relay may have refused a credential that has since changed, so the retry reads again.
+        forgetPublishSettings();
         return Effect.logWarning("agent activity publish failed", {
           threadId,
           cause: Cause.pretty(cause),
@@ -964,6 +990,7 @@ export const make = Effect.gen(function* () {
     publishThread,
     drain: worker.drain,
     requestCatchUp: Effect.fn("AgentAwarenessRelay.requestCatchUp")(function () {
+      forgetPublishSettings();
       return Queue.offer(catchUpRequests, undefined).pipe(Effect.asVoid);
     }),
     start,

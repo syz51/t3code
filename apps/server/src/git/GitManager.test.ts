@@ -1082,6 +1082,62 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("a branch PR lookup reads git config at most twice", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/config-reads"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/config-reads"]);
+      yield* runGit(repoDir, ["branch", "feature/local-only"]);
+      const forkDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "fork", forkDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/on-fork"]);
+      yield* runGit(repoDir, ["push", "-u", "fork", "feature/on-fork"]);
+      const gitCommands: string[] = [];
+      const { manager } = yield* makeManager({
+        gitCommands,
+        providerScenario: {
+          prListByHeadSelector: {
+            "feature/config-reads": [
+              {
+                number: 1,
+                title: "Config reads",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/1",
+                baseRefName: "main",
+                headRefName: "feature/config-reads",
+                state: "open",
+              },
+            ],
+          },
+        },
+      });
+      const configReads = (branch: string, options?: { readonly refresh: boolean }) =>
+        Effect.gen(function* () {
+          gitCommands.length = 0;
+          const pullRequest = yield* manager.branchPullRequest({ cwd: repoDir, branch }, options);
+          return {
+            number: pullRequest?.number ?? null,
+            reads: gitCommands.filter((args) => args.startsWith("config ")).length,
+          };
+        });
+
+      const first = yield* configReads("feature/config-reads");
+      expect(first.number).toBe(1);
+      expect(first.reads).toBeLessThanOrEqual(2);
+      const refreshed = yield* configReads("feature/config-reads", { refresh: true });
+      expect(refreshed.number).toBe(1);
+      expect(refreshed.reads).toBeLessThanOrEqual(2);
+      // The host result expired; the remembered git state did not.
+      yield* TestClock.adjust("61 seconds");
+      expect((yield* configReads("feature/config-reads")).reads).toBeLessThanOrEqual(1);
+      expect(yield* configReads("feature/local-only")).toEqual({ number: null, reads: 1 });
+      expect((yield* configReads("feature/on-fork")).reads).toBeLessThanOrEqual(2);
+    }),
+  );
+
   it.effect("a settled branch PR is rechecked only when the branch moves or every 15 minutes", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
@@ -1116,6 +1172,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       const freshLookups = () => gitCommands.filter((args) => args === "remote").length;
 
       expect((yield* lookup)?.state).toBe("merged");
+      expect(gitCommands.filter((args) => args.startsWith("config ")).length).toBe(2);
       gitCommands.length = 0;
       expect((yield* lookup)?.state).toBe("merged");
       expect((yield* lookup)?.state).toBe("merged");

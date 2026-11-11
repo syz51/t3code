@@ -1338,6 +1338,8 @@ const make = Effect.gen(function* () {
             ],
             { concurrency: 10 },
           );
+          // Drops the relay's remembered link, so no publish uses the removed credential.
+          yield* awarenessRelay.requestCatchUp();
           yield* setCliDesiredCloudLink(false).pipe(withSecrets);
           return { ok: true, endpointRuntimeStatus } satisfies EnvironmentCloudRelayConfigResult;
         }),
