@@ -2532,6 +2532,7 @@ describe("storage cleanup reports and local file policies", () => {
     ["with a merge commit", "removed", "Pull request was merged"],
     ["by squash", "removed", "Pull request was merged"],
     ["before a later unpushed commit", "kept", "Not merged"],
+    ["and the branch is gone", "kept", "Not merged"],
     ["with an uncommitted edit left", "kept", "Has uncommitted changes (1 file)"],
   ] as const)(
     "cleans a worktree whose pull request merged into a non-default branch %s",
@@ -2551,7 +2552,7 @@ describe("storage cleanup reports and local file policies", () => {
           const merged = (yield* command(worktree, ["rev-parse", "HEAD"])).stdout.trim();
           if (state !== "by squash")
             yield* command(repo, ["push", "origin", "feature:integration"]);
-          if (state === "before a later unpushed commit") {
+          if (state === "before a later unpushed commit" || state === "and the branch is gone") {
             yield* fs.writeFileString(`${worktree}/tracked.txt`, "unpushed work\n");
             yield* command(worktree, ["commit", "-am", "unpushed work"]);
           }
@@ -2560,7 +2561,7 @@ describe("storage cleanup reports and local file policies", () => {
           setPullRequest({
             state: "merged",
             headRef: "feature",
-            baseRef: "integration",
+            baseRef: state === "and the branch is gone" ? "gone" : "integration",
             headSha: state === "with a merge commit" ? null : merged,
           });
 

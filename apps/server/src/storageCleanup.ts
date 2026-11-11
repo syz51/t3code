@@ -1078,39 +1078,38 @@ const make = Effect.gen(function* () {
               { cwd: worktreePath, branch: thread.branch },
               { refresh: true },
             );
-            eligible = storageCleanupPullRequestMerged(pullRequest, {
-              branch: thread.branch,
-              headSha: head.commitSha,
-              integrated,
-            });
+            let merged = integrated;
             // A repository can merge into a branch other than the remote's default one.
-            if (!eligible && pullRequest?.state === "merged" && pullRequest.baseRef !== branch) {
+            if (!merged && pullRequest?.state === "merged" && pullRequest.baseRef !== branch) {
               const baseRef = `refs/remotes/${remote}/${pullRequest.baseRef}`;
-              // A deleted base branch fails the fetch; the worktree then stays as not merged.
-              const fetched = yield* git.execute({
-                operation: "StorageCleanup.fetchPullRequestBase",
-                cwd: repositoryCwd,
-                args: [
-                  "fetch",
-                  "--quiet",
-                  "--no-tags",
-                  "--",
-                  remote,
-                  `+refs/heads/${pullRequest.baseRef}:${baseRef}`,
-                ],
-                allowNonZeroExit: true,
-                timeoutMs: 60_000,
-              });
-              if (fetched.exitCode === 0) {
+              const refreshed = refreshedDefaultRefs.get(repositoryCwd) ?? new Set<string>();
+              // A deleted base branch fails the fetch; the worktree then counts as not merged.
+              const fetched =
+                refreshed.has(baseRef) ||
+                (yield* git
+                  .fetchRemoteTrackingBranch({
+                    cwd: repositoryCwd,
+                    remoteName: remote,
+                    remoteBranch: pullRequest.baseRef,
+                  })
+                  .pipe(Effect.isSuccess));
+              if (fetched) {
+                refreshed.add(baseRef);
+                refreshedDefaultRefs.set(repositoryCwd, refreshed);
                 const inBase = yield* git.execute({
                   operation: "StorageCleanup.integratedBranch",
                   cwd: worktreePath,
                   args: ["merge-base", "--is-ancestor", head.commitSha, baseRef],
                   allowNonZeroExit: true,
                 });
-                eligible = inBase.exitCode === 0;
+                merged = inBase.exitCode === 0;
               }
             }
+            eligible = storageCleanupPullRequestMerged(pullRequest, {
+              branch: thread.branch,
+              headSha: head.commitSha,
+              integrated: merged,
+            });
             if (eligible) removalReason = "pull request was merged";
           }
           if (!eligible && remote === null) return keep("has commits beyond the project branch");
