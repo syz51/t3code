@@ -2,6 +2,7 @@ import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
+import { lowerAgentProcessPriority } from "./agentProcessPriority.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
   mcpToolPresentation,
@@ -1617,6 +1618,7 @@ export const layerAppServerClientFactory: Layer.Layer<
               }),
           ),
         );
+        lowerAgentProcessPriority(handle.pid);
         // Its shells carry each thread's T3CODE_THREAD_ID, so port discovery reads listeners' threads.
         yield* Effect.acquireRelease(Effect.sync(portDiscovery.trackAgent), (release) =>
           Effect.sync(release),
