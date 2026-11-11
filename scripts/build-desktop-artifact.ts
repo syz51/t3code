@@ -73,8 +73,6 @@ const StageWorkspaceConfig = Schema.Struct({
     cpu: Schema.Array(Schema.String),
     libc: Schema.optional(Schema.Array(Schema.String)),
   }),
-  // pnpm 11 reads build approvals only from pnpm-workspace.yaml; omission fails staged lifecycle installs.
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
   patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   packageExtensions: Schema.optional(
@@ -88,11 +86,10 @@ const StageWorkspaceConfig = Schema.Struct({
       }),
     ),
   ),
-  nodeLinker: Schema.optional(Schema.Literals(["hoisted"])),
 });
 type StageWorkspaceConfig = typeof StageWorkspaceConfig.Type;
 
-// TypeScript is a typings-only peer; pnpm auto-installation would ship a compiler.
+// TypeScript is a typings-only peer; auto-installing it would ship a compiler.
 const STAGE_PACKAGE_EXTENSIONS = {
   "electron-webauthn": { peerDependenciesMeta: { typescript: { optional: true } } },
   "@electron-webauthn/macos": { peerDependenciesMeta: { typescript: { optional: true } } },
@@ -973,7 +970,6 @@ interface StagePackageJson {
   };
 }
 
-export const STAGE_INSTALL_ARGS = ["install", "--prod"] as const;
 export const DESKTOP_ELECTRON_LANGUAGES = ["en-US"] as const;
 export const DESKTOP_FILE_EXCLUSIONS = [
   // Cursor walks from argv[1] to platform assets; helpers and native addons need real paths outside ASAR.
@@ -1506,7 +1502,7 @@ export function resolveKeyringNativeArtifacts(
   }));
 }
 
-/** electron-builder omits pnpm-nested platform packages; stage keyring's binary beside its loader, which checks there first. */
+/** electron-builder omits nested platform packages; stage keyring's binary beside its loader, which checks there first. */
 const stageKeyringNativeBinaries = Effect.fn("stageKeyringNativeBinaries")(function* (
   stageAppDir: string,
   platform: typeof BuildPlatform.Type,
@@ -1537,7 +1533,7 @@ const stageKeyringNativeBinaries = Effect.fn("stageKeyringNativeBinaries")(funct
   }
 });
 
-// Stage pnpm-nested Clerk binaries beside index.js so the loader finds them and electron-builder unpacks them.
+// Stage nested Clerk binaries beside index.js so the loader finds them and electron-builder unpacks them.
 const stageClerkPasskeyNativeBinaries = Effect.fn("stageClerkPasskeyNativeBinaries")(function* (
   stageAppDir: string,
   platform: typeof BuildPlatform.Type,
@@ -1568,17 +1564,16 @@ const stageClerkPasskeyNativeBinaries = Effect.fn("stageClerkPasskeyNativeBinari
   }
 });
 
-export function createStageWorkspaceConfig(input: {
+function createStageWorkspaceConfig(input: {
   readonly platform: typeof BuildPlatform.Type;
   readonly arch: typeof BuildArch.Type;
-  readonly allowBuilds?: Record<string, boolean>;
   readonly patchedDependencies?: Record<string, string>;
   readonly overrides?: Record<string, string>;
 }): StageWorkspaceConfig {
-  const { platform, arch, allowBuilds, patchedDependencies, overrides } = input;
+  const { platform, arch, patchedDependencies, overrides } = input;
   const hostOs = platform === "mac" ? "darwin" : platform === "win" ? "win32" : "linux";
   const hostCpu = arch === "universal" ? ["arm64", "x64"] : [arch];
-  // Linux AppImages require glibc native optional dependencies; tell pnpm explicitly.
+  // Linux AppImages require glibc native optional dependencies; tell the installer explicitly.
   const supportedArchitectures =
     platform === "linux"
       ? {
@@ -1593,7 +1588,6 @@ export function createStageWorkspaceConfig(input: {
 
   return {
     supportedArchitectures,
-    ...(allowBuilds && Object.keys(allowBuilds).length > 0 ? { allowBuilds } : {}),
     ...(patchedDependencies && Object.keys(patchedDependencies).length > 0
       ? { patchedDependencies }
       : {}),
@@ -2777,7 +2771,7 @@ export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefi
   return `http://localhost:${mockUpdateServerPort ?? 3000}`;
 }
 
-// electron-builder reads user-agent syntax (pnpm/version), not packageManager syntax (pnpm@version).
+// electron-builder reads user-agent syntax (bun/version), not packageManager syntax (bun@version).
 export function resolvePackageManagerUserAgent(packageManager: string): string {
   const trimmed = packageManager.trim();
   const versionSeparator = trimmed.lastIndexOf("@");

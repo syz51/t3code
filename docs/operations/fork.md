@@ -17,7 +17,9 @@ This fork (`syz51/t3code`) is tested next to the installed T3 Code app. The inst
 ## Sync with upstream
 
 A sync merges `upstream/main` into a branch from `fork` and lands it through a PR, so CI runs
-before `fork` changes. `fork` is never rebased or force-pushed.
+before `fork` changes. `fork` is never rebased or force-pushed. The T3 scheduled task "Weekly fork
+upstream sync" starts one every Monday at 10:00 in a new thread on the Air, and that agent follows
+this section.
 
 ```sh
 git fetch upstream main
@@ -38,8 +40,8 @@ gh pr create --repo syz51/t3code --base fork --head fork-sync-<yyyymmdd>
 ```
 
 Fix CI failures on the branch. Merge the PR with a merge commit (`gh pr merge --merge`), never a
-squash, so `fork` keeps upstream's history and the next merge finds the right base. Then rebuild
-the fork app (see [Desktop app](#desktop-app)).
+squash, so `fork` keeps upstream's history and the next merge finds the right base. Then
+[deliver the build](#deliver-the-build).
 
 Agent Context Budget fails when upstream grew the agent context since the last sync. When
 `git diff upstream/main -- apps/server/src/provider/agentContextBudget.json` is empty, the growth
@@ -93,11 +95,65 @@ side: that drops either upstream's changes or the fork's bun edits elsewhere in 
 The script fails when a label names an OS it has no runner for, or when upstream changed the
 budget fetch. Add the runner to `hostedRunners` or redo the edit by hand.
 
+In `ci.yml`, the two background installs of the browser secret helper libraries call
+`.github/scripts/fork-apt-install.sh` under a `# fork-apt:` comment, where upstream calls
+`apt-get` directly. On the hosted runners `setup-apt-mirrors` changes nothing, because their
+sources already read a mirror list that names only `ubuntu.com` hosts, so one stalled zone
+stopped every job at the 10-minute wait without a log. The script limits each `apt-get` call and
+retries a failed update or install on a mirror outside that zone. After each merge,
+`git grep -c 'fork-apt:' .github/workflows/ci.yml` must print `.github/workflows/ci.yml:2`; when
+upstream edits those lines, keep its package list and pass it to the script.
+
+In `scripts/check-changed.ts`, `comparisonBase` also tries each remote's `fork` branch, where
+upstream tries only each remote's `main`. With no ref, `vp run check:changed` compares against
+the candidate whose merge base has the fewest commits before `HEAD`. A branch from `fork` so
+compares against `origin/fork` and checks only its own changes, not the whole fork diff. A branch
+from a `main` still compares against that main, and a tie reports the main. A sync branch holds
+both histories, so pass `upstream/main` there as [Sync with upstream](#sync-with-upstream) says.
+After each merge, `git grep -c '"fork"' scripts/check-changed.ts` must print
+`scripts/check-changed.ts:1`; when upstream edits those lines, keep its change and add the `fork`
+candidates again.
+
 ### Other conflicts
 
 Resolve a conflict in another fork patch by keeping upstream's behavior and redoing the patch on
-top. When that needs a design choice, run `git merge --abort` and file a board task that names
-the patch, its files and the upstream commit it conflicts with.
+top. When that needs a design choice, the sync [fails](#when-the-sync-fails).
+
+### When the sync fails
+
+Only `gh pr merge` changes `fork`, so a sync that stops earlier leaves `fork` as it was. Nothing
+is half-merged: the work stays on the sync branch or its PR. Do not merge, and do not deliver a
+build.
+
+- **A conflict the agent cannot resolve.** Run `git merge --abort`. File a task on the `t3code`
+  board that names the fork patch, its files and the upstream commit it conflicts with.
+- **A check the agent cannot fix.** Leave the PR open and unmerged. File a board task that names
+  the PR, the check and its error.
+
+The next sync starts again from `origin/fork`. Close the older sync PR once a newer one merges.
+
+### Deliver the build
+
+After the sync PR merges, update the installed app on both Macs with
+[`scripts/fork-app-update.sh`](#update-the-fork-app). The update quits the app, which ends every
+running thread on that Mac, the sync's own thread on the Air included.
+
+1. On the Air, check out the merged `origin/fork` and build the app as in
+   [Desktop app](#desktop-app).
+2. Update the Pro first. It has no checkout, so copy the build and the script:
+
+   ```sh
+   rsync -a --delete ~/.t3-fork/build/mac-arm64/ roy-macbook-pro:.t3-fork/build/mac-arm64/
+   rsync -a scripts/fork-app-update.sh roy-macbook-pro:.t3-fork/
+   ssh roy-macbook-pro '~/.t3-fork/fork-app-update.sh --dry-run && ~/.t3-fork/fork-app-update.sh --detach'
+   ```
+
+   About three minutes later, `ssh roy-macbook-pro 'tail -3 ~/.t3-fork/update.log'` must end with
+   `finished` and the new version. When the Pro is asleep or the update fails there, file a board
+   task and continue with the Air.
+
+3. Finish everything else: the board task, the report and the final reply.
+4. Update the Air last, as the last command of the turn: `scripts/fork-app-update.sh --detach`.
 
 ## State retention
 
@@ -267,7 +323,8 @@ quits or hands off to the one already running.
 There are two ways to use a fork build daily:
 
 - **Replace Nightly.** Keep the same `~/.t3` state and update by syncing `fork`, rebuilding and
-  replacing the app. See [Switch to the fork build](#switch-to-the-fork-build).
+  replacing the app. See [Switch to the fork build](#switch-to-the-fork-build) and
+  [Update the fork app](#update-the-fork-app).
 - **Run beside Nightly.** This needs fork patches to the bundle id (`DESKTOP_APP_ID` in
   `scripts/build-desktop-artifact.ts`), the Electron data folder (`DesktopUserData.ts`), the URL
   schemes and the default state folder (`DesktopStatePaths.ts`). Updates are rebuilds as above.
@@ -289,8 +346,7 @@ an agent inside Nightly.
 5. Open `/Applications/T3 Code (Beta).app`. The new signature makes macOS ask again for privacy
    permissions and keychain access.
 
-To update, quit the fork app, rebuild, and replace `/Applications/T3 Code (Beta).app` with the new
-build.
+To update an installed fork app, see [Update the fork app](#update-the-fork-app).
 
 To roll back:
 
@@ -305,3 +361,30 @@ beside the backup as `statev2.fork.sqlite`. Otherwise it keeps the current datab
 done on the fork. Pass `--restore-db` to restore the backup anyway. Pass a backup folder when `latest` does not
 point at the swap to undo. If the fork app fails to start, its recovery page offers to download its own
 version from upstream releases. No such release exists, so roll back instead.
+
+## Update the fork app
+
+`scripts/fork-app-update.sh` replaces the installed fork app with a newer fork build. An agent
+inside the app may run it, because the script does its work after the app has quit.
+
+1. Build the app as in [Desktop app](#desktop-app).
+2. Run `scripts/fork-app-update.sh --dry-run`. It runs while the app is open, checks the build and
+   lists the steps without changing anything.
+3. Run `scripts/fork-app-update.sh --detach`. It returns at once and logs to
+   `~/.t3-fork/update.log`.
+
+The quit ends every running thread on that Mac, also threads of other agents, and they do not
+continue on their own. Send a message to a thread afterwards to resume it. `--detach` runs the
+update in a new session; without it, the update stops with the agent that started it.
+
+The detached run waits 75 seconds, so the agent's last reply is saved, then asks the app to quit.
+When the app still runs after 90 seconds, it sends SIGTERM to the app's main process only: the
+process under `Contents/MacOS` that launchd owns, or the pid passed as an argument. Once the app
+and `statev2.sqlite` are free, it backs up the database with `VACUUM INTO` and moves the old app
+to `~/.t3-swap-backup/<time>-update/`, copies the new build into `/Applications` and opens it.
+When a step fails, it reopens the old app and the log says which step.
+
+To go back to the previous build, quit the app and move the old app from that backup folder to
+`/Applications`. Restore the database backup only when the newer build ran migrations the older
+one does not know. Ad-hoc signed builds fail `codesign --verify --deep` ("code has no
+resources"), so that command does not check a copy.

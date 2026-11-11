@@ -616,6 +616,34 @@ describe("pull request detail decoding", () => {
     }
   });
 
+  it("reads a finished run by its conclusion when GitHub leaves its status in progress", () => {
+    const stuck = {
+      name: "Changes",
+      workflowName: "CI",
+      status: "IN_PROGRESS",
+      conclusion: "SUCCESS",
+      startedAt: "2026-11-10T03:48:03Z",
+      completedAt: "2026-11-10T03:48:09Z",
+    };
+    const rerun = {
+      ...stuck,
+      conclusion: null,
+      startedAt: "2026-11-10T04:07:18Z",
+      completedAt: "0001-01-01T00:00:00Z",
+    };
+    const checksOf = (rollup: ReadonlyArray<Record<string, unknown>>) => {
+      const detail = detailOf(rollup.map(inWorkflow));
+      return [detail.checks.map((check) => [check.name, check.status]), detail.checksState];
+    };
+
+    expect(checksOf([stuck])).toEqual([[["Changes", "success"]], "passing"]);
+    expect(checksOf([{ ...stuck, conclusion: "FAILURE" }])).toEqual([
+      [["Changes", "failure"]],
+      "failing",
+    ]);
+    expect(checksOf([stuck, rerun])).toEqual([[["Changes", "pending"]], "pending"]);
+  });
+
   it("merges reviews with comments in time order and keeps a bodyless approval", () => {
     const detail = expectSuccess(activity(JSON.parse(detailJson) as Record<string, unknown>));
     expect(detail.comments.map((comment) => comment.id)).toEqual(["r1", "c1", "r2"]);

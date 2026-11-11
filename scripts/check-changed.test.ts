@@ -259,8 +259,8 @@ const env = {
   ),
 };
 
-// History A -> B -> C, with HEAD at C. Each remote's main points at A or B.
-function fixture(remotes: Record<string, "A" | "B">) {
+// History A -> B -> C, with HEAD at C. Each remote's main, and fork where given, points at A or B.
+function fixture(remotes: Record<string, "A" | "B">, forks: Record<string, "A" | "B"> = {}) {
   const root = NodeFS.realpathSync(
     NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-check-changed-")),
   );
@@ -283,6 +283,9 @@ function fixture(remotes: Record<string, "A" | "B">) {
     for (const [remote, commit] of Object.entries(remotes)) {
       git("remote", "add", remote, NodePath.join(root, "missing"));
       git("update-ref", `refs/remotes/${remote}/main`, commits[commit]!);
+    }
+    for (const [remote, commit] of Object.entries(forks)) {
+      git("update-ref", `refs/remotes/${remote}/fork`, commits[commit]!);
     }
   } catch (error) {
     NodeFS.rmSync(root, { recursive: true, force: true });
@@ -317,6 +320,32 @@ it.each(["upstream", "team/upstream"])(
     assert.strictEqual(result.ref, remote + "/main");
   },
 );
+
+it.each([
+  {
+    name: "a closer remote fork",
+    mains: { origin: "A", upstream: "A" },
+    fork: "B",
+    ref: "origin/fork",
+  },
+  {
+    name: "a remote main closer than the fork",
+    mains: { origin: "A", upstream: "B" },
+    fork: "A",
+    ref: "upstream/main",
+  },
+  {
+    name: "a remote main level with the fork",
+    mains: { origin: "A", upstream: "B" },
+    fork: "B",
+    ref: "upstream/main",
+  },
+] as const)("compares against $name", async ({ mains, fork, ref }) => {
+  using project = fixture(mains, { origin: fork });
+  const result = await compare(project.root, Option.none());
+  assert.strictEqual(result.base, project.commits.B);
+  assert.strictEqual(result.ref, ref);
+});
 
 it("compares against an explicit ref instead of the closest remote main", async () => {
   using project = fixture({ origin: "A", upstream: "B" });

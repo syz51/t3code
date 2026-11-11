@@ -53,41 +53,32 @@ describe("shouldBundleCliDependency", () => {
 });
 
 it.layer(NodeServices.layer)("external package dependency closure", (it) => {
-  // Read the pnpm store directly: isolation hides transitive names and exports maps can block package.json.
+  // Read the bun store directly: isolation hides transitive names and exports maps can block package.json.
   const readInstalledPackages = Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const storeDir = path.resolve(
       path.dirname(NodeURL.fileURLToPath(import.meta.url)),
-      "../../node_modules/.pnpm",
+      "../../node_modules/.bun",
     );
 
-    // Paths under store files such as lock.yaml raise ENOTDIR, not absence.
-    const isPresent = (candidate: string) =>
-      fileSystem.exists(candidate).pipe(Effect.orElseSucceed(() => false));
-
     const installed = new Map<string, PackageManifest>();
-    if (!(yield* isPresent(storeDir))) return installed;
-
     for (const entry of yield* fileSystem.readDirectory(storeDir)) {
-      const modulesDir = path.join(storeDir, entry, "node_modules");
-      if (!(yield* isPresent(modulesDir))) continue;
-
-      for (const owner of yield* fileSystem.readDirectory(modulesDir)) {
-        const names = owner.startsWith("@")
-          ? (yield* fileSystem.readDirectory(path.join(modulesDir, owner))).map(
-              (scoped) => `${owner}/${scoped}`,
-            )
-          : [owner];
-
-        for (const name of names) {
-          if (installed.has(name)) continue;
-          const manifestPath = path.join(modulesDir, name, "package.json");
-          if (!(yield* isPresent(manifestPath))) continue;
-          installed.set(name, decodeManifest(yield* fileSystem.readFileString(manifestPath)));
-        }
-      }
+      // Store entries are `<name>@<version>`, with a scope's slash written as `+`.
+      const versionSeparator = entry.indexOf("@", 1);
+      if (versionSeparator < 0) continue;
+      const name = entry.slice(0, versionSeparator).replace("+", "/");
+      if (installed.has(name)) continue;
+      installed.set(
+        name,
+        decodeManifest(
+          yield* fileSystem.readFileString(
+            path.join(storeDir, entry, "node_modules", name, "package.json"),
+          ),
+        ),
+      );
     }
+    assert.isAbove(installed.size, 0, `no packages found in ${storeDir}`);
     return installed;
   }).pipe(Effect.cached, Effect.runSync);
 

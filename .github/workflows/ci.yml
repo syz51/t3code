@@ -143,7 +143,8 @@ jobs:
           sudo sed -i 's|http://|https://|g' /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
           (
             set +e
-            sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config xvfb
+            # fork-apt: upstream runs apt-get here with no time limit. See docs/operations/fork.md.
+            .github/scripts/fork-apt-install.sh libsecret-1-dev pkg-config xvfb
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
@@ -290,7 +291,8 @@ jobs:
           sudo sed -i 's|http://|https://|g' /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
           (
             set +e
-            sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+            # fork-apt: upstream runs apt-get here with no time limit. See docs/operations/fork.md.
+            .github/scripts/fork-apt-install.sh libsecret-1-dev pkg-config
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 

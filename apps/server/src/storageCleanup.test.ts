@@ -260,7 +260,6 @@ describe("merged pull request cleanup", () => {
   const HEAD_SHA = "a".repeat(40);
   const integrated = {
     branch: "feature",
-    defaultBranch: "main",
     headSha: HEAD_SHA,
     integrated: true,
   };
@@ -270,7 +269,6 @@ describe("merged pull request cleanup", () => {
   ) => ({
     state: "merged" as const,
     headRef: "feature",
-    baseRef: "main",
     headSha: HEAD_SHA,
     ...overrides,
   });
@@ -285,8 +283,6 @@ describe("merged pull request cleanup", () => {
 
   it.each([
     ["has a later commit than the merged head", { headSha: "c".repeat(40) }],
-    ["was merged into a release branch", { baseRef: "release" }],
-    ["was merged into its stack parent", { baseRef: "stack-parent" }],
     ["was merged without a reported head commit", { headSha: null }],
     ["belongs to a different branch", { headRef: "other" }],
     ["is still open", { state: "open" }],
@@ -353,6 +349,10 @@ const cleanupFixture = (
     let fullStatusCalls = 0;
     let gitInspections = 0;
     let snapshotReads = 0;
+    let pullRequest: Pick<
+      GitManager.GitBranchPullRequest,
+      "state" | "headRef" | "baseRef" | "headSha"
+    > | null = null;
     let terminalListener: ((event: TerminalMetadataStreamEvent) => Effect.Effect<void>) | undefined;
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
@@ -464,6 +464,7 @@ const cleanupFixture = (
         )) as unknown as SqlClient.SqlClient),
       Effect.provideService(GitManager.GitManager, {
         invalidateStatus: () => Effect.void,
+        branchPullRequest: () => Effect.sync(() => pullRequest),
       } as unknown as GitManager.GitManager["Service"]),
       Effect.provideService(TerminalManager.TerminalManager, {
         subscribeMetadata: (
@@ -516,6 +517,9 @@ const cleanupFixture = (
             worktreeOnDelete: false,
           },
         };
+      },
+      setPullRequest: (next: typeof pullRequest) => {
+        pullRequest = next;
       },
       setThreads: (next: typeof threads) => {
         threads = next;
@@ -2523,6 +2527,49 @@ describe("storage cleanup reports and local file policies", () => {
         ).not.toBe("");
       }),
     ),
+  );
+  it.live.each([
+    ["with a merge commit", "removed", "Pull request was merged"],
+    ["by squash", "removed", "Pull request was merged"],
+    ["before a later unpushed commit", "kept", "Not merged"],
+    ["and the branch is gone", "kept", "Not merged"],
+    ["with an uncommitted edit left", "kept", "Has uncommitted changes (1 file)"],
+  ] as const)(
+    "cleans a worktree whose pull request merged into a non-default branch %s",
+    ([state, outcome, reason]) =>
+      runCleanupTest(
+        Effect.gen(function* () {
+          const { service, fs, repo, worktree, command, setPullRequest } = yield* cleanupFixture({
+            ...DEFAULT_SERVER_SETTINGS.storageCleanup,
+            worktreeOnMerge: true,
+          });
+          const remote = yield* fs.makeTempDirectoryScoped({ prefix: "cleanup-remote-" });
+          yield* command(remote, ["init", "--bare", "-b", "main"]);
+          yield* command(repo, ["remote", "add", "origin", remote]);
+          yield* command(repo, ["push", "origin", "main", "main:integration"]);
+          yield* fs.writeFileString(`${worktree}/tracked.txt`, "merged work\n");
+          yield* command(worktree, ["commit", "-am", "merged work"]);
+          const merged = (yield* command(worktree, ["rev-parse", "HEAD"])).stdout.trim();
+          if (state !== "by squash")
+            yield* command(repo, ["push", "origin", "feature:integration"]);
+          if (state === "before a later unpushed commit" || state === "and the branch is gone") {
+            yield* fs.writeFileString(`${worktree}/tracked.txt`, "unpushed work\n");
+            yield* command(worktree, ["commit", "-am", "unpushed work"]);
+          }
+          if (state === "with an uncommitted edit left")
+            yield* fs.writeFileString(`${worktree}/tracked.txt`, "uncommitted work\n");
+          setPullRequest({
+            state: "merged",
+            headRef: "feature",
+            baseRef: state === "and the branch is gone" ? "gone" : "integration",
+            headSha: state === "with a merge commit" ? null : merged,
+          });
+
+          const report = yield* service.runNow;
+          expect(report.entries[0]).toMatchObject({ outcome, reason });
+          expect(yield* fs.exists(worktree)).toBe(outcome === "kept");
+        }),
+      ),
   );
   it.live(
     "discovers trunk without a remote HEAD or tracking ref and removes an integrated worktree",

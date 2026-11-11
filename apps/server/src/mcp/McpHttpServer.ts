@@ -1155,18 +1155,18 @@ const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, 
               McpInvocationContext.McpInvocationContext,
             );
             if (caller === undefined) return options.handle(payload);
-            const threadId: unknown = payload?.threadId;
-            const linked =
-              typeof threadId === "string"
-                ? threadLinkRefs(threadId, caller.environmentId)[0]
+            const linkRef = (value: unknown) =>
+              typeof value === "string"
+                ? threadLinkRefs(value, caller.environmentId)[0]
                 : undefined;
+            const linked = linkRef(payload?.threadId);
             // A link to a thread elsewhere names the environment the call goes to. A tool
             // that reaches no other environment keeps the link, and refuses it as a thread id.
             const elsewhere =
               linked !== undefined &&
               linked.environmentId !== caller.environmentId &&
               payload.environmentId == null;
-            const params =
+            const routed =
               linked === undefined || (elsewhere && !takesEnvironment)
                 ? payload
                 : {
@@ -1174,6 +1174,14 @@ const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, 
                     ...(elsewhere ? { environmentId: linked.environmentId } : {}),
                     threadId: linked.threadId,
                   };
+            // A transfer's target is in the environment the call goes to; a link to a
+            // thread in any other stays as written, and is refused as a thread id.
+            const target = linkRef(routed?.targetThreadId);
+            const params =
+              target !== undefined &&
+              target.environmentId === (routed.environmentId ?? caller.environmentId)
+                ? { ...routed, targetThreadId: target.threadId }
+                : routed;
             const call = options.handle(params);
             // A linked environment decodes the result itself, maybe with a schema that needs every field.
             if (caller.client?.linked === true) return call;
