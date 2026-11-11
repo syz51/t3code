@@ -248,7 +248,7 @@ it.effect("show reads the end of a long thread, not its whole history", () =>
     const { messages } = yield* readLatestMessages(tools, threadId, 10);
 
     assert.deepStrictEqual(
-      messages.map((item) => item.itemId),
+      messages.map((item): string | undefined => item.itemId),
       latest(10),
     );
     assert.isBelow(
@@ -268,7 +268,7 @@ it.effect("show widens back to the first item when the thread has fewer messages
     const { messages } = yield* readLatestMessages(tools, threadId, 10);
 
     assert.deepStrictEqual(
-      messages.map((item) => item.itemId),
+      messages.map((item): string | undefined => item.itemId),
       latest(10),
     );
     assert.lengthOf(messages, 5);
@@ -282,7 +282,7 @@ it.effect("show returns a --messages count larger than one call can spread", () 
     const { messages } = yield* readLatestMessages(tools, threadId, 200_000);
 
     assert.deepStrictEqual(
-      messages.map((item) => item.itemId),
+      messages.map((item): string | undefined => item.itemId),
       latest(200_000),
     );
   }),

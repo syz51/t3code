@@ -10,7 +10,7 @@ import {
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
   OrchestratorMcpDelegateTaskInput,
-  OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpDelegateTaskToolResult,
   OrchestratorMcpDeleteScheduledTaskInput,
   OrchestratorMcpDeleteScheduledTaskResult,
   OrchestratorMcpEnvironmentTarget,
@@ -29,7 +29,7 @@ import {
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadInput,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   OrchestratorMcpThreadSendInput,
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitInput,
@@ -85,9 +85,9 @@ const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
 
 const DelegateTaskTool = Tool.make("delegate_task", {
   description:
-    "Start one child agent with only `task`. No parent history. Separate checkout or PR per child: `isolation:'worktree'`, plus `startFromOrigin:true` when the work does not need your commits. Keep `taskId` for `task_status` and `task_cancel`. No secrets in `task`.",
+    "Start one child agent with only `task`. No parent history. Separate checkout or PR per child: `isolation:'worktree'`, plus `startFromOrigin:true` when the work does not need your commits. Keep `taskId` for `task_status` and `task_cancel`. Thread tools take the child's `link` as `threadId`. No secrets in `task`.",
   parameters: OrchestratorMcpDelegateTaskInput,
-  success: OrchestratorMcpDelegateTaskResult,
+  success: OrchestratorMcpDelegateTaskToolResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
@@ -100,7 +100,7 @@ const TaskStatusTool = Tool.make("task_status", {
   description:
     "Read one delegated task you started. Do not call it on a running task before its completion wakes you. `workState`: working, waiting_for_children, result_available. A finished turn with live child work is not done. `summary`: final result. Reading it marks it delivered.",
   parameters: OrchestratorMcpTaskStatusInput,
-  success: OrchestratorMcpDelegateTaskResult,
+  success: OrchestratorMcpDelegateTaskToolResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
@@ -238,9 +238,9 @@ const ThreadListTool = Tool.make("t3_thread_list", {
 
 const ThreadReadTool = Tool.make("t3_thread_read", {
   description:
-    "Read any thread by id. `messages` (default): user and assistant messages and plans. `activity`: all timeline items. Keep reads small: low `limit` and `maxCharsPerItem`. Page with `afterPosition=nextPosition`. Cut-off text: `itemId` with `textOffset=nextTextOffset`. Reading a child's final result marks it delivered. In your reply, name it as its `link` verbatim.",
+    "Read any thread by id or `link`. `messages` (default): user and assistant messages and plans. `activity`: all timeline items. Keep reads small: low `limit` and `maxCharsPerItem`. Page with `afterPosition=nextPosition`. Cut-off text: `itemId` with `textOffset=nextTextOffset`. Reading a child's final result marks it delivered. In your reply, name it as its `link` verbatim.",
   parameters: OrchestratorMcpThreadReadInput,
-  success: OrchestratorMcpThreadReadResult,
+  success: OrchestratorMcpThreadReadToolResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,

@@ -774,7 +774,6 @@ const delegateToBox = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>)
         return result.structuredContent as {
           taskId: NodeId;
           status: string;
-          childThreadId: null;
           remoteChild: { environmentId: string; threadId: ThreadId; label: string };
           link?: string;
         };
@@ -820,7 +819,6 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
       const delegated = yield* delegateToBox(a);
       expect(delegated).toMatchObject({
         status: "running",
-        childThreadId: null,
         remoteChild: { environmentId: box.environmentId, label: "Box" },
       });
       // The box launched it in the project with the same repository.
@@ -865,13 +863,9 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
         .pipe(Effect.withTracer(historyTracer));
       expect(running.structuredContent).toMatchObject({
         taskId: delegated.taskId,
-        childThreadId: null,
         remoteChild: delegated.remoteChild,
         status: "running",
         workState: "working",
-        summary: null,
-        hasPendingQuestion: false,
-        pendingApproval: null,
       });
       // A running task there needs its local row, not the parent's run or transfer history.
       expect(historyReads).toEqual([]);

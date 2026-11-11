@@ -40,7 +40,9 @@ import {
   MAX_REPORTED_DEPTH,
   toolOutcome,
 } from "../telemetry/ProviderDimensions.ts";
+import { threadLinkRefs } from "@t3tools/shared/threadLinks";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
+import { compactToolResult } from "./compactResults.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
@@ -1077,19 +1079,23 @@ const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <
   const decoders = new Map(
     Object.values(toolkit.tools).map((tool) => [
       tool.name,
-      // Tool parameters are JSON structs; their decoding needs no services.
-      Schema.decodeUnknownEffect(Schema.toCodecJson(tool.parametersSchema)) as (
-        input: unknown,
-        options?: typeof strictDecoding,
-      ) => Effect.Effect<unknown, Schema.SchemaError>,
+      {
+        // Tool parameters are JSON structs; their decoding needs no services.
+        decode: Schema.decodeUnknownEffect(Schema.toCodecJson(tool.parametersSchema)) as (
+          input: unknown,
+          options?: typeof strictDecoding,
+        ) => Effect.Effect<unknown, Schema.SchemaError>,
+        accepted: Object.keys(advertisedJsonSchema(tool).properties ?? {}),
+      },
     ]),
   );
   const checkingServer = McpServer.McpServer.of({
     ...server,
     addTool: Effect.fn("McpServer.addTool")(function (options) {
       const { name } = options.tool;
-      const decode = decoders.get(name);
-      if (decode === undefined) return server.addTool(options);
+      const decoder = decoders.get(name);
+      if (decoder === undefined) return server.addTool(options);
+      const { decode, accepted } = decoder;
       return server.addTool({
         ...options,
         handle: (payload) =>
@@ -1111,7 +1117,7 @@ const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <
                       onSuccess: () =>
                         Effect.fail(
                           new McpSchema.InvalidParams({
-                            message: `Invalid parameters for tool '${name}': ${strict.message}`,
+                            message: `Invalid parameters for tool '${name}': ${strict.message}\nIt takes: ${accepted.join(", ")}.`,
                           }),
                         ),
                       onFailure: () => options.handle(payload),
@@ -1124,6 +1130,70 @@ const withKnownKeys = Effect.fn("McpHttpServer.withKnownKeys")(function* <
     }),
   });
   return yield* registration.pipe(Effect.provideService(McpServer.McpServer, checkingServer));
+});
+
+/**
+ * A thread's `link` works wherever its `threadId` does, and the largest results
+ * lose what an agent cannot use. Outermost, so the tool analytics inside still
+ * read the ids of the whole result.
+ */
+const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, R>(
+  registration: Effect.Effect<A, E, R>,
+) {
+  const server = yield* McpServer.McpServer;
+  const wireServer = McpServer.McpServer.of({
+    ...server,
+    addTool: Effect.fn("McpServer.addTool")(function (options) {
+      const { name } = options.tool;
+      const takesEnvironment = "environmentId" in (options.tool.inputSchema.properties ?? {});
+      return server.addTool({
+        ...options,
+        handle: (payload) =>
+          Effect.withFiber((fiber) => {
+            const caller = Context.getOrUndefined(
+              fiber.context,
+              McpInvocationContext.McpInvocationContext,
+            );
+            if (caller === undefined) return options.handle(payload);
+            const threadId: unknown = payload?.threadId;
+            const linked =
+              typeof threadId === "string"
+                ? threadLinkRefs(threadId, caller.environmentId)[0]
+                : undefined;
+            // A link to a thread elsewhere names the environment the call goes to. A tool
+            // that reaches no other environment keeps the link, and refuses it as a thread id.
+            const elsewhere =
+              linked !== undefined &&
+              linked.environmentId !== caller.environmentId &&
+              payload.environmentId == null;
+            const params =
+              linked === undefined || (elsewhere && !takesEnvironment)
+                ? payload
+                : {
+                    ...payload,
+                    ...(elsewhere ? { environmentId: linked.environmentId } : {}),
+                    threadId: linked.threadId,
+                  };
+            const call = options.handle(params);
+            // A linked environment decodes the result itself, maybe with a schema that needs every field.
+            if (caller.client?.linked === true) return call;
+            return Effect.map(call, (result) => {
+              if (result instanceof McpSchema.InputRequired || result.isError === true)
+                return result;
+              const compact = compactToolResult(name, params, result.structuredContent);
+              return compact === undefined
+                ? result
+                : new McpSchema.CallToolResult({
+                    ...result,
+                    structuredContent: compact,
+                    content: [{ type: "text", text: JSON.stringify(compact) }],
+                  });
+            });
+          }),
+      });
+    }),
+  });
+  return yield* registration.pipe(Effect.provideService(McpServer.McpServer, wireServer));
 });
 
 /** `McpServer.registerToolkit` advertises the full codec schema; agents get the compact one. */
@@ -1177,11 +1247,13 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) =>
   Layer.effectDiscard(
-    withToolAnalytics(
-      withToolSpans(
-        withKnownKeys(
-          toolkit,
-          withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+    withAgentWire(
+      withToolAnalytics(
+        withToolSpans(
+          withKnownKeys(
+            toolkit,
+            withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+          ),
         ),
       ),
     ),

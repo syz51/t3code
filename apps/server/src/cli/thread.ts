@@ -1,7 +1,7 @@
 import {
   OrchestratorMcpFailure,
   OrchestratorMcpThreadListResult,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitResult,
   ProjectId,
@@ -10,7 +10,7 @@ import {
   TrimmedNonEmptyString,
   type OrchestratorMcpThreadListItem,
   type OrchestratorMcpThreadStatus,
-  type OrchestratorMcpThreadTimelineItem,
+  type OrchestratorMcpThreadReadToolItem,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Console from "effect/Console";
@@ -315,9 +315,9 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
   threadId: ThreadId,
   view: "messages" | "activity",
 ) {
-  const items: Array<OrchestratorMcpThreadTimelineItem> = [];
+  const items: Array<OrchestratorMcpThreadReadToolItem> = [];
   let afterPosition: number | undefined;
-  let page: OrchestratorMcpThreadReadResult;
+  let page: OrchestratorMcpThreadReadToolResult;
   do {
     page = yield* tools.call(
       "t3_thread_read",
@@ -326,14 +326,15 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
         view,
         limit: READ_PAGE_LIMIT,
         runLimit: 1,
+        include: ["runs"],
         ...(afterPosition === undefined ? {} : { afterPosition }),
       },
-      OrchestratorMcpThreadReadResult,
+      OrchestratorMcpThreadReadToolResult,
     );
     items.push(...page.items);
     afterPosition = page.nextPosition ?? undefined;
   } while (page.hasMore && afterPosition !== undefined);
-  return { thread: page.thread, items };
+  return { items };
 });
 
 /**
@@ -348,10 +349,11 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
 ) {
   let { thread } = yield* tools.call(
     "t3_thread_read",
-    { threadId, limit: 1, runLimit: 1 },
-    OrchestratorMcpThreadReadResult,
+    { threadId, limit: 1, runLimit: 1, include: ["thread"] },
+    OrchestratorMcpThreadReadToolResult,
   );
-  let messages: Array<OrchestratorMcpThreadTimelineItem> = [];
+  if (thread === undefined) return yield* Effect.die("t3_thread_read left out the thread record.");
+  let messages: Array<OrchestratorMcpThreadReadToolItem> = [];
   // The newest window has no upper bound, so items added since the first
   // read are still shown.
   let before: number | undefined;
@@ -360,9 +362,9 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
   do {
     const end = before;
     start = Math.max(0, start - span);
-    const window: Array<OrchestratorMcpThreadTimelineItem> = [];
+    const window: Array<OrchestratorMcpThreadReadToolItem> = [];
     let afterPosition = start - 1;
-    let page: OrchestratorMcpThreadReadResult;
+    let page: OrchestratorMcpThreadReadToolResult;
     do {
       page = yield* tools.call(
         "t3_thread_read",
@@ -371,9 +373,10 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
           view: "messages",
           limit: READ_PAGE_LIMIT,
           runLimit: 1,
+          include: ["thread", "runs"],
           ...(afterPosition < 0 ? {} : { afterPosition }),
         },
-        OrchestratorMcpThreadReadResult,
+        OrchestratorMcpThreadReadToolResult,
       );
       window.push(
         ...page.items.filter(
@@ -384,7 +387,7 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
       );
       afterPosition = page.nextPosition ?? Number.POSITIVE_INFINITY;
     } while (page.hasMore && afterPosition < (end ?? Number.POSITIVE_INFINITY) - 1);
-    thread = page.thread;
+    thread = page.thread ?? thread;
     // A window can hold the whole --messages count, too many to spread as arguments.
     messages = window.concat(messages);
     before = start;
@@ -397,7 +400,7 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
 const readFullText = Effect.fn("cli.thread.readFullText")(function* (
   tools: ThreadTools,
   threadId: ThreadId,
-  item: OrchestratorMcpThreadTimelineItem,
+  item: OrchestratorMcpThreadReadToolItem,
 ) {
   let text = item.text ?? "";
   let nextTextOffset = item.textTruncated ? (item.nextTextOffset ?? null) : null;
@@ -405,7 +408,7 @@ const readFullText = Effect.fn("cli.thread.readFullText")(function* (
     const page = yield* tools.call(
       "t3_thread_read",
       { threadId, itemId: item.itemId, textOffset: nextTextOffset, runLimit: 1 },
-      OrchestratorMcpThreadReadResult,
+      OrchestratorMcpThreadReadToolResult,
     );
     const chunk = page.items.find((candidate) => candidate.itemId === item.itemId);
     if (chunk === undefined) break;
@@ -459,10 +462,10 @@ export const waitForRun = Effect.fn("cli.thread.waitForRun")(function* (
     // behind, blocks it until someone answers.
     const { thread } = yield* tools.call(
       "t3_thread_read",
-      { threadId, limit: 1, runLimit: 1 },
-      OrchestratorMcpThreadReadResult,
+      { threadId, limit: 1, runLimit: 1, include: ["thread"] },
+      OrchestratorMcpThreadReadToolResult,
     );
-    if (thread.pendingRequestCount > 0) {
+    if (thread !== undefined && thread.pendingRequestCount > 0) {
       // The count is thread-wide: if this run ended since the slice, the
       // request belongs to a later run.
       const recheck = yield* waitSlice(1);
@@ -736,7 +739,7 @@ const threadShowCommand = Command.make("show", {
             readFullText(tools, threadId, item).pipe(
               Effect.map((text) => ({
                 role: item.type === "user_message" ? "user" : "assistant",
-                runId: item.runId,
+                runId: item.runId ?? null,
                 text,
               })),
             ),

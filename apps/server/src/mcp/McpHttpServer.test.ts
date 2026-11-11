@@ -275,6 +275,12 @@ const layerRecordingTools = (calls: Array<unknown>) => {
     OrchestratorToolkit.tools.t3_thread_read,
     OrchestratorToolkit.tools.t3_thread_wait,
     ProjectToolkit.tools.t3_project_update,
+    // Like the attachment tools, it takes a thread and reaches no other environment.
+    Tool.make("local_thread_tool", {
+      parameters: Schema.Struct({ threadId: Schema.String }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
     // The real parameters without the launch services, which the recording handler never uses.
     Tool.make("t3_thread_launch", {
       parameters: ProjectToolkit.tools.t3_thread_launch.parametersSchema,
@@ -296,6 +302,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_thread_read: record,
       t3_thread_wait: record,
       t3_project_update: record,
+      local_thread_tool: record,
       t3_thread_launch: record,
     }),
   ).pipe(
@@ -596,8 +603,31 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     yield* callTool("delegate_task", { task: "Inspect", target: {} });
     yield* callTool("delegate_task", { task: "Inspect", title: null, target: { model: null } });
     yield* callTool("t3_project_update", { projectId: "project-1", projectIcon: null });
+    // A result's `link` names its thread to the next call.
+    yield* callTool("t3_thread_read", {
+      threadId: `[Fix](t3-thread://v2/${environmentId}/${thread.threadId})`,
+    });
+    const elsewhere = yield* callTool("t3_thread_read", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+    });
+    // A link to a thread elsewhere sends the call to that environment, which this test has none of.
+    expect(JSON.stringify(elsewhere.content)).toContain("cannot reach linked environments");
 
-    expect(calls).toHaveLength(5);
+    // An explicit null is no choice of environment, so the link's still decides.
+    const nulled = yield* callTool("t3_thread_read", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+      environmentId: null,
+    });
+    expect(JSON.stringify(nulled.content)).toContain("cannot reach linked environments");
+    // A tool that reaches no other environment gets the link as written.
+    const unreachable = yield* callTool("local_thread_tool", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+    });
+    expect(JSON.stringify(unreachable.content)).not.toContain("environmentId");
+
+    expect(calls.pop()).toMatchObject({ threadId: `<t3-thread://v2/box/${thread.threadId}>` });
+    expect(calls).toHaveLength(6);
+    expect(calls[5]).toEqual(calls[0]);
     expect(calls[1]).toEqual(calls[0]);
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
@@ -611,6 +641,7 @@ it.effect("rejects keys a tool does not declare and names them", () => {
       Effect.flip,
     );
     expect(String(launch)).toContain('Expected no excess property\n  at ["prompt"]');
+    expect(String(launch)).toMatch(/It takes: .*\bmessage\b/);
     const nested = yield* callTool("delegate_task", {
       task: "Inspect",
       target: { model: null, isolation: "worktree" },
