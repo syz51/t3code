@@ -648,6 +648,8 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
       alive.resume();
       yield* Effect.promise(() => turnStarted);
+      // Agent work yields the CPU to the server that drives it.
+      assert.isAbove(NodeOS.getPriority(child.pid), NodeOS.getPriority());
 
       // A dying server's descriptors close; the kernel would do this for it.
       for (const pipe of child.stdio) pipe?.destroy();

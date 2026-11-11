@@ -4,6 +4,7 @@ import {
   mcpToolResultOutput,
   toolOutputImages,
 } from "@t3tools/shared/toolOutput";
+import { lowerAgentProcessPriority } from "./agentProcessPriority.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -385,6 +386,7 @@ export function spawnClaudeProcessGroup(
       detached: true,
     },
   );
+  lowerAgentProcessPriority(child.pid);
   // Always drained, so a chatty CLI never blocks on a full stderr pipe.
   child.stderr?.setEncoding("utf8").on("data", onStderr).once("close", onStderrClose);
   child.once("exit", () => {
@@ -1247,6 +1249,7 @@ export const layerQueryRunner: Layer.Layer<
                 windowsHide: true,
                 stdio: ["pipe", "pipe", "pipe"],
               });
+              lowerAgentProcessPriority(child.pid);
               child.stderr
                 .setEncoding("utf8")
                 .on("data", (chunk: string) => options.stderr?.(chunk));

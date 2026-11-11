@@ -131,6 +131,23 @@ Focused coverage: `ProjectionSettlement.test.ts`, `ThreadSettlementService.test.
 `runtimeLayer.test.ts`, `AgentAwarenessRelay.test.ts`, `GitVcsDriverCore.test.ts`, and
 `desktopLocal.test.ts`.
 
+## Host load from many threads
+
+Provider sessions and the tools agents run use far more memory and CPU than the server. On a
+16 GiB host, about 14 active threads left 27 warm sessions and a 28 GiB process footprint, and
+the server then waited seconds for reads that take milliseconds. Two rules keep that load off the
+server and clients:
+
+- Sessions without a running turn count against a budget that follows host memory: one per
+  4 GiB, at least two. Over it, the least recently active sessions without background work
+  release before the idle timeout. A session active in the last minute is exempt, because a
+  session opened for a turn has no running turn until that turn starts.
+- Claude and Codex processes start at a lower scheduling priority than the server. Their builds
+  and tests inherit it, so many threads at once slow each other down first. The other providers
+  keep the server's priority.
+
+Focused coverage: `ProviderSessionManager.test.ts` and `ClaudeAgentSdkQueryRunner.test.ts`.
+
 ## Mobile looping animations
 
 `apps/mobile/package.json` sets Reanimated's `DISABLE_COMMIT_PAUSING_MECHANISM` so keyboard avoiding

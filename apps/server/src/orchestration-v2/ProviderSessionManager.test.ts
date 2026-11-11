@@ -576,6 +576,7 @@ function layerTest(input: {
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs: number;
   readonly maxIdlePinMs?: number;
+  readonly maxIdleSessions?: number;
   readonly failEventStream?: boolean;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
   readonly extensionStatuses?: OrchestrationV2ProviderSession["extensionStatuses"];
@@ -674,6 +675,8 @@ function layerTest(input: {
     McpProviderSessions.layer,
     ProviderSessionManager.layerWithOptions({
       idleTimeoutMs: input.idleTimeoutMs,
+      // The default follows this host's memory, which tests must not depend on.
+      maxIdleSessions: input.maxIdleSessions ?? Number.POSITIVE_INFINITY,
       ...(input.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: input.maxIdlePinMs }),
     }).pipe(
       Layer.provide(
@@ -1087,6 +1090,72 @@ it.effect("ProviderSessionManagerV2 closes every live session for a provider ins
       ),
     );
   }),
+);
+
+it.effect.each([false, true] as const)(
+  "ProviderSessionManagerV2 releases the least recently active idle sessions over the budget (background work: %s)",
+  (hasPendingBackgroundWork) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadIds = ["a", "b", "c"].map((name) =>
+          ThreadId.make(`thread-provider-session-manager-idle-budget-${name}`),
+        );
+        yield* eventSink.write({
+          events: yield* Effect.forEach(threadIds, (threadId) =>
+            makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          ),
+        });
+        const open = Effect.fnUntraced(function* (threadId: ThreadId) {
+          const providerSessionId = yield* idAllocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+          });
+          yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+          return providerSessionId;
+        });
+        const first = yield* open(threadIds[0]!);
+        yield* TestClock.adjust("1 second");
+        const second = yield* open(threadIds[1]!);
+        // Past the grace that protects a session between its open and its first turn.
+        yield* TestClock.adjust("2 minutes");
+        const third = yield* open(threadIds[2]!);
+
+        if (!hasPendingBackgroundWork) {
+          yield* Effect.forEach(threadIds.slice(0, 2), (threadId) =>
+            eventSink.stream({ threadId, eventType: "provider-session.updated" }).pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "provider-session.updated" &&
+                  stored.event.payload.status === "stopped",
+              ),
+              Stream.runHead,
+            ),
+          );
+        }
+        yield* TestClock.adjust("1 millis");
+        assert.deepEqual(
+          yield* Effect.forEach([first, second, third], (id) => manager.isLive(id)),
+          hasPendingBackgroundWork ? [true, true, true] : [false, false, true],
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, hasPendingBackgroundWork ? 0 : 2);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60 * 60_000,
+            maxIdleSessions: 1,
+            hasPendingBackgroundWork: Effect.succeed(hasPendingBackgroundWork),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 opens a duplicate session only once", () =>
