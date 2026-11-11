@@ -95,6 +95,15 @@ side: that drops either upstream's changes or the fork's bun edits elsewhere in 
 The script fails when a label names an OS it has no runner for, or when upstream changed the
 budget fetch. Add the runner to `hostedRunners` or redo the edit by hand.
 
+In `ci.yml`, the two background installs of the browser secret helper libraries call
+`.github/scripts/fork-apt-install.sh` under a `# fork-apt:` comment, where upstream calls
+`apt-get` directly. On the hosted runners `setup-apt-mirrors` changes nothing, because their
+sources already read a mirror list that names only `ubuntu.com` hosts, so one stalled zone
+stopped every job at the 10-minute wait without a log. The script limits each `apt-get` call and
+retries a failed update or install on a mirror outside that zone. After each merge,
+`git grep -c 'fork-apt:' .github/workflows/ci.yml` must print `.github/workflows/ci.yml:2`; when
+upstream edits those lines, keep its package list and pass it to the script.
+
 ### Other conflicts
 
 Resolve a conflict in another fork patch by keeping upstream's behavior and redoing the patch on
