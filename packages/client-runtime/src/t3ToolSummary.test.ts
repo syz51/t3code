@@ -68,6 +68,13 @@ describe("summarizeT3ToolCalls", () => {
       label: "Sent 1 message to 1 thread",
       failedCount: 2,
     });
+    // An agent names a thread by its id or by its link.
+    expect(
+      summarizeT3ToolCalls("thread-send", [
+        completed({ threadId: "success" }, { messageId: "a" }),
+        completed({ threadId: "[Fix](t3-thread://v2/local/success)" }, { messageId: "b" }),
+      ]).label,
+    ).toBe("Sent 2 messages to 1 thread");
     expect(summarizeT3ToolCalls("thread-send", [calls[1]!])).toEqual({
       label: "Tried to send 1 message to 1 thread",
       failedCount: 1,

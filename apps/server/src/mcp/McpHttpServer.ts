@@ -1145,6 +1145,7 @@ const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, 
     ...server,
     addTool: Effect.fn("McpServer.addTool")(function (options) {
       const { name } = options.tool;
+      const takesEnvironment = "environmentId" in (options.tool.inputSchema.properties ?? {});
       return server.addTool({
         ...options,
         handle: (payload) =>
@@ -1159,15 +1160,18 @@ const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, 
               typeof threadId === "string"
                 ? threadLinkRefs(threadId, caller.environmentId)[0]
                 : undefined;
+            // A link to a thread elsewhere names the environment the call goes to. A tool
+            // that reaches no other environment keeps the link, and refuses it as a thread id.
+            const elsewhere =
+              linked !== undefined &&
+              linked.environmentId !== caller.environmentId &&
+              payload.environmentId == null;
             const params =
-              linked === undefined
+              linked === undefined || (elsewhere && !takesEnvironment)
                 ? payload
                 : {
-                    // A link to a thread elsewhere names the environment the call goes to.
-                    ...(linked.environmentId === caller.environmentId
-                      ? {}
-                      : { environmentId: linked.environmentId }),
                     ...payload,
+                    ...(elsewhere ? { environmentId: linked.environmentId } : {}),
                     threadId: linked.threadId,
                   };
             const call = options.handle(params);

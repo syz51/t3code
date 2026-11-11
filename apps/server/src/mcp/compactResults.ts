@@ -72,7 +72,7 @@ const compactThreadRead = (params: Encoded, result: Encoded): Encoded => {
       ? { thread }
       : present({ link: thread.link, status: thread.status })),
     ...(runs ? { recentRuns } : {}),
-    items: items.map(compactItem(thread.threadId, params.itemId !== undefined, runs)),
+    items: items.map(compactItem(thread.threadId, params.itemId != null, runs)),
     ...paging,
   };
 };

@@ -146,6 +146,17 @@ export function hasThreadLinks(markdown: string): boolean {
   return markdown.includes(`${THREAD_LINK_PROTOCOL}://v`) || markdown.includes(HOSTED_PREFIX);
 }
 
+/** The thread id of a tool call's `threadId`, which agents also write as the thread's link. */
+export function threadIdOfToolInput(value: string): string {
+  const match = new RegExp(THREAD_LINK_OUTSIDE_CODE).exec(value);
+  const href =
+    match?.groups?.angleHref ??
+    match?.groups?.href ??
+    match?.groups?.autolink ??
+    match?.groups?.bare;
+  return (href === undefined ? null : parseThreadLinkHref(href))?.threadId ?? value.trim();
+}
+
 /** Every thread the markdown's links can name, so their titles are keyed reads. */
 export function threadLinkRefs(
   markdown: string,

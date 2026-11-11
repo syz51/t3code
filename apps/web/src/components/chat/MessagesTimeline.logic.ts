@@ -66,6 +66,7 @@ import {
 import type { ThreadRunSummary } from "@t3tools/client-runtime/state/shell";
 import type { ToolCallVisibility } from "@t3tools/contracts/settings";
 import { resolveT3McpToolDefinition } from "@t3tools/shared/t3McpToolPresentation";
+import { threadIdOfToolInput } from "@t3tools/shared/threadLinks";
 import { compactDynamicToolOutput } from "@t3tools/shared/toolOutput";
 import { htmlRenderReferencesEqual, type HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { mcpAppReferencesEqual, type McpAppReference } from "@t3tools/shared/mcpApp";
@@ -188,7 +189,9 @@ export function threadReadTargetId(entry: Pick<WorkLogEntry, "structuredPayload"
   const input = item.input;
   const threadId =
     input !== null && typeof input === "object" && "threadId" in input ? input.threadId : null;
-  return typeof threadId === "string" && threadId.trim().length > 0 ? threadId.trim() : null;
+  return typeof threadId === "string" && threadId.trim().length > 0
+    ? threadIdOfToolInput(threadId)
+    : null;
 }
 
 const THREAD_READ_OBJECT = " a T3 thread";

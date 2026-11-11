@@ -290,7 +290,7 @@ do not end the wait.
 The service fills every field below. An agent's result leaves out null and false
 fields, the ids no tool takes as input (`childRunId`, `childNodeId`,
 `latestTerminalRunId`, the context transfer ids), and `childThreadId`, which
-`link` carries: every tool takes a thread's `link` as its `threadId`. The
+`link` carries: a tool's `threadId` parameter takes a thread's `link`. The
 acknowledgement of a task that still runs also leaves out the model fields. A
 linked environment gets every field, because its version may require them.
 
