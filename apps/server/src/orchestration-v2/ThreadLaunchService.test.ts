@@ -2471,7 +2471,7 @@ const defaultBranchOnOrigin = {
   resolvePrimaryRemoteName: () => Effect.succeed("origin"),
   resolveDefaultBranchName: () => Effect.succeed("trunk"),
   resolveCommit: ({ revision }: { readonly revision: string }) =>
-    revision === "refs/remotes/origin/trunk"
+    revision.endsWith("origin/trunk")
       ? Effect.succeed({ commitSha: "trunk-sha" })
       : Effect.fail(
           new GitCommandError({
@@ -2502,6 +2502,14 @@ it.effect.each([
   {
     name: "a project without a default stays in its folder",
     options: {},
+    expected: { type: "root" },
+  },
+  {
+    name: "a project with no default branch to find stays in its folder",
+    options: {
+      serverSettings: projectDefaultsToWorktree,
+      vcs: { ...defaultBranchOnOrigin, resolveDefaultBranchName: () => Effect.succeed("gone") },
+    },
     expected: { type: "root" },
   },
   {

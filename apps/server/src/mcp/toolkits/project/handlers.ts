@@ -152,10 +152,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             });
           yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
         }
-        // A replay keeps the workspace its first launch chose, so it reads no default.
+        // A delegated task runs in the project's checkout, also when an older sender names no workspace.
         const strategy =
           input.workspaceStrategy ??
-          (replaying
+          (input.delegatedFrom !== undefined
             ? ({ type: "root" } as const)
             : yield* ThreadLaunch.ThreadLaunchService.pipe(
                 Effect.flatMap((launches) => launches.defaultWorkspaceStrategy(projectId)),
@@ -171,11 +171,14 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               (error) =>
                 new OrchestratorMcpFailure({
                   code: "invalid_request",
-                  message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
-                    strategy.startFromOrigin === true
-                      ? "; the project has no usable remote to fetch it from."
-                      : ", or set startFromOrigin:true if it exists only on a remote."
-                  }`,
+                  message:
+                    input.workspaceStrategy === undefined
+                      ? `${error.message} No thread was created. The project's new-thread setting chose this base. Pass workspaceStrategy {type:'root'} (CLI: --local) to run in the project folder.`
+                      : `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
+                          strategy.startFromOrigin === true
+                            ? "; the project has no usable remote to fetch it from."
+                            : ", or set startFromOrigin:true if it exists only on a remote."
+                        }`,
                 }),
             ),
           );

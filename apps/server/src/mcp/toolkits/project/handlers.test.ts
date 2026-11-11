@@ -558,15 +558,19 @@ it.effect("a launch without a workspace strategy follows the project's default",
 
     yield* launch({});
     yield* launch({ workspaceStrategy: { type: "root" } });
-    // A retry replays the accepted launch, whatever the default is by then.
+    yield* launch({
+      delegatedFrom: { environmentId: "environment-far", threadId: "thread-far", title: "Far" },
+    });
+    // A retry sends the default again, as a caller's own strategy is, so an unfinished preparation keeps it.
     yield* launch({ clientRequestId: "fix-default" });
     yield* launch({ clientRequestId: "fix-default" });
 
     expect(launched.map((entry) => entry.workspaceStrategy)).toEqual([
       projectDefault,
       { type: "root" },
-      projectDefault,
       { type: "root" },
+      projectDefault,
+      projectDefault,
     ]);
     expect(checked).toEqual([projectDefault, projectDefault]);
   }),

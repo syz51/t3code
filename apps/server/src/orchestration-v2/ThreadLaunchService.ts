@@ -325,11 +325,13 @@ const make = Effect.gen(function* () {
         .hasCommit({ cwd, refName: "HEAD" })
         .pipe(Effect.orElseSucceed(() => false));
       if (!hasCommit) return root;
-      return {
-        type: "worktree" as const,
-        baseRef: yield* resolveDefaultBaseRef(gitDriver, cwd),
-        startFromOrigin: true,
-      };
+      const baseRef = yield* resolveDefaultBaseRef(gitDriver, cwd);
+      // The last-resort name can be absent, as in a local repository on another branch.
+      const baseExists = yield* gitDriver.resolveCommit({ cwd, revision: baseRef }).pipe(
+        Effect.as(true),
+        Effect.orElseSucceed(() => false),
+      );
+      return baseExists ? { type: "worktree" as const, baseRef, startFromOrigin: true } : root;
     });
 
   const prepareInBackground = Effect.fn("ThreadLaunchService.prepareInBackground")(function* (
