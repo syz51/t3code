@@ -50,7 +50,10 @@ function tryResolveClaudeModelCatalog(
     if (Option.isNone(profile) || Option.isNone(adapter)) return null;
     const model = ModelCatalog.catalogServerModel(resolved, entry);
     models.push({
-      model: { ...model, capabilities: withUltracodeToggle(model.capabilities) },
+      model: {
+        ...model,
+        capabilities: withClaudeCodeDefaultEffort(withUltracodeToggle(model.capabilities)),
+      },
       runtime: profile.value.claudeCode ?? {},
       compatibility: adapter.value.claudeCode ?? {},
     });
@@ -58,6 +61,33 @@ function tryResolveClaudeModelCatalog(
 
   return {
     models,
+  };
+}
+
+// `default` is not an effort, so choosing it sends none and Claude Code applies the user's settings.
+const CLAUDE_CODE_DEFAULT_EFFORT_OPTION = { id: "default", label: "Default", isDefault: true };
+
+// An effort sent at launch overrides the user's per-model Claude Code setting, so a built-in
+// model defaults to none rather than to the manifest's default level.
+function withClaudeCodeDefaultEffort(
+  capabilities: ModelCapabilities | null,
+): ModelCapabilities | null {
+  if (!capabilities) return capabilities;
+  const descriptors = capabilities.optionDescriptors ?? [];
+  const effortIndex = descriptors.findIndex(
+    (descriptor) => descriptor.id === "effort" && descriptor.type === "select",
+  );
+  const effort = descriptors[effortIndex];
+  if (effort?.type !== "select") return capabilities;
+  return {
+    ...capabilities,
+    optionDescriptors: descriptors.toSpliced(effortIndex, 1, {
+      ...effort,
+      options: [
+        CLAUDE_CODE_DEFAULT_EFFORT_OPTION,
+        ...effort.options.map(({ isDefault: _isDefault, ...option }) => option),
+      ],
+    }),
   };
 }
 
@@ -207,9 +237,8 @@ export function claudeReportedModels(
                 id: "effort",
                 label: "Reasoning",
                 type: "select",
-                // `default` is not an effort, so choosing it sends none and Claude Code picks.
                 options: [
-                  { id: "default", label: "Default", isDefault: true },
+                  CLAUDE_CODE_DEFAULT_EFFORT_OPTION,
                   ...efforts.map((id) => ({ id, label: CLAUDE_EFFORT_LABELS[id] ?? id })),
                 ],
               },
@@ -341,7 +370,9 @@ export function resolveClaudeCatalogEffort(
   });
   const descriptor = descriptors.find((candidate) => candidate.id === "effort");
   const value = getProviderOptionCurrentValue(descriptor);
-  return typeof value === "string" ? value : undefined;
+  return typeof value === "string" && value !== CLAUDE_CODE_DEFAULT_EFFORT_OPTION.id
+    ? value
+    : undefined;
 }
 
 export function normalizeClaudeCatalogEffort(

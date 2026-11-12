@@ -97,12 +97,21 @@ describe("compileClaudeModelSelection", () => {
     }
   });
 
-  it("uses the model default SDK effort alongside prompt-injected effort", () => {
+  it("leaves effort to Claude Code's settings unless the selection names a level", () => {
+    for (const options of [[], [{ id: "effort", value: "default" }]]) {
+      expect(
+        compileClaudeModelSelection(selection("claude-opus-5-5", options)).effort,
+      ).toBeUndefined();
+    }
+    expect(
+      compileClaudeModelSelection(selection("claude-opus-5-5", [{ id: "effort", value: "medium" }]))
+        .effort,
+    ).toBe("medium");
     expect(
       compileClaudeModelSelection(
         selection("claude-sonnet-4-6", [{ id: "effort", value: "ultrathink" }]),
       ),
-    ).toMatchObject({ effort: "high", promptEffort: "ultrathink" });
+    ).toMatchObject({ effort: undefined, promptEffort: "ultrathink" });
   });
 
   it("keeps explicit effort for models missing from the local catalog", () => {
