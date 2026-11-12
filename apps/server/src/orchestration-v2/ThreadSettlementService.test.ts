@@ -144,6 +144,22 @@ describe("isAutoSettlementCandidate", () => {
         NOW_MS,
       ),
     ).toBe(true);
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({
+          pendingBackgroundTasks: [
+            { taskId: "deploy", kind: "command", description: "deploy", awaited: true },
+          ],
+        }),
+        NOW_MS,
+      ),
+    ).toBe(false);
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({ activityRunStatus: "running" }),
+        NOW_MS,
+      ),
+    ).toBe(false);
   });
 
   it("never settles, or keeps snoozed, a thread whose guest is waiting on the owner", () => {
