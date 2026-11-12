@@ -12,7 +12,7 @@ const descriptor = (ids: ReadonlyArray<string>, promptInjectedValues?: ReadonlyA
 
 describe("resolveEffortGlyph", () => {
   const claude = descriptor(
-    ["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"],
+    ["default", "low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"],
     ["ultrathink"],
   );
 
@@ -27,6 +27,10 @@ describe("resolveEffortGlyph", () => {
 
   it("names max instead of drawing it", () => {
     expect(resolveEffortGlyph(claude, "max")?.special).toBe("Max");
+  });
+
+  it("names Default, which leaves the level to the provider, instead of ranking it", () => {
+    expect(resolveEffortGlyph(claude, "default")?.special).toBe("Default");
   });
 
   it("names Ultracode and Ultrathink instead of drawing a level", () => {

@@ -11,8 +11,8 @@ const BASELINE_INSET = 2;
 type SelectDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
 
 // Older servers offer Ultracode as a level. It changes the workflow, so it keeps its name.
-// Max is named too, so the full scale stops short of it.
-const NAMED_LEVELS = new Set(["ultracode", "max"]);
+// Max is named too, so the full scale stops short of it. Default sends no level, so it has no rank.
+const NAMED_LEVELS = new Set(["ultracode", "max", "default"]);
 const OFF_LEVELS = new Set(["off", "none"]);
 // More bars than this no longer fit the glyph's height in whole pixels.
 const MAX_BARS = 7;
