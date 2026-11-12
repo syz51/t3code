@@ -12622,6 +12622,39 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect("does not hold a stopped awaited task for a wake", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startAwaitedWakeTask(harness, "attempt-claude-owed-wake-stopped");
+
+        const rosterCount = providerThreadRosterEvents(harness.events).length;
+        yield* harness.offerAndWait(emptyWakeRoster);
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            ...wakeNotification,
+            status: "stopped",
+            uuid: "00000000-0000-4000-8000-000000000151",
+          }),
+        );
+        yield* harness.until(
+          () => providerThreadRosterEvents(harness.events).length >= rosterCount + 2,
+        );
+        assert.deepStrictEqual(latestWakeRoster(harness), []);
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   it.effect("starts the wake run when Claude opens the wake turn, before its output", () =>
     Effect.scoped(
       Effect.gen(function* () {
