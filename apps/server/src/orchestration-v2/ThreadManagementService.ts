@@ -66,6 +66,7 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { deriveProviderInstanceConfigMap } from "../provider/ProviderInstanceRegistryHydration.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -317,9 +318,15 @@ export class ThreadManagementProviderInstanceDisabledError extends Schema.Tagged
   {
     projectId: ProjectId,
     instanceId: ProviderInstanceId,
+    /** Present only when the server knows no instance with this id. */
+    enabledInstanceIds: Schema.optional(Schema.Array(ProviderInstanceId)),
   },
 ) {
   override get message(): string {
+    if (this.enabledInstanceIds !== undefined) {
+      const enabled = this.enabledInstanceIds.join(", ") || "none";
+      return `Provider instance "${this.instanceId}" does not exist. Enabled instances for project ${this.projectId}: ${enabled}.`;
+    }
     return `Provider instance "${this.instanceId}" is disabled for project ${this.projectId}.`;
   }
 }
@@ -591,14 +598,33 @@ const make = Effect.gen(function* () {
             ? Effect.void
             : serverSettings.getSettings.pipe(
                 Effect.orDie,
-                Effect.flatMap((current) =>
-                  resolveProjectProviderInstanceEnabled(current, input.projectId, input.instanceId)
-                    ? Effect.void
-                    : new ThreadManagementProviderInstanceDisabledError({
-                        projectId: input.projectId,
-                        instanceId: input.instanceId,
-                      }),
-                ),
+                Effect.flatMap((current) => {
+                  if (
+                    resolveProjectProviderInstanceEnabled(
+                      current,
+                      input.projectId,
+                      input.instanceId,
+                    )
+                  ) {
+                    return Effect.void;
+                  }
+                  const known = Object.keys(deriveProviderInstanceConfigMap(current)).map((id) =>
+                    ProviderInstanceId.make(id),
+                  );
+                  return new ThreadManagementProviderInstanceDisabledError({
+                    projectId: input.projectId,
+                    instanceId: input.instanceId,
+                    ...(known.includes(input.instanceId)
+                      ? {}
+                      : {
+                          enabledInstanceIds: known
+                            .filter((id) =>
+                              resolveProjectProviderInstanceEnabled(current, input.projectId, id),
+                            )
+                            .toSorted(),
+                        }),
+                  });
+                }),
               ),
         ),
       );

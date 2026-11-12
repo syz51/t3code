@@ -1610,6 +1610,27 @@ it.effect("replays an accepted launch after the project disables the instance", 
     if (fresh._tag !== "ThreadManagementProviderInstanceDisabledError") {
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
+    assert.include(fresh.message, '"codex" is disabled');
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("names a provider instance the server does not know as unknown", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const error = yield* launches
+      .launch({
+        ...launchInput({ command: "command:launch:unknown", thread: "thread:launch:unknown" }),
+        modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "claude-opus-5-5" },
+      })
+      .pipe(Effect.flip);
+    if (error._tag !== "ThreadManagementProviderInstanceDisabledError") {
+      assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${error._tag}`);
+    }
+    assert.include(error.message, '"claude" does not exist');
+    assert.include(error.message, "claudeAgent");
+    assert.include(error.message, "codex");
+    assert.notInclude(error.message, "cursor");
   }).pipe(Effect.provide(harness.layer));
 });
 
