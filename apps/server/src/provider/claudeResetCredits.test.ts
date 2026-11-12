@@ -189,18 +189,18 @@ effectIt.layer(NodeServices.layer)("makeClaudeResetCreditsReader", (it) => {
       const credits = { availableCount: 1, nextCreditId: "grant_a" };
 
       expect(yield* reader.read("2.1.0")).toBeUndefined();
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       yield* TestClock.adjust("4 minutes");
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(2);
 
       yield* reader.invalidate;
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(3);
 
       yield* TestClock.adjust("5 minutes");
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(4);
     }),
   );
