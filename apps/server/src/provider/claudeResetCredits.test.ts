@@ -63,7 +63,49 @@ describe("claudeResetCreditsToContract", () => {
       availableCount: 2,
       nextCreditId: "grant_a",
       nextExpiresAt: "2026-10-01T00:00:00.000Z",
+      options: [
+        expect.objectContaining({
+          creditId: "grant_a",
+          label: "Full reset",
+          availableCount: 2,
+          expiresAt: "2026-10-01T00:00:00.000Z",
+        }),
+      ],
     });
+  });
+
+  it("offers each kind of reset by its own grant", () => {
+    const credits = ClaudeResetCredits.claudeResetCreditsToContract(
+      {
+        eligible: true,
+        next_grant_id: "weekly_a",
+        grants: [
+          grant({ id: "weekly_a", clears: ["seven_day"], ends_at: "2026-12-10T22:00:00Z" }),
+          grant({
+            id: "fable_a",
+            clears: ["seven_day_overage_included"],
+            gives_back_weekly: true,
+            ends_at: "2027-03-09T07:59:00Z",
+          }),
+          grant({ id: "fable_b", gives_back_weekly: true, type: "weekly" }),
+          grant({ id: "session_a", type: "session" }),
+          grant({ id: "spent", clears: ["seven_day"], resets_left: 0 }),
+        ],
+      },
+      NOW,
+    );
+    expect(
+      credits?.options?.map(({ creditId, label, availableCount }) => [
+        creditId,
+        label,
+        availableCount,
+      ]),
+    ).toEqual([
+      ["session_a", "5-hour reset", 1],
+      ["weekly_a", "Weekly reset", 1],
+      ["fable_a", "Fable reset", 2],
+    ]);
+    expect(credits).toMatchObject({ availableCount: 4, nextCreditId: "weekly_a" });
   });
 
   it("offers nothing to redeem without a usable next grant or an eligible account", () => {
@@ -111,7 +153,10 @@ effectIt.layer(NodeServices.layer)("makeClaudeResetCreditsReader", (it) => {
         return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json(usageAnswer)));
       });
       const reader = yield* makeReader(configDir, client);
-      expect(yield* reader.read("2.1.0")).toEqual({ availableCount: 1, nextCreditId: "grant_a" });
+      expect(yield* reader.read("2.1.0")).toMatchObject({
+        availableCount: 1,
+        nextCreditId: "grant_a",
+      });
     }),
   );
 
@@ -144,18 +189,18 @@ effectIt.layer(NodeServices.layer)("makeClaudeResetCreditsReader", (it) => {
       const credits = { availableCount: 1, nextCreditId: "grant_a" };
 
       expect(yield* reader.read("2.1.0")).toBeUndefined();
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       yield* TestClock.adjust("4 minutes");
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(2);
 
       yield* reader.invalidate;
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(3);
 
       yield* TestClock.adjust("5 minutes");
-      expect(yield* reader.read("2.1.0")).toEqual(credits);
+      expect(yield* reader.read("2.1.0")).toMatchObject(credits);
       expect(requests).toBe(4);
     }),
   );

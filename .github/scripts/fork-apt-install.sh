@@ -15,12 +15,17 @@ apt_get() {
     "$@"
 }
 
-apt_get 90 update && apt_get 150 install -y "$@" && exit
+# Upstream's update skips translations, DEP-11 metadata and command-not-found indexes.
+update_opts=(-o Acquire::Languages=none
+  -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false
+  -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false)
+
+apt_get 90 "${update_opts[@]}" update && apt_get 150 install -y "$@" && exit
 
 echo "fork-apt-install: failed with the runner's mirrors; retrying with mirrors.edge.kernel.org"
 # A mirror outside ubuntu.com: the runner's mirrors and archive.ubuntu.com share that DNS zone.
 sudo sed -i -E 's#^URIs: .*#URIs: https://mirrors.edge.kernel.org/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources
 # Reads only the Ubuntu sources, so a stalled third-party repository cannot fail the retry.
-apt_get 90 -o APT::Update::Error-Mode=any \
+apt_get 90 "${update_opts[@]}" -o APT::Update::Error-Mode=any \
   -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update &&
   apt_get 150 install -y "$@"
