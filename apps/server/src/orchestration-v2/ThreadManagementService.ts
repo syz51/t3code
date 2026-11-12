@@ -66,6 +66,7 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ManagedProviders from "../policy/managedProviders.ts";
 import { deriveProviderInstanceConfigMap } from "../provider/ProviderInstanceRegistryHydration.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
@@ -608,19 +609,27 @@ const make = Effect.gen(function* () {
                   ) {
                     return Effect.void;
                   }
-                  const known = Object.keys(deriveProviderInstanceConfigMap(current)).map((id) =>
-                    ProviderInstanceId.make(id),
-                  );
+                  const configs = deriveProviderInstanceConfigMap(current);
                   return new ThreadManagementProviderInstanceDisabledError({
                     projectId: input.projectId,
                     instanceId: input.instanceId,
-                    ...(known.includes(input.instanceId)
+                    ...(input.instanceId in configs
                       ? {}
                       : {
-                          enabledInstanceIds: known
-                            .filter((id) =>
-                              resolveProjectProviderInstanceEnabled(current, input.projectId, id),
+                          enabledInstanceIds: Object.entries(configs)
+                            .filter(
+                              ([id, config]) =>
+                                ManagedProviders.disallowedDriverReason(
+                                  serverSettings.managedPolicy,
+                                  config.driver,
+                                ) === undefined &&
+                                resolveProjectProviderInstanceEnabled(
+                                  current,
+                                  input.projectId,
+                                  ProviderInstanceId.make(id),
+                                ),
                             )
+                            .map(([id]) => ProviderInstanceId.make(id))
                             .toSorted(),
                         }),
                   });

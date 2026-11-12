@@ -19,6 +19,7 @@ import {
   GitCommandError,
   MessageId,
   ProjectId,
+  type ManagedPolicySummary,
   ProviderDriverKind,
   ProviderInstanceId,
   OrchestrationV2ThreadProjectionJson,
@@ -132,6 +133,7 @@ interface HarnessOptions {
   readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
   readonly generateBranchName?: TextGeneration.TextGeneration["Service"]["generateBranchName"];
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
+  readonly managedPolicy?: ManagedPolicySummary;
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
   readonly vcs?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
@@ -146,7 +148,10 @@ function makeHarness(options: HarnessOptions = {}) {
     layerRegistry,
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
-  const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
+  const layerServerSettings = ServerSettings.layerTest(
+    options.serverSettings,
+    options.managedPolicy,
+  );
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
   const layerThreadManagement = ThreadManagement.layer.pipe(
     Layer.provide(layerOrchestrator),
@@ -1615,7 +1620,18 @@ it.effect("replays an accepted launch after the project disables the instance", 
 });
 
 it.effect("names a provider instance the server does not know as unknown", () => {
-  const harness = makeHarness();
+  const harness = makeHarness({
+    managedPolicy: {
+      organization: "Example Corp",
+      lockedSettings: [],
+      limits: {
+        providers: {
+          allowedDrivers: [ProviderDriverKind.make("claudeAgent")],
+          lockedInstanceFields: {},
+        },
+      },
+    },
+  });
   return Effect.gen(function* () {
     const launches = yield* ThreadLaunch.ThreadLaunchService;
     const error = yield* launches
@@ -1629,7 +1645,7 @@ it.effect("names a provider instance the server does not know as unknown", () =>
     }
     assert.include(error.message, '"claude" does not exist');
     assert.include(error.message, "claudeAgent");
-    assert.include(error.message, "codex");
+    assert.notInclude(error.message, "codex");
     assert.notInclude(error.message, "cursor");
   }).pipe(Effect.provide(harness.layer));
 });
