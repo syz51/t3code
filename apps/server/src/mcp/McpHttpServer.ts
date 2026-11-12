@@ -1300,7 +1300,8 @@ const layerPreviewStandardToolkitRegistration = toolkitRegistration(
   PreviewHandlers.layerStandard,
 );
 
-const layerPreviewSnapshotRegistration = imageToolRegistration(registerPreviewSnapshot(),
+const layerPreviewSnapshotRegistration = imageToolRegistration(
+  registerPreviewSnapshot(),
   PreviewHandlers.layerSnapshot,
 );
 
@@ -1348,7 +1349,8 @@ const layerDeviceStandardToolkitRegistration = toolkitRegistration(
   DeviceHandlers.layerStandard,
 );
 
-const layerDeviceScreenshotRegistration = imageToolRegistration(registerDeviceScreenshot(),
+const layerDeviceScreenshotRegistration = imageToolRegistration(
+  registerDeviceScreenshot(),
   DeviceHandlers.layerScreenshot,
 );
 

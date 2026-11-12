@@ -96,6 +96,7 @@ it.effect("warns how long reclaiming can take and reports each step with its ela
                   afterBytes: 12.8 * 1024 ** 3,
                   deletedEventCount: 0,
                   deletedReceiptCount: 0,
+                  compactedTurnItemCount: 0,
                 };
               }),
             removeLegacyDatabase: () => Effect.void,
