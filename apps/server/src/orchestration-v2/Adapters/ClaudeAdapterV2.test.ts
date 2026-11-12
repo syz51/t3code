@@ -6588,7 +6588,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         });
         assert.deepEqual(harness.liveSelectionChanges, [
           { model: "claude-sonnet-4-6" },
-          { effortLevel: "high", fastMode: null, ultracode: null },
+          { fastMode: null, ultracode: null },
         ]);
         assert.lengthOf(harness.offeredMessages, 2);
       }).pipe(
@@ -11172,18 +11172,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ],
         );
 
-        // An ended awaited task stays held for the wake it owes; a reused id starts unmarked.
+        // Once the task ends, a reused id starts unmarked.
         yield* Queue.offer(
           harness.sdkMessages,
           claudeSdkFrame({ ...wakeNotification, uuid: "00000000-0000-4000-8000-000000000303" }),
         );
-        assert.deepStrictEqual(
-          marks(yield* nextRoster((tasks) => tasks[0]?.taskId === "dev-server")),
-          [
-            ["dev-server", false],
-            [WAKE_TASK_ID, true],
-          ],
-        );
+        yield* nextRoster((tasks) => tasks.length === 1);
         yield* Queue.offer(
           harness.sdkMessages,
           roster(["dev-server", WAKE_TASK_ID], "00000000-0000-4000-8000-000000000304"),
@@ -14011,10 +14005,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
         yield* harness.offerAndWait(wakeNotification);
         assert.lengthOf(harness.continuationRequests, 0);
-        assert.isTrue(
-          yield* harness.hasPendingBackgroundWork,
-          "the wake it owes must keep the process",
-        );
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
 
         yield* Queue.offer(harness.sdkMessages, wakeAssistant);
         yield* harness.awaitContinuation(1);
@@ -14081,85 +14072,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
   // Settlement reads the roster: an empty one between the exit and the CLI's wake frames
   // let a merged PR settle the thread and close the process before it woke.
-  it.effect("keeps an awaited task listed from its exit until the wake run drains it", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const harness = yield* makeWakeHarness;
-        yield* startAwaitedWakeTask(harness, "attempt-claude-owed-wake-1");
-
-        const rosterCount = providerThreadRosterEvents(harness.events).length;
-        yield* harness.offerAndWait(wakeNotification);
-        yield* harness.offerAndWait(emptyWakeRoster);
-        yield* harness.until(
-          () => providerThreadRosterEvents(harness.events).length >= rosterCount + 2,
-        );
-        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
-        assert.isTrue(yield* harness.hasPendingBackgroundWork);
-
-        yield* harness.offerAndWait(wakeTurnInit);
-        yield* harness.awaitContinuation(1);
-        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
-        yield* harness.runtime.startTurn(
-          makeClaudeTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now: yield* DateTime.now,
-            attemptId: RunAttemptId.make("attempt-claude-owed-wake-2"),
-            text: "Background task completed.",
-            attachments: [],
-            providerTurnOrdinal: 2,
-            messageCreatedBy: "agent",
-            messageCreationSource: "provider",
-          }),
-        );
-        yield* harness.until(() => latestWakeRoster(harness).length === 0);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
-          ),
-        ),
-      ),
-    ),
-  );
-
-  it.effect("stops holding an exited awaited task when Claude never opens its wake", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const harness = yield* makeWakeHarness;
-        yield* startAwaitedWakeTask(harness, "attempt-claude-owed-wake-expiry");
-
-        // The CLI can send the empty level before the notification.
-        const rosterCount = providerThreadRosterEvents(harness.events).length;
-        yield* harness.offerAndWait(emptyWakeRoster);
-        yield* harness.until(
-          () => providerThreadRosterEvents(harness.events).length >= rosterCount + 1,
-        );
-        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
-        yield* harness.offerAndWait(wakeNotification);
-        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
-        assert.isTrue(yield* harness.hasPendingBackgroundWork);
-
-        yield* TestClock.adjust("2 minutes");
-        yield* harness.until(() => latestWakeRoster(harness).length === 0);
-        assert.isFalse(yield* harness.hasPendingBackgroundWork);
-        assert.lengthOf(harness.continuationRequests, 0);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
-          ),
-        ),
-      ),
-    ),
-  );
-
   it.effect("does not hold a stopped awaited task for a wake", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -18632,7 +18544,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   it.effect.each(["while it runs", "when it settles"] as const)(
-    "replaces a subagent's inherited effort with the one its transcript records, %s",
+    "takes a subagent's unstated effort from the one its transcript records, %s",
     (moment) =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -18753,13 +18665,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             }),
           );
           yield* harness.until(() => efforts().at(-1) === "xhigh");
-          assert.equal(efforts()[0], "medium");
+          assert.equal(efforts()[0], undefined);
           const childThreadEfforts = harness.events.flatMap((event) =>
             event.type === "app_thread.created"
               ? [getModelSelectionStringOptionValue(event.appThread.modelSelection, "effort")]
               : [],
           );
-          assert.deepEqual(childThreadEfforts, ["medium", "xhigh"]);
+          assert.deepEqual(childThreadEfforts, [undefined, "xhigh"]);
         }).pipe(
           Effect.provide(
             Layer.mergeAll(
