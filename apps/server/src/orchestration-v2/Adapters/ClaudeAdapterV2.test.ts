@@ -10307,12 +10307,19 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ],
         );
 
-        // Once the task leaves the roster, a reused id starts unmarked.
+        // A task that leaves the roster before its exit stays held for the wake it owes;
+        // a reused id starts unmarked.
         yield* Queue.offer(
           harness.sdkMessages,
           roster(["dev-server"], "00000000-0000-4000-8000-000000000303"),
         );
-        yield* nextRoster((tasks) => tasks.length === 1);
+        assert.deepStrictEqual(
+          marks(yield* nextRoster((tasks) => tasks[0]?.taskId === "dev-server")),
+          [
+            ["dev-server", false],
+            [WAKE_TASK_ID, true],
+          ],
+        );
         yield* Queue.offer(
           harness.sdkMessages,
           roster(["dev-server", WAKE_TASK_ID], "00000000-0000-4000-8000-000000000304"),
@@ -12466,7 +12473,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
         yield* harness.offerAndWait(wakeNotification);
         assert.lengthOf(harness.continuationRequests, 0);
-        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        assert.isTrue(
+          yield* harness.hasPendingBackgroundWork,
+          "the wake it owes must keep the process",
+        );
 
         yield* Queue.offer(harness.sdkMessages, wakeAssistant);
         yield* harness.awaitContinuation(1);
@@ -12479,6 +12489,126 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.lengthOf(harness.continuationRequests, 1);
         assert.lengthOf(harness.terminalEvents(), 1);
         assert.isTrue(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  const startAwaitedWakeTask = Effect.fn("startAwaitedWakeTask")(function* (
+    harness: Effect.Success<typeof makeWakeHarness>,
+    attempt: string,
+  ) {
+    const awaitBackgroundTasks = harness.runtime.awaitBackgroundTasks;
+    if (awaitBackgroundTasks === undefined) {
+      throw new Error("Claude adapter runtime must expose awaitBackgroundTasks.");
+    }
+    yield* harness.runtime.startTurn(
+      makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make(attempt),
+        text: "Run the build in the background and wait for it.",
+        attachments: [],
+      }),
+    );
+    yield* harness.offerAndWait(wakeTaskStarted);
+    yield* awaitBackgroundTasks({
+      providerThread: harness.providerThread,
+      taskIds: [WAKE_TASK_ID],
+      awaited: true,
+    });
+    yield* Queue.offer(harness.sdkMessages, turnOneResult);
+    yield* harness.awaitTerminal(1);
+  });
+  const emptyWakeRoster = claudeSdkFrame({
+    type: "system",
+    subtype: "background_tasks_changed",
+    tasks: [],
+    uuid: "00000000-0000-4000-8000-000000000150",
+    session_id: WAKE_NATIVE_SESSION,
+  });
+  const latestWakeRoster = (harness: Effect.Success<typeof makeWakeHarness>) =>
+    (
+      providerThreadRosterEvents(harness.events).at(-1)?.providerThread.pendingBackgroundTasks ?? []
+    ).map((task) => [task.taskId, task.awaited === true]);
+
+  // Settlement reads the roster: an empty one between the exit and the CLI's wake frames
+  // let a merged PR settle the thread and close the process before it woke.
+  it.effect("keeps an awaited task listed from its exit until the wake run drains it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startAwaitedWakeTask(harness, "attempt-claude-owed-wake-1");
+
+        const rosterCount = providerThreadRosterEvents(harness.events).length;
+        yield* harness.offerAndWait(wakeNotification);
+        yield* harness.offerAndWait(emptyWakeRoster);
+        yield* harness.until(
+          () => providerThreadRosterEvents(harness.events).length >= rosterCount + 2,
+        );
+        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
+        assert.isTrue(yield* harness.hasPendingBackgroundWork);
+
+        yield* harness.offerAndWait(wakeTurnInit);
+        yield* harness.awaitContinuation(1);
+        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-owed-wake-2"),
+            text: "Background task completed.",
+            attachments: [],
+            providerTurnOrdinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* harness.until(() => latestWakeRoster(harness).length === 0);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("stops holding an exited awaited task when Claude never opens its wake", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startAwaitedWakeTask(harness, "attempt-claude-owed-wake-expiry");
+
+        // The CLI can send the empty level before the notification.
+        const rosterCount = providerThreadRosterEvents(harness.events).length;
+        yield* harness.offerAndWait(emptyWakeRoster);
+        yield* harness.until(
+          () => providerThreadRosterEvents(harness.events).length >= rosterCount + 1,
+        );
+        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
+        yield* harness.offerAndWait(wakeNotification);
+        assert.deepStrictEqual(latestWakeRoster(harness), [[WAKE_TASK_ID, true]]);
+        assert.isTrue(yield* harness.hasPendingBackgroundWork);
+
+        yield* TestClock.adjust("2 minutes");
+        yield* harness.until(() => latestWakeRoster(harness).length === 0);
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        assert.lengthOf(harness.continuationRequests, 0);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
