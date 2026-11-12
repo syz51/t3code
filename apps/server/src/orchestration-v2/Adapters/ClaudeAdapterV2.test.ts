@@ -296,6 +296,22 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
     assert.isUndefined(options.extraArgs?.["dangerously-skip-permissions"]);
   });
 
+  it("launches with an effort only when the selection names a level", () => {
+    const launchOptions = (effort: string) =>
+      ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: {
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          model: "claude-opus-5-5",
+          options: [{ id: "effort", value: effort }],
+        },
+        nativeThreadId: "native-effort",
+        resume: false,
+        cwd: "/workspace",
+      });
+    assert.equal(launchOptions("medium").effort, "medium");
+    assert.notProperty(launchOptions("default"), "effort");
+  });
+
   it("passes every --add-dir launch directory to Claude", () => {
     const options = ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: CLAUDE_TEST_MODEL_SELECTION,
@@ -5875,7 +5891,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             }),
           );
           yield* settle;
-          yield* harness.runtime.startTurn(turn(4, { ...normal, model: "claude-sonnet-4-6" }));
+          yield* harness.runtime.startTurn(
+            turn(4, {
+              ...normal,
+              model: "claude-sonnet-4-6",
+              options: [{ id: "effort", value: "high" }],
+            }),
+          );
           yield* settle;
           assert.deepEqual(harness.liveSelectionChanges, [
             { effortLevel: "high", fastMode: true, ultracode: true },
@@ -5963,9 +5985,51 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* harness.runtime.startTurn(turn(3, opus));
         assert.deepEqual(harness.liveSelectionChanges, [
           { model: "claude-sonnet-4-6" },
-          { effortLevel: "high", fastMode: null, ultracode: null },
+          { fastMode: null, ultracode: null },
           { model: "claude-opus-5-5" },
-          { effortLevel: "medium", fastMode: false, ultracode: null },
+          { fastMode: false, ultracode: null },
+        ]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  // t3_thread_launch, create_threads and delegate_task start threads with only a model.
+  it.effect("launches and live-switches a model-only thread without an effort", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const turn = (ordinal: number, model: string) =>
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make(`attempt-model-only:${ordinal}`),
+            text: `Request ${ordinal}`,
+            attachments: [],
+            providerTurnOrdinal: ordinal,
+            modelSelection: { instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID, model },
+          });
+        yield* harness.runtime.startTurn(turn(1, "claude-fable-5-2"));
+        const launched = harness.getOpenedOptions();
+        assert.notProperty(launched, "effort");
+        yield* harness.offerAndWait(turnOneResult);
+        yield* Queue.take(harness.terminalReceipts);
+
+        yield* harness.runtime.startTurn(turn(2, "claude-opus-5-5"));
+        assert.strictEqual(harness.getOpenedOptions(), launched);
+        assert.deepEqual(harness.liveSelectionChanges, [
+          { model: "claude-opus-5-5" },
+          { fastMode: false, ultracode: null },
         ]);
       }).pipe(
         Effect.provide(
