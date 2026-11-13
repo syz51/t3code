@@ -2989,7 +2989,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             ...(variant === undefined ? {} : { variant }),
             system: [
               orchestrationSystemPrompt,
-              buildRuntimeInstructions({ harness: "OpenCode", model: turn.modelSelection.model }),
+              buildRuntimeInstructions({
+                harness: "OpenCode",
+                model: turn.modelSelection.model,
+                delegatedChild: turn.appThread.lineage.relationshipToParent === "subagent",
+              }),
             ]
               .filter(Boolean)
               .join("\n\n"),
