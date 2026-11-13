@@ -8,6 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import { assert } from "vite-plus/test";
 
 import {
+  findSubagentTranscriptDirs,
   initialWorkflowAgentTranscriptCursor,
   readWorkflowAgentTranscript,
 } from "./workflowAgentTranscript.ts";
@@ -60,6 +61,52 @@ it.layer(NodeServices.layer)("readWorkflowAgentTranscript", (it) => {
       assert.equal(NodeFS.statSync(file).ino, replaced.cursor.identity?.ino);
       const shrunk = yield* read(replaced.cursor);
       assert.deepEqual(uuids(shrunk.lines), ["d"], "a shrunk file reads from 0");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("finds only the project directories that hold the subagent's transcript", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const configDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "wf-transcript-" });
+      const projectsDir = NodePath.join(configDir, "projects");
+      const subagentsDir = (project: string, nativeThreadId = "native") =>
+        NodePath.join(projectsDir, project, nativeThreadId, "subagents");
+      for (let index = 0; index < 100; index += 1) {
+        NodeFS.mkdirSync(NodePath.join(projectsDir, `empty-${index}`), { recursive: true });
+      }
+      for (const dir of [
+        subagentsDir("first"),
+        subagentsDir("second"),
+        subagentsDir("other-agent"),
+        subagentsDir("other-session", "elsewhere"),
+      ]) {
+        NodeFS.mkdirSync(dir, { recursive: true });
+      }
+      NodeFS.writeFileSync(NodePath.join(subagentsDir("first"), "agent-a1.jsonl"), "");
+      NodeFS.writeFileSync(NodePath.join(subagentsDir("second"), "agent-a1.jsonl"), "");
+      NodeFS.writeFileSync(NodePath.join(subagentsDir("other-agent"), "agent-a2.jsonl"), "");
+      NodeFS.writeFileSync(
+        NodePath.join(subagentsDir("other-session", "elsewhere"), "agent-a1.jsonl"),
+        "",
+      );
+      const find = (dir: string) =>
+        findSubagentTranscriptDirs({ projectsDir: dir, nativeThreadId: "native", agentId: "a1" });
+
+      assert.deepEqual(
+        (yield* find(projectsDir)).toSorted(),
+        [subagentsDir("first"), subagentsDir("second")],
+        "directory order is the file system's",
+      );
+      assert.deepEqual(yield* find(NodePath.join(configDir, "missing")), []);
+      assert.deepEqual(
+        yield* findSubagentTranscriptDirs({
+          projectsDir,
+          nativeThreadId: "native",
+          agentId: "../../first/native/subagents/agent-a1",
+        }),
+        [],
+        "an id that is not a plain name finds nothing",
+      );
     }).pipe(Effect.scoped),
   );
 });
