@@ -13028,6 +13028,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             return false;
           }),
+          // The wake's subagent has settled, but Claude streams the wake turn into this process.
+          hasUndeliveredWake: Effect.gen(function* () {
+            for (const latch of (yield* Ref.get(requestedContinuations)).values()) {
+              if (latch.retired === null) {
+                return true;
+              }
+            }
+            return false;
+          }),
           // Untraced: the run's event stream calls this once per provider event.
           hasPendingBackgroundWorkForThread: Effect.fnUntraced(function* (providerThread, options) {
             const nativeThreadId = providerThread.nativeThreadRef?.nativeId;

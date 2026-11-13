@@ -3637,6 +3637,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         throw new Error("Claude adapter runtime must expose hasPendingBackgroundWork.");
       }
       const hasPendingBackgroundWork = runtime.hasPendingBackgroundWork;
+      if (runtime.hasUndeliveredWake === undefined) {
+        throw new Error("Claude adapter runtime must expose hasUndeliveredWake.");
+      }
+      const hasUndeliveredWake = runtime.hasUndeliveredWake;
       const terminalEvents = () =>
         events.filter(
           (
@@ -3672,6 +3676,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         getOpenedOptions: () => openedOptions,
         terminalEvents,
         hasPendingBackgroundWork,
+        hasUndeliveredWake,
         until: changes.until,
         awaitTerminal: (count: number) => changes.until(() => terminalEvents().length >= count),
         awaitContinuation: (count: number) =>
@@ -14460,7 +14465,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
         yield* harness.offerAndWait(wakeNotification);
         assert.lengthOf(harness.continuationRequests, 1);
+        assert.isTrue(yield* harness.hasUndeliveredWake);
         yield* harness.continuationRequests[0]!.onRunEndedWithoutStarting!();
+        assert.isFalse(
+          yield* harness.hasUndeliveredWake,
+          "a cancelled wake must not pin the session",
+        );
         yield* harness.offerAndWait(wakeTurnInit);
         yield* harness.offerAndWait(wakeAssistant);
         yield* harness.offerAndWait(wakeResult);
@@ -16465,6 +16475,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* Queue.offer(harness.sdkMessages, frame);
         }
         yield* harness.awaitContinuation(1);
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+          ),
+        );
+        assert.isFalse(yield* harness.hasPendingBackgroundWork, "a model switch need not wait");
+        assert.isTrue(
+          yield* harness.hasUndeliveredWake,
+          "an idle release now would kill the wake turn Claude is about to run",
+        );
         yield* Queue.offer(
           harness.sdkMessages,
           makeResultFrame({
@@ -16486,6 +16506,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           }),
         );
         yield* harness.awaitTerminal(2);
+        assert.isFalse(yield* harness.hasUndeliveredWake);
 
         const finalRouting = subagentRouting(harness.events, [STRADDLING_BASH, IDLE_BASH]);
         assert.deepEqual(finalRouting.assistantTexts(finalRouting.childThreadId), [
