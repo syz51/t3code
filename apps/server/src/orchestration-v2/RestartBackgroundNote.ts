@@ -249,6 +249,47 @@ export function continuationStartRetryDelayMs(
   return CONTINUATION_START_RETRY_DELAYS_MS[failedStarts - 1];
 }
 
+export const RATE_LIMIT_RETRY_DELAYS_MS = [30_000, 120_000, 300_000];
+// A reset further away than this is a usage cap, which the limit recovery settings own.
+const RATE_LIMIT_MAX_WAIT_MS = 15 * 60_000;
+
+/** The run failed on a short provider rate limit, which a later try can pass. */
+export function failedOnRateLimit(
+  run: OrchestrationV2Run,
+  turnItems: Parameters<typeof latestRootProviderFailure>[1],
+  nowMs: number,
+): boolean {
+  const failure = latestRootProviderFailure(run, turnItems);
+  if (failure?.class !== "usage_limit" || failure.retryable !== true) return false;
+  const resetMs = failure.resetAt == null ? Number.NaN : Date.parse(failure.resetAt);
+  return Number.isNaN(resetMs) || resetMs - nowMs <= RATE_LIMIT_MAX_WAIT_MS;
+}
+
+/** Backoff before trying a rate-limited run again, or undefined to let it fail. */
+export function rateLimitRetryDelayMs(
+  run: OrchestrationV2Run,
+  projection: {
+    readonly runs: ReadonlyArray<OrchestrationV2Run>;
+    readonly turnItems: Parameters<typeof latestRootProviderFailure>[1];
+  },
+  nowMs: number,
+): number | undefined {
+  let failures = 0;
+  for (
+    let current: OrchestrationV2Run | undefined = run;
+    current !== undefined && failedOnRateLimit(current, projection.turnItems, nowMs);
+    current = projection.runs.find(
+      (candidate) => candidate.id === current?.restartContinuationOfRunId,
+    )
+  )
+    failures += 1;
+  const delayMs = RATE_LIMIT_RETRY_DELAYS_MS[failures - 1];
+  if (delayMs === undefined) return;
+  const resetAt = latestRootProviderFailure(run, projection.turnItems)?.resetAt;
+  const resetMs = resetAt == null ? Number.NaN : Date.parse(resetAt) - nowMs;
+  return Number.isNaN(resetMs) ? delayMs : Math.max(delayMs, resetMs);
+}
+
 export function isRestartContinuationSource(
   source: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartCancelledBackgroundWork">,
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,

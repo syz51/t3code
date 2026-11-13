@@ -231,6 +231,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childNodeId: NodeId,
   status: OrchestratorMcpDelegatedTaskStatus,
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
+  retryAt: Schema.optional(IsoDateTime).annotate({
+    description:
+      "Set while the task is `waiting` to retry a run that failed, such as on a provider rate limit: when it starts again.",
+  }),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
   latestTerminalStatus: Schema.NullOr(OrchestratorMcpTerminalDelegatedTaskStatus),

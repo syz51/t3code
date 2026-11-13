@@ -127,6 +127,8 @@ import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
   continuationStartRetryDelayMs,
+  failedOnRateLimit,
+  rateLimitRetryDelayMs,
   delegatedTaskResultRun,
   isRestartContinuationSource,
   runOutcome,
@@ -401,6 +403,8 @@ export interface OrchestratorV2Shape {
     taskId?: NodeId,
   ) => Effect.Effect<boolean, OrchestratorProjectionError>;
   readonly restartContinuationPending: (run: OrchestrationV2Run) => Effect.Effect<boolean>;
+  /** When a pending restart continuation of this run will start, if one waits. */
+  readonly restartContinuationRetryAt: (run: OrchestrationV2Run) => Effect.Effect<string | null>;
   /** Declined continuations emit no thread event; this still wakes waiters. */
   readonly awaitRestartContinuation: (run: OrchestrationV2Run) => Effect.Effect<void>;
   readonly dispatch: (
@@ -2920,18 +2924,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   // Under load a resumed provider can time out before taking the prompt; the restart still owes the turn.
+  // A delegated task's run that hit a short rate limit is tried again in the same thread.
   const retryContinuationStart = Effect.fn("Orchestrator.retryContinuationStart")(function* (
     threadId: ThreadId,
     runId: RunId,
   ) {
-    const projection = yield* projectionStore.getThreadRecords(
-      threadId,
-      ["runs", "providerTurns", "turnItems"],
-      { turnItemTypes: ["error"], turnItemRunIds: [runId] },
-    );
-    const run = projection.runs.find((candidate) => candidate.id === runId);
+    const { runs, providerTurns } = yield* projectionStore.getThreadRecords(threadId, [
+      "runs",
+      "providerTurns",
+    ]);
+    const run = runs.find((candidate) => candidate.id === runId);
     if (run === undefined) return;
-    const delayMs = continuationStartRetryDelayMs(run, projection);
+    const chainRunIds: Array<RunId> = [];
+    for (
+      let current: OrchestrationV2Run | undefined = run;
+      current !== undefined && !chainRunIds.includes(current.id);
+      current = runs.find((candidate) => candidate.id === current?.restartContinuationOfRunId)
+    )
+      chainRunIds.push(current.id);
+    const { turnItems } = yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+      turnItemTypes: ["error"],
+      turnItemRunIds: chainRunIds,
+    });
+    const now = yield* DateTime.now;
+    const delayMs =
+      continuationStartRetryDelayMs(run, { runs, providerTurns, turnItems }) ??
+      ((yield* appOwnedSubagentParentThreadId(threadId)) === undefined
+        ? undefined
+        : rateLimitRetryDelayMs(run, { runs, turnItems }, DateTime.toEpochMillis(now)));
     if (delayMs === undefined) return;
     const commandId = CommandId.make(`command:restart-continuation-retry:${run.id}`);
     yield* writeSystemEvents(
@@ -2942,7 +2962,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandId,
           threadId,
           request: { type: "provider-runtime.continue", sourceRunId: run.id },
-          availableAt: DateTime.add(yield* DateTime.now, { milliseconds: delayMs }),
+          availableAt: DateTime.add(now, { milliseconds: delayMs }),
         },
       ],
     );
@@ -6330,7 +6350,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         !source ||
         !(
           isRestartContinuationSource(source, projection.providerTurns) ||
-          continuationFailedBeforePrompt(source, projection.providerTurns)
+          continuationFailedBeforePrompt(source, projection.providerTurns) ||
+          failedOnRateLimit(
+            source,
+            projection.turnItems,
+            DateTime.toEpochMillis(yield* DateTime.now),
+          )
         ) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
@@ -11992,8 +12017,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // A resumed queue can have a lower ordinal than a pending continuation source.
       // Stop must reach those sources even when interrupting the resumed run succeeds.
       if (
-        (run.status === "cancelled" ||
-          (run.status === "failed" && run.restartContinuationOfRunId !== undefined)) &&
+        (run.status === "cancelled" || run.status === "failed") &&
         (yield* awaitsRestartContinuation(run).pipe(mapDispatchError(input.command)))
       ) {
         yield* markStoppedRun({ ...input, thread, run });
@@ -14944,7 +14968,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // The keyed semaphores are neither reentrant nor deadlock-aware.
       if (delegatedTaskTerminalStatus(run.status) !== null) {
         // Before the parent hears of the failure: a pending continuation keeps the task open.
-        if (run.status === "failed" && run.restartContinuationOfRunId !== undefined) {
+        if (run.status === "failed") {
           yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("Failed to schedule a restart continuation retry", {
@@ -15375,6 +15399,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     restartContinuationPending: Effect.fn("OrchestratorV2.restartContinuationPending")(
       function (run) {
         return awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false));
+      },
+    ),
+    restartContinuationRetryAt: Effect.fn("OrchestratorV2.restartContinuationRetryAt")(
+      function (run) {
+        return effectOutbox.get(`effect:restart-continuation:${run.id}`).pipe(
+          Effect.map((effect) =>
+            Option.isSome(effect) && effect.value.status === "pending"
+              ? effect.value.availableAt
+              : null,
+          ),
+          Effect.orElseSucceed(() => null),
+        );
       },
     ),
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {

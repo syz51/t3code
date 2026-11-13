@@ -1546,6 +1546,10 @@ const make = Effect.gen(function* () {
       (yield* threadManagement
         .delegatedTaskResultPending(task.childThreadId, childRun?.delegatedTaskId)
         .pipe(Effect.mapError(threadManagementFailure)));
+    const retryAt =
+      heldForRestart && taskResultRun?.status === "failed"
+        ? yield* threadManagement.restartContinuationRetryAt(taskResultRun)
+        : null;
     const workState =
       task.result !== null ? "result_available" : heldForRestart ? "working" : taskWorkState;
     const status =
@@ -1558,15 +1562,17 @@ const make = Effect.gen(function* () {
               ? { status: task.status }
               : childRun,
           )
-        : workState === "result_available"
-          ? // A cancelled task's finished turn settles it as interrupted.
-            task.cancelledRunId !== undefined &&
-            taskStatusForRun(taskResultRun ?? childRun) === "completed"
-            ? "interrupted"
-            : taskStatusForRun(taskResultRun ?? childRun)
-          : taskStatusForRun(taskResultRun ?? childRun) === "queued"
-            ? "queued"
-            : "running";
+        : retryAt !== null
+          ? "waiting"
+          : workState === "result_available"
+            ? // A cancelled task's finished turn settles it as interrupted.
+              task.cancelledRunId !== undefined &&
+              taskStatusForRun(taskResultRun ?? childRun) === "completed"
+              ? "interrupted"
+              : taskStatusForRun(taskResultRun ?? childRun)
+            : taskStatusForRun(taskResultRun ?? childRun) === "queued"
+              ? "queued"
+              : "running";
     const derivedResult =
       task.result !== null
         ? task.result
@@ -1617,6 +1623,7 @@ const make = Effect.gen(function* () {
       childNodeId: task.id,
       status,
       workState,
+      ...(retryAt === null ? {} : { retryAt }),
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,

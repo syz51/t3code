@@ -21,6 +21,7 @@ import {
   cancelledRosterTaskWork,
   cancelledTurnItemWork,
   continuationFailedBeforePrompt,
+  failedOnRateLimit,
   isAwaitedWork,
   isRestartContinuationSource,
   cancelledBeforeStart,
@@ -32,6 +33,9 @@ import {
 
 const CONTINUE_PROMPT =
   "Continue where you left off. Your last turn was cut short, so a command or other action it started may have finished or may still be running. Before you repeat one that changes state, confirm it did not take effect and is not still running; if you cannot tell, say so instead of repeating it.";
+
+const RATE_LIMIT_CONTINUE_PROMPT =
+  "Continue where you left off. Your last turn stopped because the provider hit a rate limit. Before you repeat an action that changes state, confirm it did not already take effect.";
 
 const MAX_CONTINUATION_CHAIN = 3;
 const CONTINUATION_LOOP_WINDOW_MS = 5 * 60 * 1_000;
@@ -184,34 +188,44 @@ export function restartContinuationRun(
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(
   function* (input: { readonly threadId: ThreadId; readonly sourceRunId: RunId }) {
-    const settings = yield* ServerSettings.ServerSettingsService;
-    const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
-    if (!enabled) return;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const messageId = MessageId.make(`message:restart-continuation:${input.sourceRunId}`);
     const projection = yield* threads.getThreadRecords(
       input.threadId,
       ["messages", "runs", "providerTurns", "attempts", "runtimeRequests", "turnItems"],
-      { messageIds: [messageId], turnItemTypes: ["secret_request"] },
+      { messageIds: [messageId], turnItemTypes: ["secret_request", "error"] },
     );
-    if (
-      !resolveProjectSettings(enabled, projection.thread.projectId).settings
-        .continueThreadsAfterServerUpdate
-    )
-      return;
     if (projection.messages.some((message) => message.id === messageId)) return;
     const source = projection.runs.find((run) => run.id === input.sourceRunId);
+    if (!source) return;
+    const now = yield* DateTime.now;
+    // Only delegated runs schedule this retry, and the server-update setting does not cover it.
+    const rateLimited = failedOnRateLimit(
+      source,
+      projection.turnItems,
+      DateTime.toEpochMillis(now),
+    );
+    if (!rateLimited) {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
+      if (
+        !enabled ||
+        !resolveProjectSettings(enabled, projection.thread.projectId).settings
+          .continueThreadsAfterServerUpdate
+      )
+        return;
+    }
     if (
-      !source ||
       !(
+        rateLimited ||
         isRestartContinuationSource(source, projection.providerTurns) ||
         continuationFailedBeforePrompt(source, projection.providerTurns)
       ) ||
       restartContinuationBlocked(
         projection,
         source,
-        yield* DateTime.now,
-        isRestartNoteSource(source, projection.providerTurns),
+        now,
+        rateLimited || isRestartNoteSource(source, projection.providerTurns),
       )
     )
       return;
@@ -299,8 +313,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     );
     const noteText =
       note.work.length === 0 ? undefined : restartCancelledBackgroundWorkNote(note.work);
-    const text =
-      noteText === undefined
+    const text = rateLimited
+      ? RATE_LIMIT_CONTINUE_PROMPT
+      : noteText === undefined
         ? CONTINUE_PROMPT
         : note.settled
           ? noteText
@@ -315,9 +330,11 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         notification: {
           source: { kind: "system" },
           outcome: "updated",
-          summary: note.settled
-            ? "T3 Code restarted and stopped background work"
-            : "T3 Code restarted and resumed this turn",
+          summary: rateLimited
+            ? "T3 Code retried this turn after a provider rate limit"
+            : note.settled
+              ? "T3 Code restarted and stopped background work"
+              : "T3 Code restarted and resumed this turn",
           detail: text,
         },
         attachments: [],
