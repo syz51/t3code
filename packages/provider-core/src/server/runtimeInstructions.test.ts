@@ -52,4 +52,31 @@ describe("buildRuntimeInstructions", () => {
     );
     assert.include(instructions, "call unwatch_pull_request");
   });
+
+  it("sends a delegated child, which T3 gives no watch tools, back to its parent instead", () => {
+    // A session-carried block is the top-level text, so a child gets its own that overrides it.
+    const instructions = buildRuntimeInstructions({
+      harness: "Claude Code",
+      pullRequestLinking: false,
+      delegatedChild: true,
+    });
+
+    assert.include(instructions, "Link each PR you create, take over, or push to");
+    assert.notInclude(instructions, "watch_pull_request");
+    assert.include(instructions, "This block replaces the pull_request_linking block");
+    assert.notInclude(
+      buildRuntimeInstructions({ harness: "Claude Code", delegatedChild: true }),
+      "This block replaces",
+    );
+    assert.include(instructions, "you cannot watch PRs, even if the brief says babysit");
+    assert.include(instructions, "push, then end your turn: your parent watches and finishes.");
+    assert.include(
+      instructions,
+      "Your last line is: PR <full URL>, head <SHA>, checks and reviews <state>.",
+    );
+    assert.include(
+      instructions,
+      "For PR waits, no sleep, loops, gh --watch, Monitor or ScheduleWakeup.",
+    );
+  });
 });

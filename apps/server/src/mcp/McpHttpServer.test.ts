@@ -59,6 +59,7 @@ import { PreviewToolkit } from "./toolkits/preview/tools.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
+import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -1525,6 +1526,14 @@ it.effect("lists pull request watch tools only to threads that are not delegated
       expect(childTools).toContain("link_pull_request");
       expect(childTools).not.toContain("watch_pull_request");
       expect(childTools).not.toContain("unwatch_pull_request");
+      // Each side's PR rules name only tools it lists.
+      const hiddenFromChild = parentTools.filter((tool) => !childTools.includes(tool));
+      const childText = buildRuntimeInstructions({ harness: "Claude Code", delegatedChild: true });
+      for (const tool of hiddenFromChild) expect(childText).not.toContain(tool);
+      const parentText = buildRuntimeInstructions({ harness: "Claude Code" });
+      for (const tool of parentText.match(/\b\w+_pull_requests?\b/g) ?? []) {
+        expect(parentTools).toContain(tool);
+      }
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
