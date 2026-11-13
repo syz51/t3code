@@ -250,7 +250,10 @@ keeps the provider's explanation. Retry after the limit resets, or switch to
 another provider instance.
 Press **Resume** in an empty composer to continue a limited or interrupted turn
 manually. Do this when the provider reports no reset time, because nothing
-continues the turn on its own.
+continues the turn on its own. A delegated task is the exception: when a rate
+limit resets within 15 minutes or gives no reset time, its thread tries the turn
+again up to three times, after 30 seconds, 2 minutes, and 5 minutes, and never
+before the reset. Until then, the task shows as waiting to its parent.
 Queued messages stay saved while the limit blocks the thread. They run after
 the continuation finishes. If the queue was held by a restart, resume it then.
 

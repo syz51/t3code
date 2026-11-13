@@ -231,6 +231,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childNodeId: NodeId,
   status: OrchestratorMcpDelegatedTaskStatus,
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
+  retryAt: Schema.optional(IsoDateTime).annotate({
+    description:
+      "While `status` is `waiting`: when T3 Code tries the failed run again, such as after a provider rate limit.",
+  }),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
   latestTerminalStatus: Schema.NullOr(OrchestratorMcpTerminalDelegatedTaskStatus),

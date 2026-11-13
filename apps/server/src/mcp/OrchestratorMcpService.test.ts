@@ -275,17 +275,16 @@ describe("OrchestratorMcpService", () => {
           },
         ],
       } as unknown as OrchestrationV2ThreadProjection;
+      const cutRun = {
+        id: RunId.make("run:mcp-restart-child"),
+        ordinal: 1,
+        status: "cancelled",
+        delegatedTaskId: taskId,
+      };
+      let retryAt: string | null = null;
       const childProjection = {
         thread: { id: childThreadId, title: "Child" },
-        runs: [
-          {
-            id: RunId.make("run:mcp-restart-child"),
-            ordinal: 1,
-            status: "cancelled",
-            delegatedTaskId: taskId,
-          },
-          { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
-        ],
+        runs: [cutRun, { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" }],
         contextTransfers: [],
         messages: [],
         subagents: [],
@@ -304,6 +303,7 @@ describe("OrchestratorMcpService", () => {
             readFails
               ? Effect.fail(new OrchestratorProjectionError({ threadId: childThreadId }))
               : Effect.succeed(awaitsRestart),
+          restartContinuationRetryAt: () => Effect.succeed(retryAt),
           dispatch: () => Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({} as never)),
         }),
         ServerSettings.layerTest(),
@@ -339,10 +339,21 @@ describe("OrchestratorMcpService", () => {
         assert.equal(held.status, "running");
         assert.equal(held.workState, "working");
         assert.isNull(held.summary);
+        assert.isUndefined(held.retryAt);
+        // A rate-limited run waits for its scheduled retry.
+        cutRun.status = "failed";
+        retryAt = "2026-11-13T06:00:30.000Z";
+        const retrying = yield* service.taskStatus(scope, taskId);
+        assert.equal(retrying.status, "waiting");
+        assert.equal(retrying.workState, "working");
+        assert.equal(retrying.retryAt, retryAt);
         assert.equal(yield* Ref.get(dispatched), 0);
+        cutRun.status = "cancelled";
+        retryAt = null;
         awaitsRestart = false;
         const settled = yield* service.taskStatus(scope, taskId);
         assert.equal(settled.status, "cancelled");
+        assert.isUndefined(settled.retryAt);
         assert.equal(yield* Ref.get(dispatched), 1);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
