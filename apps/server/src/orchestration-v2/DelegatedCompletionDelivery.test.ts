@@ -4609,14 +4609,12 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         const settledIds = yield* eventSink
           .stream({ afterSequence, eventType: "subagent.updated" })
           .pipe(
-            Stream.filterMap((stored) =>
-              stored.event.type === "subagent.updated" &&
-              stored.event.payload.status === "failed" &&
-              (stored.event.payload.id === broken.taskId ||
-                stored.event.payload.id === exhausted.taskId)
-                ? Option.some(stored.event.payload.id)
-                : Option.none(),
+            Stream.map((stored) =>
+              stored.event.type === "subagent.updated" && stored.event.payload.status === "failed"
+                ? stored.event.payload.id
+                : null,
             ),
+            Stream.filter((id) => id === broken.taskId || id === exhausted.taskId),
             Stream.take(2),
             Stream.runCollect,
           );

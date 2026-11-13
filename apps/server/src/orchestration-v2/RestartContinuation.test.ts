@@ -22,7 +22,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ServerSettings from "../serverSettings.ts";
 import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
-import { continuationStartRetryDelayMs } from "./RestartBackgroundNote.ts";
+import { continuationStartRetryDelayMs, rateLimitRetryDelayMs } from "./RestartBackgroundNote.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -847,6 +847,7 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
 const continuationDispatches = (
   projection: OrchestrationV2ThreadProjection,
   sourceRunId: RunId = runId,
+  continueThreadsAfterServerUpdate = true,
 ) =>
   Effect.gen(function* () {
     const dispatches: Array<Extract<OrchestrationV2Command, { type: "message.dispatch" }>> = [];
@@ -861,7 +862,7 @@ const continuationDispatches = (
               return Effect.succeed({} as never);
             },
           }),
-          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate }),
         ),
       ),
     );
@@ -998,6 +999,92 @@ it("backs off twice from a continuation the provider never took, then lets it fa
     ),
   );
 });
+
+const rateLimitError = (run: { readonly id: RunId }, failure: Record<string, unknown> = {}) => ({
+  id: `error:${run.id}`,
+  type: "error",
+  status: "failed",
+  runId: run.id,
+  nodeId: undefined,
+  ordinal: 1,
+  updatedAt: now,
+  failure: {
+    class: "usage_limit",
+    message: "Claude API rate limit reached. Try again later.",
+    code: "api_error_429",
+    retryable: true,
+    resetAt: null,
+    ...failure,
+  },
+});
+
+it("backs off three times from a rate limit, waits for its reset, and leaves usage caps alone", () => {
+  const base = makeProjection();
+  const failed = (id: string, of?: RunId) => ({
+    ...base.runs[0]!,
+    id: RunId.make(id),
+    status: "failed" as const,
+    ...(of === undefined ? {} : { restartContinuationOfRunId: of }),
+  });
+  const first = failed("run:limited");
+  const second = failed("run:limited-1", first.id);
+  const third = failed("run:limited-2", second.id);
+  const runs = [first, second, third, failed("run:limited-3", third.id)];
+  const nowMs = DateTime.toEpochMillis(now);
+  const delay = (failure?: Record<string, unknown>) =>
+    rateLimitRetryDelayMs(
+      first,
+      {
+        runs,
+        turnItems: [rateLimitError(first, failure)],
+      } as unknown as Parameters<typeof rateLimitRetryDelayMs>[1],
+      nowMs,
+    );
+  assert.deepEqual(
+    runs.map((run) =>
+      rateLimitRetryDelayMs(
+        run,
+        {
+          runs,
+          turnItems: runs.map((candidate) => rateLimitError(candidate)),
+        } as unknown as Parameters<typeof rateLimitRetryDelayMs>[1],
+        nowMs,
+      ),
+    ),
+    [30_000, 120_000, 300_000, undefined],
+  );
+  assert.equal(delay({ resetAt: "2026-10-03T12:01:30.000Z" }), 90_000);
+  assert.equal(delay({ resetAt: "2026-10-03T12:00:10.000Z" }), 30_000);
+  for (const failure of [
+    { resetAt: "2026-10-03T13:00:00.000Z" },
+    { retryable: null },
+    { class: "provider_error" },
+  ])
+    assert.isUndefined(delay(failure));
+});
+
+it.effect("retries a rate-limited run with its own prompt even when restarts do not continue", () =>
+  Effect.gen(function* () {
+    const base = cutMidTurn();
+    const limited = { ...base.runs[0]!, status: "failed" };
+    const projection = {
+      ...base,
+      runs: [limited],
+      turnItems: [rateLimitError(limited)],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const dispatches = yield* continuationDispatches(projection, runId, false);
+    assert.deepEqual(
+      dispatches.map((command) => [command.threadId, command.restartContinuationOfRunId]),
+      [[threadId, runId]],
+    );
+    assert.include(dispatches[0]!.text, "rate limit");
+    const providerFailure = {
+      ...projection,
+      turnItems: [rateLimitError(limited, { class: "provider_error" })],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.deepEqual(yield* continuationDispatches(providerFailure, runId, true), []);
+  }),
+);
 
 it.effect("continues again after a continuation fails before its prompt", () =>
   Effect.gen(function* () {
