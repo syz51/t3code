@@ -241,7 +241,10 @@ const turnInput = (
   modelSelection: ModelSelection = bigPickle,
   runtimeMode: "full-access" | "approval-required" = "full-access",
 ) => ({
-  appThread: { title: TITLE } as OrchestrationV2AppThread,
+  appThread: {
+    title: TITLE,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+  } as OrchestrationV2AppThread,
   threadId,
   runId: RunId.make("run:opencode2-adapter"),
   runOrdinal: 1,
@@ -510,7 +513,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       ]);
       const renamed = {
         ...turnInput(thread),
-        appThread: { title: "Prime factors of 391" } as OrchestrationV2AppThread,
+        appThread: {
+          ...turnInput(thread).appThread,
+          title: "Prime factors of 391",
+        } as OrchestrationV2AppThread,
       };
       const first = yield* terminalOf(runtime).pipe(Effect.forkScoped);
       yield* runtime.startTurn(renamed);
@@ -856,14 +862,10 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       }),
     ];
   };
-  const withLineage = (thread: OrchestrationV2ProviderThread) => ({
-    ...turnInput(thread),
-    appThread: {
-      id: threadId,
-      title: TITLE,
-      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-    } as OrchestrationV2AppThread,
-  });
+  const withLineage = (thread: OrchestrationV2ProviderThread) => {
+    const input = turnInput(thread);
+    return { ...input, appThread: { ...input.appThread, id: threadId } };
+  };
   const continuationTurn = (
     thread: OrchestrationV2ProviderThread,
     offer: ProviderContinuationRequests.ProviderContinuationRequest,
