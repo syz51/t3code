@@ -249,7 +249,7 @@ export function continuationStartRetryDelayMs(
   return CONTINUATION_START_RETRY_DELAYS_MS[failedStarts - 1];
 }
 
-export const RATE_LIMIT_RETRY_DELAYS_MS = [30_000, 120_000, 300_000];
+const RATE_LIMIT_RETRY_DELAYS_MS = [30_000, 120_000, 300_000];
 // A reset further away than this is a usage cap, which the limit recovery settings own.
 const RATE_LIMIT_MAX_WAIT_MS = 15 * 60_000;
 

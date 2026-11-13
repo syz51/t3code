@@ -284,10 +284,7 @@ describe("OrchestratorMcpService", () => {
       let retryAt: string | null = null;
       const childProjection = {
         thread: { id: childThreadId, title: "Child" },
-        runs: [
-          cutRun,
-          { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
-        ],
+        runs: [cutRun, { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" }],
         contextTransfers: [],
         messages: [],
         subagents: [],
