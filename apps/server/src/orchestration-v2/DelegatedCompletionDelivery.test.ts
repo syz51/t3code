@@ -4570,6 +4570,28 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
           ];
         };
         const limited = yield* seedChild("rate-limited-child");
+        const stopped = yield* seedChild("rate-limited-stopped-child");
+        // A settled task no longer owns later turns in its thread.
+        const done = yield* seedChild("rate-limited-done-child");
+        const doneTask = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+          (row) => row.id === done.taskId,
+        )!;
+        yield* eventSink.write({
+          commandId: reconcileCommandId("rate-limited-done-child"),
+          events: [
+            {
+              id: EventId.make("event:rate-limited-done-child:settled"),
+              type: "subagent.updated",
+              threadId,
+              runId,
+              nodeId: done.taskId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: { ...doneTask, status: "completed", result: "Done.", completedAt: now },
+            },
+          ],
+        });
         const broken = yield* seedChild("provider-error-child");
         const exhausted = yield* seedChild("rate-limit-exhausted-child");
         // Three earlier tries already hit the limit; reconcile writes skip the run-update handler.
@@ -4591,6 +4613,19 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
           commandId: CommandId.make("command:rate-limit-children:failed"),
           events: [
             ...failedRun(limited.childThreadId, 2, rateLimit),
+            ...failedRun(done.childThreadId, 2, rateLimit),
+            ...failedRun(stopped.childThreadId, 2, rateLimit).map((event) =>
+              event.type === "run.updated"
+                ? {
+                    ...event,
+                    payload: {
+                      ...event.payload,
+                      rootNodeId: NodeId.make(`node:${event.runId}:root`),
+                      providerThreadId: ProviderThreadId.make(`provider:${event.runId}`),
+                    },
+                  }
+                : event,
+            ),
             ...failedRun(broken.childThreadId, 2, {
               class: "provider_error",
               message: "Provider failed.",
@@ -4637,10 +4672,51 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         assert.equal(task(limited.taskId)?.status, "running");
         assert.include(task(exhausted.taskId)?.result ?? "", "rate limit");
         for (const runId of [
+          RunId.make(`${done.childThreadId}:run:2`),
           RunId.make(`${broken.childThreadId}:run:2`),
           RunId.make(`${exhausted.childThreadId}:run:5`),
         ])
           assert.isTrue(Option.isNone(yield* outbox.get(`effect:restart-continuation:${runId}`)));
+
+        // The due retry passes the dispatch gate even while restarts do not continue.
+        const continueRun = (childThreadId: ThreadId) =>
+          continueRestartedRun({
+            threadId: childThreadId,
+            sourceRunId: RunId.make(`${childThreadId}:run:2`),
+          }).pipe(
+            Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: false })),
+          );
+        yield* continueRun(limited.childThreadId);
+        assert.isTrue(
+          (yield* orchestrator.getThreadProjection(limited.childThreadId)).runs.some(
+            (run) => run.restartContinuationOfRunId === limitedRunId,
+          ),
+        );
+
+        // Stop reaches a task whose retry is still pending: the retry starts nothing, and the
+        // task settles with its rate-limit failure.
+        yield* orchestrator.cancelDelegatedTask({
+          parentThreadId: threadId,
+          taskId: stopped.taskId,
+          command: {
+            type: "thread.stop",
+            commandId: CommandId.make("command:rate-limited-stopped-child:stop"),
+            threadId: stopped.childThreadId,
+            stopDelegatedTasks: false,
+          },
+          stopDescendants: () => Effect.void,
+        });
+        yield* continueRun(stopped.childThreadId);
+        const stoppedTask = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+          (row) => row.id === stopped.taskId,
+        );
+        assert.equal(stoppedTask?.status, "failed");
+        assert.include(stoppedTask?.result ?? "", "rate limit");
+        assert.isFalse(
+          (yield* orchestrator.getThreadProjection(stopped.childThreadId)).runs.some(
+            (run) => run.restartContinuationOfRunId !== undefined,
+          ),
+        );
       }),
   );
 

@@ -348,9 +348,11 @@ describe("OrchestratorMcpService", () => {
         assert.equal(retrying.workState, "working");
         assert.equal(retrying.retryAt, retryAt);
         assert.equal(yield* Ref.get(dispatched), 0);
+        cutRun.status = "cancelled";
+        retryAt = null;
         awaitsRestart = false;
         const settled = yield* service.taskStatus(scope, taskId);
-        assert.equal(settled.status, "failed");
+        assert.equal(settled.status, "cancelled");
         assert.isUndefined(settled.retryAt);
         assert.equal(yield* Ref.get(dispatched), 1);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));

@@ -193,7 +193,11 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     const projection = yield* threads.getThreadRecords(
       input.threadId,
       ["messages", "runs", "providerTurns", "attempts", "runtimeRequests", "turnItems"],
-      { messageIds: [messageId], turnItemTypes: ["secret_request", "error"] },
+      {
+        messageIds: [messageId],
+        turnItemTypes: ["secret_request", "error"],
+        turnItemRunIds: [input.sourceRunId],
+      },
     );
     if (projection.messages.some((message) => message.id === messageId)) return;
     const source = projection.runs.find((run) => run.id === input.sourceRunId);

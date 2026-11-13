@@ -2924,16 +2924,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   // Under load a resumed provider can time out before taking the prompt; the restart still owes the turn.
-  // A delegated task's run that hit a short rate limit is tried again in the same thread.
+  // An open delegated task's run that hit a short rate limit is tried again in the same thread.
   const retryContinuationStart = Effect.fn("Orchestrator.retryContinuationStart")(function* (
     threadId: ThreadId,
-    runId: RunId,
+    failed: OrchestrationV2Run,
   ) {
+    const retriesRateLimit = yield* delegatedTaskOpen(threadId, failed);
+    if (failed.restartContinuationOfRunId === undefined && !retriesRateLimit) return;
     const { runs, providerTurns } = yield* projectionStore.getThreadRecords(threadId, [
       "runs",
       "providerTurns",
     ]);
-    const run = runs.find((candidate) => candidate.id === runId);
+    const run = runs.find((candidate) => candidate.id === failed.id);
     if (run === undefined) return;
     const chainRunIds: Array<RunId> = [];
     for (
@@ -2949,9 +2951,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const now = yield* DateTime.now;
     const delayMs =
       continuationStartRetryDelayMs(run, { runs, providerTurns, turnItems }) ??
-      ((yield* appOwnedSubagentParentThreadId(threadId)) === undefined
-        ? undefined
-        : rateLimitRetryDelayMs(run, { runs, turnItems }, DateTime.toEpochMillis(now)));
+      (retriesRateLimit
+        ? rateLimitRetryDelayMs(run, { runs, turnItems }, DateTime.toEpochMillis(now))
+        : undefined);
     if (delayMs === undefined) return;
     const commandId = CommandId.make(`command:restart-continuation-retry:${run.id}`);
     yield* writeSystemEvents(
@@ -13348,6 +13350,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // A settled task no longer owns later turns in its thread.
+  const delegatedTaskOpen = Effect.fn("Orchestrator.delegatedTaskOpen")(function* (
+    childThreadId: ThreadId,
+    run: OrchestrationV2Run,
+  ) {
+    const { lineage, forkedFrom } = yield* projectionStore.getThread(childThreadId);
+    if (
+      lineage.relationshipToParent !== "subagent" ||
+      lineage.parentThreadId === null ||
+      forkedFrom?.type !== "node"
+    )
+      return false;
+    const taskId = run.delegatedTaskId ?? forkedFrom.nodeId;
+    const { subagents } = yield* projectionStore.getThreadRecords(
+      lineage.parentThreadId,
+      ["subagents"],
+      { subagentIds: [taskId] },
+    );
+    return subagents.some(
+      (task) =>
+        task.id === taskId &&
+        task.origin === "app_owned" &&
+        task.result === null &&
+        isOrchestrationV2WorkActive(task.status),
+    );
+  });
+
   const awaitsRestartContinuation = (run: OrchestrationV2Run) =>
     effectOutbox
       .get(`effect:restart-continuation:${run.id}`)
@@ -14969,7 +14998,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (delegatedTaskTerminalStatus(run.status) !== null) {
         // Before the parent hears of the failure: a pending continuation keeps the task open.
         if (run.status === "failed") {
-          yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
+          yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run)).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("Failed to schedule a restart continuation retry", {
                 threadId,
