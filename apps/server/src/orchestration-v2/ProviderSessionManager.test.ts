@@ -443,6 +443,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
       readonly initialProviderItemIdentityVersion?: 2;
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+    readonly hasUndeliveredWake?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
@@ -552,6 +553,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
+          ...(options.hasUndeliveredWake === undefined
+            ? {}
+            : { hasUndeliveredWake: options.hasUndeliveredWake }),
           ...(options.hasPendingBackgroundWorkForThread === undefined
             ? {}
             : {
@@ -625,6 +629,7 @@ function layerTest(input: {
     readonly paused: Deferred.Deferred<void>;
   };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+  readonly hasUndeliveredWake?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
@@ -664,6 +669,9 @@ function layerTest(input: {
       ...(input.hasPendingBackgroundWork === undefined
         ? {}
         : { hasPendingBackgroundWork: input.hasPendingBackgroundWork }),
+      ...(input.hasUndeliveredWake === undefined
+        ? {}
+        : { hasUndeliveredWake: input.hasUndeliveredWake }),
       ...(input.hasPendingBackgroundWorkForThread === undefined
         ? {}
         : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
@@ -1130,10 +1138,11 @@ it.effect("ProviderSessionManagerV2 closes every live session for a provider ins
   }),
 );
 
-it.effect.each([false, true] as const)(
-  "ProviderSessionManagerV2 releases the least recently active idle sessions over the budget (background work: %s)",
-  (hasPendingBackgroundWork) =>
+it.effect.each([undefined, "hasPendingBackgroundWork", "hasUndeliveredWake"] as const)(
+  "ProviderSessionManagerV2 releases the least recently active idle sessions over the budget (held by: %s)",
+  (holdingProbe) =>
     Effect.gen(function* () {
+      const hasPendingBackgroundWork = holdingProbe !== undefined;
       const state = yield* Ref.make(emptyState);
       const effect = Effect.gen(function* () {
         const eventSink = yield* EventSink.EventSinkV2;
@@ -1199,7 +1208,7 @@ it.effect.each([false, true] as const)(
             state,
             idleTimeoutMs: 60 * 60_000,
             maxIdleSessions: 1,
-            hasPendingBackgroundWork: Effect.succeed(hasPendingBackgroundWork),
+            ...(holdingProbe === undefined ? {} : { [holdingProbe]: Effect.succeed(true) }),
           }),
         ),
       );

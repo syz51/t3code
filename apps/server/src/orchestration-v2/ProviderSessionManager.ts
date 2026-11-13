@@ -1248,12 +1248,17 @@ export const layerWithOptions = (
       const probePendingBackgroundWork = (
         runtime: LiveSessionEntry["runtime"],
         onProbeFailure: boolean,
-      ) =>
-        runtime.hasPendingBackgroundWork === undefined
-          ? Effect.succeed(false)
-          : runtime.hasPendingBackgroundWork.pipe(
-              Effect.catchCause(() => Effect.succeed(onProbeFailure)),
-            );
+      ) => {
+        const probe = (check: Effect.Effect<boolean> | undefined) =>
+          check === undefined
+            ? Effect.succeed(false)
+            : check.pipe(Effect.catchCause(() => Effect.succeed(onProbeFailure)));
+        return probe(runtime.hasPendingBackgroundWork).pipe(
+          Effect.flatMap((held) =>
+            held ? Effect.succeed(true) : probe(runtime.hasUndeliveredWake),
+          ),
+        );
+      };
 
       // Closing now would skip the archive of a child whose parent has not taken its result.
       const holdsUndeliveredChild = (entry: LiveSessionEntry) =>
