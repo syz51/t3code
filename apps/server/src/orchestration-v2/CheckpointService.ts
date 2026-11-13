@@ -462,23 +462,27 @@ export const layer: Layer.Layer<
           };
           // A pull or rebase can change thousands of files the turn did not write.
           const files = previousExists
-            ? yield* Effect.all([
-                checkpointStore.diffCheckpoints({
-                  ...refs,
-                  fallbackFromToHead: false,
-                  ignoreWhitespace: false,
-                  format: "numstat",
-                }),
-                checkpointStore.listAuthoredPaths(refs).pipe(
-                  Effect.catch((cause) =>
-                    Effect.logWarning("orchestration V2 checkpoint authored paths failed", {
-                      scopeId: input.scope.id,
-                      checkpointRef,
-                      cause: String(cause),
-                    }).pipe(Effect.as(null)),
+            ? yield* Effect.all(
+                [
+                  checkpointStore.diffCheckpoints({
+                    ...refs,
+                    fallbackFromToHead: false,
+                    ignoreWhitespace: false,
+                    format: "numstat",
+                  }),
+                  checkpointStore.listAuthoredPaths(refs).pipe(
+                    Effect.catch((cause) =>
+                      Effect.logWarning("orchestration V2 checkpoint authored paths failed", {
+                        scopeId: input.scope.id,
+                        checkpointRef,
+                        cause: String(cause),
+                      }).pipe(Effect.as(null)),
+                    ),
                   ),
-                ),
-              ]).pipe(
+                ],
+                // Both only read the two refs.
+                { concurrency: "unbounded" },
+              ).pipe(
                 Effect.map(([diff, authoredPaths]) =>
                   parseTurnDiffFilesFromNumstat(diff)
                     .filter((file) => !isGitImport(file, authoredPaths))
