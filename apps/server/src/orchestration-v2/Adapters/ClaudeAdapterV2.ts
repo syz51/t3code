@@ -16,6 +16,7 @@ import { field, text } from "../unknownField.ts";
 import { mergeWorkflowAgentMetadata, type WorkflowAgentMetadata } from "../workflowAgentAnswers.ts";
 import {
   initialWorkflowAgentTranscriptCursor,
+  findSubagentTranscriptDirs,
   readWorkflowAgentTranscript,
   type WorkflowAgentTranscriptCursor,
 } from "../workflowAgentTranscript.ts";
@@ -7293,13 +7294,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             configuredDir.length > 0
               ? path.resolve(session.cwd, configuredDir)
               : path.join(yield* HostProcess.HomeDirectory, ".claude");
-          const projectsDir = path.join(configDir, "projects");
-          const projects = yield* fileSystem
-            .readDirectory(projectsDir)
-            .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
-          for (const project of projects) {
+          const transcriptDirs = yield* findSubagentTranscriptDirs({
+            projectsDir: path.join(configDir, "projects"),
+            nativeThreadId,
+            agentId: taskId,
+          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+          for (const transcriptDir of transcriptDirs) {
             const read = yield* readWorkflowAgentTranscript({
-              transcriptDir: path.join(projectsDir, project, nativeThreadId, "subagents"),
+              transcriptDir,
               agentId: taskId,
               cursor: initialWorkflowAgentTranscriptCursor,
               configDir,

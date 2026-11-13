@@ -14,6 +14,12 @@ This fork (`syz51/t3code`) is tested next to the installed T3 Code app. The inst
 - Patch work branches start from `fork`. A patch meant for upstream starts from `main` instead,
   and lands on `fork` once upstream merges it, or as a cherry-pick until then.
 
+## State machine audit
+
+[Implicit state machines](../internals/state-machines.md) lists the state machines that the fork
+runs, where each transition is enforced, and each known gap with its board task. Read the entry
+before you change one of these machines, and correct it when you do.
+
 ## Sync with upstream
 
 A sync merges `upstream/main` into a branch from `fork` and lands it through a PR, so CI runs

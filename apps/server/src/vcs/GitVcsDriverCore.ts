@@ -2038,8 +2038,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
   });
 
+  const isDefaultBranchName = (branch: string | null, defaultBranch: string | null) =>
+    branch !== null &&
+    (branch === defaultBranch ||
+      (defaultBranch === null && (branch === "main" || branch === "master")));
+
   const readStatusDetailsRemote = Effect.fn("readStatusDetailsRemote")(function* (cwd: string) {
-    const branchResult = yield* executeGitWithStableDiagnostics(
+    // None of these reads needs another's output, so they spawn together. The upstream and the
+    // default branch count only in a repository, so their failures wait for the branch check.
+    const readBranch = executeGitWithStableDiagnostics(
       "GitVcsDriver.statusDetailsRemote.branch",
       cwd,
       ["rev-parse", "--symbolic-full-name", "HEAD"],
@@ -2049,6 +2056,14 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         GitCommandError: (error) =>
           isMissingGitCwdError(error) ? Effect.succeed(null) : Effect.fail(error),
       }),
+    );
+    const [branchResult, currentUpstreamRefExit, defaultBranchExit] = yield* Effect.all(
+      [
+        readBranch,
+        Effect.exit(readCurrentUpstreamRef(cwd)),
+        Effect.exit(resolveDefaultBranchName(cwd, "origin")),
+      ],
+      { concurrency: "unbounded" },
     );
 
     if (branchResult === null) {
@@ -2082,7 +2097,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     } else {
       branch = branchNameFromHeadRef(branchResult.stdout);
     }
-    const currentUpstreamRef = yield* readCurrentUpstreamRef(cwd);
+    const currentUpstreamRef = yield* currentUpstreamRefExit;
     let upstreamRef =
       currentUpstreamRef === null
         ? null
@@ -2093,13 +2108,27 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     }
     let aheadCount = 0;
     let behindCount = 0;
+    let aheadOfDefaultCount = 0;
+    const defaultBranch = yield* defaultBranchExit;
+    const isDefaultBranch = isDefaultBranchName(branch, defaultBranch);
 
     if (upstreamRef) {
-      const divergence = yield* executeGit(
-        "GitVcsDriver.statusDetailsRemote.divergence",
-        cwd,
-        ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-        { allowNonZeroExit: true },
+      // The count against the default branch does not read the divergence, so both run together.
+      const [divergence, aheadOfDefault] = yield* Effect.all(
+        [
+          executeGit(
+            "GitVcsDriver.statusDetailsRemote.divergence",
+            cwd,
+            ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            { allowNonZeroExit: true },
+          ),
+          branch && !isDefaultBranch
+            ? computeAheadCountAgainstBase(cwd, branch, {
+                knownOriginDefaultBranch: defaultBranch,
+              }).pipe(Effect.orElseSucceed(() => 0))
+            : Effect.succeed(0),
+        ],
+        { concurrency: "unbounded" },
       );
       if (divergence.exitCode === 0) {
         const [aheadRaw, behindRaw] = divergence.stdout.trim().split(/\s+/);
@@ -2108,25 +2137,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         aheadCount = Number.isFinite(parsedAhead) ? Math.max(0, parsedAhead) : 0;
         behindCount = Number.isFinite(parsedBehind) ? Math.max(0, parsedBehind) : 0;
       }
-    } else if (branch) {
-      aheadCount = yield* computeAheadCountAgainstBase(cwd, branch).pipe(
-        Effect.orElseSucceed(() => 0),
-      );
+      aheadOfDefaultCount = aheadOfDefault;
+    } else {
+      if (branch) {
+        aheadCount = yield* computeAheadCountAgainstBase(cwd, branch, {
+          knownOriginDefaultBranch: defaultBranch,
+        }).pipe(Effect.orElseSucceed(() => 0));
+      }
+      aheadOfDefaultCount = branch && !isDefaultBranch ? aheadCount : 0;
     }
-
-    const defaultBranch = yield* resolveDefaultBranchName(cwd, "origin");
-    const isDefaultBranch =
-      branch !== null &&
-      (branch === defaultBranch ||
-        (defaultBranch === null && (branch === "main" || branch === "master")));
-    const aheadOfDefaultCount =
-      branch && !isDefaultBranch
-        ? upstreamRef === null
-          ? aheadCount
-          : yield* computeAheadCountAgainstBase(cwd, branch, {
-              knownOriginDefaultBranch: defaultBranch,
-            }).pipe(Effect.orElseSucceed(() => 0))
-        : 0;
 
     return {
       isRepo: true,
