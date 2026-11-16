@@ -455,7 +455,7 @@ const make = Effect.gen(function* () {
       const project = Option.getOrUndefined(yield* projects.getById(projectId));
       if (project === undefined || (yield* managedFolders.isScratchProject(projectId))) return root;
       const cwd = project.workspaceRoot;
-      const { defaultThreadEnvMode } = resolveProjectSettings(
+      const { defaultThreadEnvMode, newWorktreesStartFromOrigin } = resolveProjectSettings(
         yield* serverSettings.getSettings,
         projectId,
         project,
@@ -473,7 +473,9 @@ const make = Effect.gen(function* () {
         Effect.as(true),
         Effect.orElseSucceed(() => false),
       );
-      return baseExists ? { type: "worktree" as const, baseRef, startFromOrigin: true } : root;
+      return baseExists
+        ? { type: "worktree" as const, baseRef, startFromOrigin: newWorktreesStartFromOrigin }
+        : root;
     });
 
   const isNonGitProject: ThreadLaunchService["Service"]["isNonGitProject"] = Effect.fn(

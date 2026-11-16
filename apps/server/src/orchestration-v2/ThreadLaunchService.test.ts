@@ -3212,6 +3212,13 @@ it.effect.each([
     expected: worktreeFromDefaultBranch,
   },
   {
+    name: "a project set to worktree follows the new-worktree origin setting",
+    options: {
+      serverSettings: { ...projectDefaultsToWorktree, newWorktreesStartFromOrigin: false },
+    },
+    expected: { ...worktreeFromDefaultBranch, startFromOrigin: false },
+  },
+  {
     name: "a t3.json default applies when no setting is stored",
     options: { projectFile: { defaultThreadEnvMode: "worktree" } },
     expected: worktreeFromDefaultBranch,
