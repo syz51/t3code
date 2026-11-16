@@ -6070,7 +6070,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       state: PullRequestDetail["state"];
       headSha: string;
       check: "pending" | "success";
-    } = { state: "open", headSha: "1111111aaa", check: "success" };
+    } = { state: "open", headSha: "1111111aaa", check: "pending" };
     const reactor = yield* PullRequestWatchReactor.make.pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -6121,6 +6121,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       orchestrator.getThreadShell(threadId),
       (thread) => thread?.pullRequests?.[0]?.watch,
     );
+    // The first read is a silent baseline, so the checks pass after it.
+    yield* reactor.sweep;
+    assert.equal((yield* wakes).length, 0);
+    pullRequest.check = "success";
+    yield* TestClock.adjust("2 minutes");
     yield* reactor.sweep;
     const told = yield* wakes;
     assert.equal(told.length, 1);
