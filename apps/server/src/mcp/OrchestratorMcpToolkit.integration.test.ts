@@ -11,7 +11,7 @@ import {
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -80,7 +80,7 @@ const delegatedResult = "Delegated API boundary inspected.";
 const cancellationPrompt = "Remain active until the parent cancels this delegated task.";
 const queuedFollowupPrompt = "Complete the queued follow-up and return the final result.";
 const queuedFollowupResult = "Queued delegated follow-up completed.";
-const decodeThreadRead = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
+const decodeThreadRead = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadToolResult);
 const longFollowupResult = "Long delegated follow-up line. ".repeat(1_500);
 
 const decodeDelegateTaskResult = Schema.decodeUnknownEffect(OrchestratorMcpDelegateTaskResult);

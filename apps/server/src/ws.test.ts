@@ -2320,6 +2320,7 @@ it.effect.each([
         );
       });
       const exit = yield* subscription.pipe(
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
