@@ -1482,10 +1482,9 @@ it.effect("a task whose thread there waits on its own task ends with the answer 
         result: "The review found two issues; both are fixed.",
       });
       const status = yield* a.call("task_status", { taskId: delegated.taskId });
-      expect(status.structuredContent).toMatchObject({
-        status: "completed",
-        executedModel: null,
-      });
+      expect(status.structuredContent).toMatchObject({ status: "completed" });
+      // The fork's agent results leave out null fields.
+      expect(status.structuredContent).not.toHaveProperty("executedModel");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
