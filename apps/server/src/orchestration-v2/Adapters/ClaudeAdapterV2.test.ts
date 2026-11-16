@@ -20530,19 +20530,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         [`task-${OVERRIDING_TOOL_USE_ID}`]: "max",
       });
       // The fork updates a child thread once its transcript reports the effort.
-      const childEfforts = new Map(
-        harness.events.flatMap((event) =>
-          event.type === "app_thread.created" && event.appThread.id !== harness.threadId
-            ? [
-                [
-                  event.appThread.id,
-                  getModelSelectionStringOptionValue(event.appThread.modelSelection, "effort"),
-                ] as const,
-              ]
-            : [],
-        ),
-      );
-      assert.deepEqual([...childEfforts.values()], ["low", "low", "max"]);
+      const childEfforts = new Map<string, Array<string | undefined>>();
+      for (const event of harness.events) {
+        if (event.type !== "app_thread.created" || event.appThread.id === harness.threadId)
+          continue;
+        const effort = getModelSelectionStringOptionValue(event.appThread.modelSelection, "effort");
+        childEfforts.set(event.appThread.id, [
+          ...(childEfforts.get(event.appThread.id) ?? []),
+          effort,
+        ]);
+      }
+      assert.deepEqual([...childEfforts.values()], [["low"], [undefined, "low"], ["max"]]);
     }).pipe(
       Effect.provideService(WorkflowAgentTranscriptReadObserver, (read) =>
         read.agentId === `task-${UNSPECIFIED_TOOL_USE_ID}`
