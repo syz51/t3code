@@ -4585,6 +4585,41 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       yield* worker.drain();
       assert.deepEqual(yield* summaries, ["#12: checks passed", "#12: checks passed"]);
       yield* watch(false, "end");
+
+      // Checks running when the watch was asked for may pass before its first read.
+      const runningThreadId = ThreadId.make("runtime-pull-request-watch-running");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-running-create"),
+        threadId: runningThreadId,
+        projectId,
+        title: "Watch running",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-watch-running-start"),
+        threadId: runningThreadId,
+        host: "github.com",
+        repository: "pingdotgg/t3code",
+        number: 12,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/12", source: "agent" },
+        checksPending: true,
+      });
+      yield* restarted.sweep;
+      yield* worker.drain();
+      const { messages } = yield* orchestrator.getThreadRecords(runningThreadId, ["messages"]);
+      assert.deepEqual(
+        messages.flatMap((message) => message.notification?.summary ?? []),
+        ["#12: checks passed"],
+      );
     }),
   );
 

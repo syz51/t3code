@@ -1,7 +1,9 @@
 import {
   CommandId,
   ThreadId,
+  type OrchestrationV2Command,
   type OrchestrationV2ThreadShell,
+  type PullRequestSummary,
   type PullRequestUnavailableError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -78,8 +80,16 @@ export class PullRequestWatchService extends Context.Service<
       | PullRequestTargetError
       | PullRequestUnavailableError
     >;
+    /** Marks a client's new watch whose checks still run, as `setWatching` does for agents. */
+    readonly withChecksAtStart: <C extends WatchCommand>(command: C) => Effect.Effect<C>;
   }
 >()("t3/pullRequest/PullRequestWatchService") {}
+
+type WatchCommand = Extract<OrchestrationV2Command, { readonly type: "thread.pull-request.watch" }>;
+
+// Null means no check has reported yet, which right after a push means CI has not started.
+const checksRunning = (summary: PullRequestSummary | undefined) =>
+  summary?.checksState === "pending" || summary?.checksState === null;
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
@@ -98,6 +108,21 @@ const make = Effect.gen(function* () {
     }
     return thread;
   });
+
+  const readSummary = (
+    projectId: OrchestrationV2ThreadShell["projectId"],
+    target: Pick<ResolvedTarget, "host" | "repository" | "number">,
+  ) =>
+    pullRequests.summary(
+      {
+        projectId,
+        host: target.host,
+        repository: target.repository,
+        number: target.number,
+        allowStale: false,
+      },
+      { recoverTransientFailure: false, bypassCache: true },
+    );
 
   // Keep the registration span stable across the service extraction.
   const setWatching = Effect.fn("PullRequestsToolkit.setWatching")(function* (input: {
@@ -123,30 +148,19 @@ const make = Effect.gen(function* () {
     if (watching && before?.snapshot?.state === "merged") {
       return yield* new PullRequestNotOpenError({ state: "merged" });
     }
-    if (watching && before?.watch === undefined) {
-      yield* pullRequests
-        .summary(
-          {
-            projectId: thread.projectId,
-            host: target.host,
-            repository: target.repository,
-            number: target.number,
-            allowStale: false,
-          },
-          { recoverTransientFailure: false, bypassCache: true },
-        )
-        .pipe(
-          Effect.flatMap((summary) =>
-            summary.state === "merged"
-              ? Effect.fail(new PullRequestNotOpenError({ state: "merged" }))
-              : Effect.void,
-          ),
-          Effect.catchTags({
-            // Host and transport errors can recover while the watch is active.
-            PullRequestOperationError: () => Effect.void,
-          }),
-        );
-    }
+    const summary =
+      watching && before?.watch === undefined
+        ? yield* readSummary(thread.projectId, target).pipe(
+            Effect.filterOrFail(
+              (summary) => summary.state !== "merged",
+              () => new PullRequestNotOpenError({ state: "merged" }),
+            ),
+            Effect.catchTags({
+              // Host and transport errors can recover while the watch is active.
+              PullRequestOperationError: () => Effect.undefined,
+            }),
+          )
+        : undefined;
     const uuid = yield* random.uuidV4().pipe(Effect.orDie);
     yield* engine
       .dispatch({
@@ -158,6 +172,7 @@ const make = Effect.gen(function* () {
         number: target.number,
         watching,
         ...(watching ? { link: { url: target.url, source: "agent" as const } } : {}),
+        ...(checksRunning(summary) && { checksPending: true }),
       })
       .pipe(
         Effect.catchCause((cause) =>
@@ -174,7 +189,23 @@ const make = Effect.gen(function* () {
     };
   });
 
-  return PullRequestWatchService.of({ setWatching });
+  const withChecksAtStart = Effect.fn("PullRequestWatchService.withChecksAtStart")(function* <
+    C extends WatchCommand,
+  >(command: C) {
+    if (!command.watching || command.checksPending !== undefined) return command;
+    const thread = yield* engine.getThreadShell(command.threadId).pipe(Effect.orDie);
+    const link =
+      thread &&
+      threadPullRequestsOf(thread).find((linked) => threadPullRequestKeysEqual(linked, command));
+    if (thread === null || link?.watch !== undefined) return command;
+    // Without a read the watch keeps its plain baseline, as an agent's does after a host error.
+    const summary = yield* readSummary(thread.projectId, command).pipe(
+      Effect.catch(() => Effect.undefined),
+    );
+    return checksRunning(summary) ? { ...command, checksPending: true } : command;
+  });
+
+  return PullRequestWatchService.of({ setWatching, withChecksAtStart });
 });
 
 export const layer = Layer.effect(PullRequestWatchService, make);

@@ -1,4 +1,5 @@
 import {
+  CommandId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -114,6 +115,7 @@ interface HarnessOptions {
   readonly project?: OrchestrationProjectShell | null;
   readonly readFailure?: PullRequestService.PullRequestError;
   readonly readState?: PullRequestSummary["state"];
+  readonly readChecks?: PullRequestSummary["checksState"];
 }
 
 const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
@@ -147,6 +149,7 @@ const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
               headBranch: "feature",
               baseBranch: "main",
               updatedAt: "2026-08-20T00:00:00.000Z",
+              checksState: options.readChecks,
             }),
     }),
     Layer.succeed(SecureRandom.SecureRandom, testCrypto),
@@ -158,21 +161,38 @@ const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
     commands,
     setWatching: (watching: boolean, target: PullRequestTarget) =>
       service.setWatching({ threadId: THREAD_ID, target, watching }),
+    withChecksAtStart: (watching: boolean, number: number) =>
+      service.withChecksAtStart({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("client-watch"),
+        threadId: THREAD_ID,
+        host: "github.com",
+        repository: "t3tools/t3code",
+        number,
+        watching,
+      }),
   };
 });
 
 describe("PullRequestWatchService", () => {
   it.effect("links an unlinked watch even while the host has a transient read failure", () =>
     Effect.gen(function* () {
-      for (const options of [
-        {},
-        {
-          readFailure: new PullRequestOperationError({
-            operation: "summary",
-            detail: "The host is temporarily unavailable.",
-          }),
-        },
-      ]) {
+      // Checks still running, or not yet reported, at the watch make their end news.
+      for (const [options, checksPending] of [
+        [{}, undefined],
+        [
+          {
+            readFailure: new PullRequestOperationError({
+              operation: "summary",
+              detail: "The host is temporarily unavailable.",
+            }),
+          },
+          undefined,
+        ],
+        [{ readChecks: "passing" }, undefined],
+        [{ readChecks: "pending" }, true],
+        [{ readChecks: null }, true],
+      ] satisfies ReadonlyArray<readonly [HarnessOptions, true | undefined]>) {
         const harness = yield* makeHarness(options);
         const result = yield* harness.setWatching(true, {
           url: "https://github.com/t3tools/t3code/pull/9",
@@ -186,6 +206,46 @@ describe("PullRequestWatchService", () => {
             link: { url: "https://github.com/t3tools/t3code/pull/9", source: "agent" },
           },
         ]);
+        const [command] = yield* Ref.get(harness.commands);
+        expect(command && "checksPending" in command ? command.checksPending : undefined).toBe(
+          checksPending,
+        );
+      }
+    }),
+  );
+
+  it.effect("marks a client's new watch whose checks are still running", () =>
+    Effect.gen(function* () {
+      const watched = makeLink(2, {
+        watch: {
+          startedAt: "2026-08-20T00:00:00.000Z",
+          headSha: null,
+          failedChecks: [],
+          passed: false,
+          passedChecks: [],
+          remarksThrough: "2026-08-20T00:00:00.000Z",
+          remarkIds: [],
+          conflicting: false,
+          wakes: 0,
+        },
+      });
+      const thread = makeThread([makeLink(1), watched]);
+      const readFailure = new PullRequestOperationError({
+        operation: "summary",
+        detail: "The host is temporarily unavailable.",
+      });
+      for (const [options, watching, number, checksPending] of [
+        [{ readChecks: "pending" }, true, 1, true],
+        [{ readChecks: null }, true, 3, true],
+        [{ readChecks: "passing" }, true, 1, undefined],
+        [{ readFailure, readChecks: "pending" }, true, 1, undefined],
+        // An active watch keeps its own state, and an unwatch needs no read.
+        [{ readChecks: "pending" }, true, 2, undefined],
+        [{ readChecks: "pending" }, false, 1, undefined],
+      ] satisfies ReadonlyArray<readonly [HarnessOptions, boolean, number, true | undefined]>) {
+        const harness = yield* makeHarness({ ...options, thread });
+        const command = yield* harness.withChecksAtStart(watching, number);
+        expect("checksPending" in command ? command.checksPending : undefined).toBe(checksPending);
       }
     }),
   );

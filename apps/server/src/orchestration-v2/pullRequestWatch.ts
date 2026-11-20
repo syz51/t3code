@@ -57,7 +57,9 @@ export function evaluatePullRequestWatch(
   // A read without a head says nothing about pushes, so it keeps the last known one.
   const headSha = detail.headSha ?? watch.headSha;
   const headMoved = watch.headSha !== null && headSha !== watch.headSha;
-  const checksBaseline = watch.awaitingBaseline !== undefined && !headMoved;
+  const baseline = watch.awaitingBaseline !== undefined && !headMoved;
+  // Checks known to be running at a baseline can only finish afterwards, so their end is news.
+  const checksBaseline = baseline && watch.checksRunningAtStart !== true;
 
   // Hosts can return no checks on read failure; preserve prior state.
   let failedChecks = headMoved ? [] : watch.failedChecks;
@@ -82,7 +84,7 @@ export function evaluatePullRequestWatch(
       changes.push({ kind: "checks-failed", failed: newlyFailed });
     }
     if (!approvalAnnounced && awaiting.length > 0) {
-      if (!checksBaseline) changes.push({ kind: "checks-awaiting-approval", checks: awaiting });
+      if (!baseline) changes.push({ kind: "checks-awaiting-approval", checks: awaiting });
       approvalAnnounced = true;
     }
     failedChecks = failed.map((check) => check.name);

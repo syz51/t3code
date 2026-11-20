@@ -5131,6 +5131,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     }),
                     // A finished-checks answer may be an older head's; a fresh read decides.
                     ...(existing.endedWatch?.checksPending === true && { checksPending: true }),
+                    ...(command.checksPending === true && { checksRunningAtStart: true }),
                     ...(existing.endedWatch?.checksAwaitedSince !== undefined && {
                       checksAwaitedSince: existing.endedWatch.checksAwaitedSince,
                     }),
