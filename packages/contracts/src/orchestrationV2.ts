@@ -3301,6 +3301,11 @@ export const OrchestrationV2Command = Schema.Union([
         repositoryWebUrl: Schema.optional(TrimmedNonEmptyString),
       }),
     ),
+    /**
+     * Checks were running or not yet reported when the watch was asked for, so a new watch reports
+     * how they end instead of recording its first read as already known.
+     */
+    checksPending: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request.sync"),

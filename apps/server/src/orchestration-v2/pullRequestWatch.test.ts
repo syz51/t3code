@@ -189,11 +189,41 @@ describe("evaluatePullRequestWatch", () => {
     ]);
   });
 
+  it("reports checks that were running at the watch but finished before its first read", () => {
+    const started = watch({ awaitingBaseline: "all", checksRunningAtStart: true });
+    const green = detail({
+      checks: [check("lint", "success"), check("test", "success")],
+      mergeability: "conflicting",
+    });
+    const passed = evaluatePullRequestWatch(started, green, noRemarks);
+    assert.deepEqual(passed.changes, [{ kind: "checks-passed", count: 2, required: false }]);
+    assert.isTrue(passed.next.conflicting);
+    assert.deepEqual(evaluatePullRequestWatch(passed.next, green, noRemarks).changes, []);
+
+    const red = detail({ checks: [check("lint", "success"), check("test", "failure")] });
+    assert.deepEqual(evaluatePullRequestWatch(started, red, noRemarks).changes, [
+      { kind: "checks-failed", failed: [check("test", "failure")] },
+    ]);
+
+    // A first read that cannot show the checks leaves their end to the next read.
+    const unread = evaluatePullRequestWatch(started, detail({ headSha: undefined }), noRemarks);
+    assert.deepEqual(unread.changes, []);
+    assert.isUndefined(unread.next.awaitingBaseline);
+    const later = detail({ checks: [check("lint", "success"), check("test", "success")] });
+    assert.deepEqual(evaluatePullRequestWatch(unread.next, later, noRemarks).changes, [
+      { kind: "checks-passed", count: 2, required: false },
+    ]);
+  });
+
   it("baselines checks already awaiting approval", () => {
     const gated = detail({ checks: [{ ...check("CI", "action-required"), url: run(1) }] });
-    const baseline = evaluatePullRequestWatch(watch({ awaitingBaseline: "all" }), gated, noRemarks);
-    assert.deepEqual(baseline.changes, []);
-    assert.deepEqual(evaluatePullRequestWatch(baseline.next, gated, noRemarks).changes, []);
+    // A run awaiting approval at the watch is already known, even when other checks were running.
+    for (const checksRunningAtStart of [false, true]) {
+      const started = watch({ awaitingBaseline: "all", checksRunningAtStart });
+      const baseline = evaluatePullRequestWatch(started, gated, noRemarks);
+      assert.deepEqual(baseline.changes, []);
+      assert.deepEqual(evaluatePullRequestWatch(baseline.next, gated, noRemarks).changes, []);
+    }
   });
 
   it("reports remarks after the watch started while baselining checks and conflicts", () => {

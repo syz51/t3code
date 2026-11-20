@@ -108,6 +108,8 @@ export const ThreadPullRequestWatch = Schema.Struct({
    * checks on the first read that can be trusted to show them (one with a head and a full check read).
    */
   awaitingBaseline: Schema.optional(Schema.Literals(["all", "checks"])),
+  /** Checks were running when the watch began, so the baseline reports how they end. */
+  checksRunningAtStart: Schema.optional(Schema.Boolean),
   /**
    * When the head was first read without any check, until a check shows up or the agent is told
    * none did. Null once either happened; absent on watches saved before it existed.
