@@ -23,8 +23,8 @@ before you change one of these machines, and correct it when you do.
 ## Sync with upstream
 
 A sync merges `upstream/main` into a branch from `fork` and lands it through a PR, so CI runs
-before `fork` changes. `fork` is never rebased or force-pushed. The T3 scheduled task "Weekly fork
-upstream sync" starts one every Monday at 10:00 in a new thread on the Air, and that agent follows
+before `fork` changes. `fork` is never rebased or force-pushed. The T3 scheduled task "Daily fork
+upstream sync" starts one every day at 10:00 in a new thread on the Air, and that agent follows
 this section.
 
 ```sh
