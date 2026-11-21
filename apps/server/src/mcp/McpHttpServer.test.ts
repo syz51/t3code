@@ -1948,7 +1948,10 @@ it.effect(
         ).toEqual([]);
         // Each side's PR rules name only tools it lists.
         const hiddenFromChild = parentTools.filter((tool) => !childTools.includes(tool));
-        const childText = buildRuntimeInstructions({ harness: "Claude Code", delegatedChild: true });
+        const childText = buildRuntimeInstructions({
+          harness: "Claude Code",
+          delegatedChild: true,
+        });
         for (const tool of hiddenFromChild) expect(childText).not.toContain(tool);
         const parentText = buildRuntimeInstructions({ harness: "Claude Code" });
         for (const tool of parentText.match(/\b\w+_pull_requests?\b/g) ?? []) {

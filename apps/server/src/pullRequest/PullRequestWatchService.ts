@@ -152,12 +152,12 @@ const make = Effect.gen(function* () {
     let checksPendingAtStart: boolean | undefined;
     if (watching && !wasWatching) {
       const read = yield* readSummary(thread.projectId, target).pipe(
-          Effect.catchTags({
-            // Host and transport errors can recover while the watch is active.
-            // A failed read leaves the seed to the link's last sync.
-            PullRequestOperationError: () => Effect.undefined,
-          }),
-        );
+        Effect.catchTags({
+          // Host and transport errors can recover while the watch is active.
+          // A failed read leaves the seed to the link's last sync.
+          PullRequestOperationError: () => Effect.undefined,
+        }),
+      );
       if (read?.state === "merged" || read?.state === "closed") return alreadyEnded(read.state);
       checksPendingAtStart = read === undefined ? undefined : read.checksState === "pending";
     }
