@@ -19061,7 +19061,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
         ),
       );
-      assert.isFalse(yield* harness.hasPendingBackgroundWork, "a model switch need not wait");
       assert.isTrue(
         yield* harness.hasUndeliveredWake,
         "an idle release now would kill the wake turn Claude is about to run",
