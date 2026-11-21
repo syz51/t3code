@@ -19,7 +19,7 @@ const MAX_BARS = 7;
 
 /**
  * Maps a reasoning select to bars: one per ordinary level, filled up to the current one, with an
- * off level as none filled. Max, prompt-injected and workflow levels are named instead of drawn.
+ * off level as none filled. Max, Default, prompt-injected and workflow levels are named instead.
  */
 export function resolveEffortGlyph(descriptor: SelectDescriptor, current: string | null) {
   const special = new Set([...(descriptor.promptInjectedValues ?? []), ...NAMED_LEVELS]);

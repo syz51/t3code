@@ -3,8 +3,8 @@ import {
   ThreadId,
   type OrchestrationV2Command,
   type OrchestrationV2ThreadShell,
-  type PullRequestSummary,
   type PullRequestUnavailableError,
+  type PullRequestWatchUntil,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -37,15 +37,6 @@ export class PullRequestWatchFailedError extends Schema.TaggedError<PullRequestW
   }
 }
 
-export class PullRequestNotOpenError extends Schema.TaggedError<PullRequestNotOpenError>()(
-  "PullRequestNotOpenError",
-  { state: Schema.String },
-) {
-  override get message(): string {
-    return `The pull request is ${this.state}, so there is nothing to watch.`;
-  }
-}
-
 export class PullRequestWatchFromSubagentError extends Schema.TaggedError<PullRequestWatchFromSubagentError>()(
   "PullRequestWatchFromSubagentError",
   {},
@@ -71,10 +62,15 @@ export class PullRequestWatchService extends Context.Service<
       readonly threadId: ThreadId;
       readonly target: PullRequestTarget;
       readonly watching: boolean;
+      readonly until?: PullRequestWatchUntil | undefined;
     }) => Effect.Effect<
-      ResolvedTarget & { readonly watching: boolean; readonly wasWatching: boolean },
+      ResolvedTarget & {
+        readonly watching: boolean;
+        readonly wasWatching: boolean;
+        /** Set when the PR already ended, so no watch was registered. */
+        readonly state?: "merged" | "closed";
+      },
       | PullRequestWatchFailedError
-      | PullRequestNotOpenError
       | PullRequestWatchFromSubagentError
       | PullRequestWatchThreadNotFoundError
       | PullRequestTargetError
@@ -86,10 +82,6 @@ export class PullRequestWatchService extends Context.Service<
 >()("t3/pullRequest/PullRequestWatchService") {}
 
 type WatchCommand = Extract<OrchestrationV2Command, { readonly type: "thread.pull-request.watch" }>;
-
-// Null means no check has reported yet, which right after a push means CI has not started.
-const checksRunning = (summary: PullRequestSummary | undefined) =>
-  summary?.checksState === "pending" || summary?.checksState === null;
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
@@ -129,6 +121,7 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly target: PullRequestTarget;
     readonly watching: boolean;
+    readonly until?: PullRequestWatchUntil | undefined;
   }) {
     const { watching } = input;
     const thread = yield* requireThread(input.threadId);
@@ -145,22 +138,29 @@ const make = Effect.gen(function* () {
       return yield* new PullRequestWatchFromSubagentError();
     }
     const before = watchedLink(thread);
-    if (watching && before?.snapshot?.state === "merged") {
-      return yield* new PullRequestNotOpenError({ state: "merged" });
+    const wasWatching = before?.watch !== undefined;
+    // A watch on an ended PR could only report that it ended, so report it now instead.
+    const alreadyEnded = (state: "merged" | "closed") => ({
+      ...target,
+      watching: false,
+      wasWatching,
+      state,
+    });
+    // A closed snapshot still gets a read below, since the PR may have reopened.
+    if (watching && before?.snapshot?.state === "merged") return alreadyEnded("merged");
+    // A pending rollup has no failure yet, so any failure the first read finds is news.
+    let checksPendingAtStart: boolean | undefined;
+    if (watching && !wasWatching) {
+      const read = yield* readSummary(thread.projectId, target).pipe(
+          Effect.catchTags({
+            // Host and transport errors can recover while the watch is active.
+            // A failed read leaves the seed to the link's last sync.
+            PullRequestOperationError: () => Effect.undefined,
+          }),
+        );
+      if (read?.state === "merged" || read?.state === "closed") return alreadyEnded(read.state);
+      checksPendingAtStart = read === undefined ? undefined : read.checksState === "pending";
     }
-    const summary =
-      watching && before?.watch === undefined
-        ? yield* readSummary(thread.projectId, target).pipe(
-            Effect.filterOrFail(
-              (summary) => summary.state !== "merged",
-              () => new PullRequestNotOpenError({ state: "merged" }),
-            ),
-            Effect.catchTags({
-              // Host and transport errors can recover while the watch is active.
-              PullRequestOperationError: () => Effect.undefined,
-            }),
-          )
-        : undefined;
     const uuid = yield* random.uuidV4().pipe(Effect.orDie);
     yield* engine
       .dispatch({
@@ -172,7 +172,10 @@ const make = Effect.gen(function* () {
         number: target.number,
         watching,
         ...(watching ? { link: { url: target.url, source: "agent" as const } } : {}),
-        ...(checksRunning(summary) && { checksPending: true }),
+        ...(watching && input.until !== undefined && { until: input.until }),
+        ...(watching && checksPendingAtStart !== undefined
+          ? { checksPending: checksPendingAtStart }
+          : {}),
       })
       .pipe(
         Effect.catchCause((cause) =>
@@ -185,7 +188,7 @@ const make = Effect.gen(function* () {
     return {
       ...target,
       watching: watchedLink(after)?.watch !== undefined,
-      wasWatching: before?.watch !== undefined,
+      wasWatching,
     };
   });
 
@@ -198,11 +201,13 @@ const make = Effect.gen(function* () {
       thread &&
       threadPullRequestsOf(thread).find((linked) => threadPullRequestKeysEqual(linked, command));
     if (thread === null || link?.watch !== undefined) return command;
-    // Without a read the watch keeps its plain baseline, as an agent's does after a host error.
+    // A failed read leaves the seed to the link's last sync, as an agent's does.
     const summary = yield* readSummary(thread.projectId, command).pipe(
       Effect.catch(() => Effect.undefined),
     );
-    return checksRunning(summary) ? { ...command, checksPending: true } : command;
+    return summary === undefined
+      ? command
+      : { ...command, checksPending: summary.checksState === "pending" };
   });
 
   return PullRequestWatchService.of({ setWatching, withChecksAtStart });

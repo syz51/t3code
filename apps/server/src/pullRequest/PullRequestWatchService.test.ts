@@ -115,7 +115,7 @@ interface HarnessOptions {
   readonly project?: OrchestrationProjectShell | null;
   readonly readFailure?: PullRequestService.PullRequestError;
   readonly readState?: PullRequestSummary["state"];
-  readonly readChecks?: PullRequestSummary["checksState"];
+  readonly readChecksState?: PullRequestSummary["checksState"];
 }
 
 const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
@@ -146,10 +146,12 @@ const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
               title: "Pull request",
               url: `https://github.com/${input.repository}/pull/${input.number}`,
               state: options.readState ?? "open",
+              ...(options.readChecksState !== undefined && {
+                checksState: options.readChecksState,
+              }),
               headBranch: "feature",
               baseBranch: "main",
               updatedAt: "2026-08-20T00:00:00.000Z",
-              checksState: options.readChecks,
             }),
     }),
     Layer.succeed(SecureRandom.SecureRandom, testCrypto),
@@ -177,9 +179,10 @@ const makeHarness = Effect.fn("makePullRequestWatchHarness")(function* (
 describe("PullRequestWatchService", () => {
   it.effect("links an unlinked watch even while the host has a transient read failure", () =>
     Effect.gen(function* () {
-      // Checks still running, or not yet reported, at the watch make their end news.
-      for (const [options, checksPending] of [
-        [{}, undefined],
+      const cases: ReadonlyArray<readonly [HarnessOptions, boolean | undefined]> = [
+        [{ readChecksState: "pending" }, true],
+        [{ readChecksState: "failing" }, false],
+        [{}, false],
         [
           {
             readFailure: new PullRequestOperationError({
@@ -189,16 +192,15 @@ describe("PullRequestWatchService", () => {
           },
           undefined,
         ],
-        [{ readChecks: "passing" }, undefined],
-        [{ readChecks: "pending" }, true],
-        [{ readChecks: null }, true],
-      ] satisfies ReadonlyArray<readonly [HarnessOptions, true | undefined]>) {
+      ];
+      for (const [options, checksPending] of cases) {
         const harness = yield* makeHarness(options);
         const result = yield* harness.setWatching(true, {
           url: "https://github.com/t3tools/t3code/pull/9",
         });
         expect(result).toMatchObject({ number: 9, wasWatching: false });
-        expect(yield* Ref.get(harness.commands)).toMatchObject([
+        const commands = yield* Ref.get(harness.commands);
+        expect(commands).toMatchObject([
           {
             type: "thread.pull-request.watch",
             number: 9,
@@ -206,15 +208,15 @@ describe("PullRequestWatchService", () => {
             link: { url: "https://github.com/t3tools/t3code/pull/9", source: "agent" },
           },
         ]);
-        const [command] = yield* Ref.get(harness.commands);
-        expect(command && "checksPending" in command ? command.checksPending : undefined).toBe(
+        const [command] = commands;
+        expect(command?.type === "thread.pull-request.watch" ? command.checksPending : null).toBe(
           checksPending,
         );
       }
     }),
   );
 
-  it.effect("marks a client's new watch whose checks are still running", () =>
+  it.effect("seeds a client's new watch with whether its checks are still running", () =>
     Effect.gen(function* () {
       const watched = makeLink(2, {
         watch: {
@@ -235,14 +237,15 @@ describe("PullRequestWatchService", () => {
         detail: "The host is temporarily unavailable.",
       });
       for (const [options, watching, number, checksPending] of [
-        [{ readChecks: "pending" }, true, 1, true],
-        [{ readChecks: null }, true, 3, true],
-        [{ readChecks: "passing" }, true, 1, undefined],
-        [{ readFailure, readChecks: "pending" }, true, 1, undefined],
+        [{ readChecksState: "pending" }, true, 1, true],
+        [{ readChecksState: "pending" }, true, 3, true],
+        [{ readChecksState: "passing" }, true, 1, false],
+        [{}, true, 1, false],
+        [{ readFailure, readChecksState: "pending" }, true, 1, undefined],
         // An active watch keeps its own state, and an unwatch needs no read.
-        [{ readChecks: "pending" }, true, 2, undefined],
-        [{ readChecks: "pending" }, false, 1, undefined],
-      ] satisfies ReadonlyArray<readonly [HarnessOptions, boolean, number, true | undefined]>) {
+        [{ readChecksState: "pending" }, true, 2, undefined],
+        [{ readChecksState: "pending" }, false, 1, undefined],
+      ] satisfies ReadonlyArray<readonly [HarnessOptions, boolean, number, boolean | undefined]>) {
         const harness = yield* makeHarness({ ...options, thread });
         const command = yield* harness.withChecksAtStart(watching, number);
         expect("checksPending" in command ? command.checksPending : undefined).toBe(checksPending);
@@ -270,13 +273,12 @@ describe("PullRequestWatchService", () => {
     }),
   );
 
-  it.effect("rejects merged PRs and keeps an active watch usable without hosting access", () =>
+  it.effect("reports merged PRs without watching and keeps an active watch usable offline", () =>
     Effect.gen(function* () {
       const freshMerged = yield* makeHarness({ readState: "merged" });
-      const freshError = yield* freshMerged
-        .setWatching(true, { repository: "t3tools/t3code", number: 1 })
-        .pipe(Effect.flip);
-      expect(freshError).toMatchObject({ _tag: "PullRequestNotOpenError", state: "merged" });
+      expect(
+        yield* freshMerged.setWatching(true, { repository: "t3tools/t3code", number: 1 }),
+      ).toMatchObject({ number: 1, watching: false, wasWatching: false, state: "merged" });
       expect(yield* Ref.get(freshMerged.commands)).toEqual([]);
 
       const watch = {
@@ -299,10 +301,9 @@ describe("PullRequestWatchService", () => {
           makeLink(3, { headBranch: "watched", watch }),
         ]),
       });
-      const error = yield* harness
-        .setWatching(true, { repository: "t3tools/t3code", number: 1 })
-        .pipe(Effect.flip);
-      expect(error).toMatchObject({ _tag: "PullRequestNotOpenError", state: "merged" });
+      expect(
+        yield* harness.setWatching(true, { repository: "t3tools/t3code", number: 1 }),
+      ).toMatchObject({ number: 1, watching: false, state: "merged" });
       expect(
         yield* harness.setWatching(true, { repository: "t3tools/t3code", number: 3 }),
       ).toMatchObject({ watching: true, wasWatching: true });
@@ -316,15 +317,19 @@ describe("PullRequestWatchService", () => {
     }),
   );
 
-  it.effect("watches a pull request saved as closed, since it may have reopened", () =>
+  it.effect("re-reads a pull request saved as closed, and watches it only if it reopened", () =>
     Effect.gen(function* () {
       const closed = makeLink(1, { headBranch: "closed" });
-      const harness = yield* makeHarness({
-        readState: "closed",
-        thread: makeThread([
-          { ...closed, snapshot: closed.snapshot && { ...closed.snapshot, state: "closed" } },
-        ]),
-      });
+      const closedThread = makeThread([
+        { ...closed, snapshot: closed.snapshot && { ...closed.snapshot, state: "closed" } },
+      ]);
+      const stillClosed = yield* makeHarness({ readState: "closed", thread: closedThread });
+      expect(
+        yield* stillClosed.setWatching(true, { repository: "t3tools/t3code", number: 1 }),
+      ).toMatchObject({ watching: false, state: "closed" });
+      expect(yield* Ref.get(stillClosed.commands)).toEqual([]);
+
+      const harness = yield* makeHarness({ readState: "open", thread: closedThread });
       yield* harness.setWatching(true, { repository: "t3tools/t3code", number: 1 });
       expect(yield* Ref.get(harness.commands)).toMatchObject([
         { type: "thread.pull-request.watch", number: 1, watching: true },
