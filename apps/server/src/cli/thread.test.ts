@@ -315,6 +315,8 @@ it.effect("--wait lasts until background work the agent waits on wakes it and th
           status: "completed",
           timedOut: false,
           resultRun: { runId: wakeRun, status: "completed" },
+          // The wake run submits the result the first run owes, which the server stores there.
+          output: { head: "abc" },
         },
       ],
       // The wake run starts from a notification, which the messages view leaves out.
@@ -330,7 +332,12 @@ it.effect("--wait lasts until background work the agent waits on wakes it and th
         { threadId, runId, timeoutMs: 15_000, untilDelegatedWorkSettled: true },
       ],
     );
-    assert.deepStrictEqual(outcome, { type: "ended", runId: wakeRun, status: "completed" });
+    assert.deepStrictEqual(outcome, {
+      type: "ended",
+      runId: wakeRun,
+      status: "completed",
+      output: { head: "abc" },
+    });
   }),
 );
 
@@ -403,6 +410,7 @@ it.effect(
             status: "completed",
             timedOut: false,
             resultRun: { runId: sentRun, status: "failed" },
+            output: { head: "abc" },
           },
         ],
         t3_thread_read: laterRunReads(sentRun, [{ runId: sentRun, type: "user_message" }]),
@@ -412,6 +420,7 @@ it.effect(
         type: "ended",
         runId,
         status: "completed",
+        output: { head: "abc" },
       });
     }),
 );
