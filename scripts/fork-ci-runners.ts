@@ -75,16 +75,12 @@ for (const file of files) {
   if (mapped !== text) NodeFS.writeFileSync(file, mapped);
 }
 
-// Fork PRs target `fork`, which lags upstream's `main` until the next sync.
+// Fork PRs target `fork`, which lags upstream's `main` until the next sync. The budget check must
+// compare with the PR merge's first parent, its base branch, not a fresh fetch of `main`.
 const budgetFile = NodePath.join(workflowDir, "agent-context-budget.yml");
-const budget = NodeFS.readFileSync(budgetFile, "utf8");
-const upstreamFetch = "git fetch --quiet --depth=1 origin main\n";
-const forkFetch = 'git fetch --quiet --depth=1 origin "$GITHUB_BASE_REF"\n';
-if (budget.includes(upstreamFetch)) {
-  NodeFS.writeFileSync(budgetFile, budget.replace(upstreamFetch, forkFetch));
-} else if (!budget.includes(forkFetch)) {
+if (!NodeFS.readFileSync(budgetFile, "utf8").includes('git show "HEAD^1:$BUDGET"')) {
   throw new Error(
-    `${budgetFile}: upstream changed how it fetches main. Redo the base-branch edit.`,
+    `${budgetFile}: upstream changed how it reads the base budget. Make it read the PR's base branch.`,
   );
 }
 

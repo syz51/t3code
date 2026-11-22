@@ -94,15 +94,17 @@ installation for, to GitHub-hosted runners. It scales each mapped job's timeouts
 loses, because the hosted runners have 3 or 4. A reusable workflow takes the largest loss among
 the runners its callers pass. Each mapped line keeps upstream's label or timeout in a
 `# fork-mapped:` or `# fork-scaled:` comment, so a rerun rescales from upstream's value. The
-script also makes Agent Context Budget compare with the PR's base branch, because `fork` lags
-`main` until the sync.
+script also checks that Agent Context Budget compares with the PR's base branch, because `fork`
+lags `main` until the sync. Upstream's check reads the PR merge's first parent, which is that
+base.
 
 A `runs-on` or `timeout-minutes` line conflicts when upstream edits it. In each conflict hunk,
 keep upstream's side, then rerun the script. Do not check out a whole workflow file from either
 side: that drops either upstream's changes or the fork's bun edits elsewhere in the file.
 
-The script fails when a label names an OS it has no runner for, or when upstream changed the
-budget fetch. Add the runner to `hostedRunners` or redo the edit by hand.
+The script fails when a label names an OS it has no runner for, or when upstream changed how
+the budget check reads its base. Add the runner to `hostedRunners`, or make the check read the
+PR's base branch again.
 
 In `ci.yml`, the two background installs of the browser secret helper libraries call
 `.github/scripts/fork-apt-install.sh` under a `# fork-apt:` comment, where upstream calls

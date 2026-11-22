@@ -154,8 +154,10 @@ in a worktree gets a new worktree from its default branch, and any other
 project runs in its folder. Pass `--worktree <base-branch>` to choose the
 worktree's base, or `--local` to run in the project folder. An agent that
 starts a thread through the MCP tools without choosing a workspace gets the
-same default. `send` never interrupts: a busy thread gets the message as its
-next turn. Pass `-` as the message to read it from stdin.
+same default. Its title is the message's first line, or `--title`; add
+`--generate-title` to have it named from the message, as threads started in the
+app are. `send` never interrupts: a busy thread gets the message as its next
+turn. Pass `-` as the message to read it from stdin.
 
 To choose the model, pass `--provider <instance-id> --model <slug>`. Add
 `--option id=value` for each model option, such as `--option effort=high`.

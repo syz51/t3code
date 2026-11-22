@@ -374,15 +374,24 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (target: WatchTarget) =>
-    record(target, null, {
+  const giveUp = (target: WatchTarget, cause: Cause.Cause<PullRequestService.PullRequestError>) => {
+    const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+    // The message is the host's own setup instruction, never the subprocess output in `cause`.
+    const unusable =
+      error?._tag === "PullRequestUnavailableError" && error.reason !== "provider-unsupported"
+        ? error.message
+        : null;
+    return record(target, null, {
       endReason: "unreadable",
       wake: {
-        text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request only if it is still open.`,
+        text:
+          unusable === null
+            ? `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request only if it is still open.`
+            : `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because the T3 Code server cannot use the host: ${unusable} Fix that on the server, then call watch_pull_request only if it is still open.`,
         notification: {
           source: { kind: "monitor" },
           outcome: "failed",
-          summary: `#${target.link.number}: stopped watching, could not read it`,
+          summary: `#${target.link.number}: stopped watching, ${unusable === null ? "could not read it" : "host not set up on the server"}`,
         },
       },
     }).pipe(
@@ -390,6 +399,7 @@ export const make = Effect.gen(function* () {
       Effect.catch(() => record(target, null, { endReason: "unreadable" })),
       Effect.tap(() => ended(target, "unreadable")),
     );
+  };
 
   // One write when an unread stretch starts or changes cause, and one when it stops: a write per
   // sweep would push a link update to every client every two minutes.
@@ -722,7 +732,9 @@ export const make = Effect.gen(function* () {
       const failures = (readFailures.get(group.key) ?? 0) + 1;
       readFailures.set(group.key, failures);
       if (failures < READ_FAILURE_LIMIT) yield* noteSkip(unended, reason ?? "failed");
-      else if (yield* eachTarget(unended, giveUp)) readFailures.delete(group.key);
+      else if (yield* eachTarget(unended, (target) => giveUp(target, detailRead.cause))) {
+        readFailures.delete(group.key);
+      }
       return yield* Effect.failCause(detailRead.cause);
     }
     readFailures.delete(group.key);
