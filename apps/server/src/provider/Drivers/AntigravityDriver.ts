@@ -653,8 +653,23 @@ export const AntigravityDriver: ProviderDriver<
     });
     const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
       function* (cwd: string) {
+        yield* fileSystem
+          .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+          .pipe(
+            Effect.mapError(
+              () =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an isolated Antigravity text generation profile.",
+                }),
+            ),
+          );
         const isolatedProfileDirectory = yield* fileSystem
-          .makeTempDirectoryScoped({ prefix: "t3-antigravity-text-profile-" })
+          .makeTempDirectoryScoped({
+            directory: directories.runtimeTemp,
+            prefix: "text-profile-",
+          })
           .pipe(
             Effect.mapError(
               () =>

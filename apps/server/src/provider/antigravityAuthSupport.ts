@@ -551,12 +551,14 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     );
     for (const fileName of antigravityIsolatedAuthFiles) {
       const sourcePath = path.join(sourceAcpDirectory, fileName);
-      if (!(yield* fs.exists(sourcePath).pipe(Effect.orElseSucceed(() => false)))) continue;
-      const targetPath = path.join(acpDirectory, fileName);
-      const data = yield* fs
-        .readFile(sourcePath)
-        .pipe(Effect.orElseSucceed((): Uint8Array | undefined => undefined));
+      const data = yield* fs.readFile(sourcePath).pipe(
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+        Effect.mapError(() =>
+          authSupportError("The Antigravity helper profile credentials could not be read."),
+        ),
+      );
       if (data === undefined) continue;
+      const targetPath = path.join(acpDirectory, fileName);
       yield* fs
         .writeFile(targetPath, data)
         .pipe(

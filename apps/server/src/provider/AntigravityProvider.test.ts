@@ -457,6 +457,23 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         label: "Google AI Ultra",
       });
 
+      // Subsequent resumed sessions that omit _meta.antigravity.tier keep the known tier label.
+      yield* personal.provider.onSessionStarted(started);
+      expect((yield* personal.provider.snapshot.getSnapshot).auth).toEqual({
+        status: "authenticated",
+        type: "oauth-personal",
+        label: "Google AI Ultra",
+      });
+
+      // Signing out clears the tier so a different account falls back to the default label.
+      yield* personal.provider.onSignedOut;
+      yield* personal.provider.onSessionStarted(started);
+      expect((yield* personal.provider.snapshot.getSnapshot).auth).toEqual({
+        status: "authenticated",
+        type: "oauth-personal",
+        label: "Google account",
+      });
+
       const apiKey = yield* makeHarness({
         auth: { type: "gemini-api-key", label: "Gemini API key" },
       });

@@ -999,5 +999,98 @@ describe("extractAntigravityProposedPlanMarkdown", () => {
         profileDirectory,
       ),
     ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_append",
+          status: "completed",
+          data: { rawInput: { Path: planPath, Content: "## Extra", Append: true } },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_partial_diff",
+          status: "completed",
+          data: {
+            content: [{ type: "diff", path: planPath, oldText: "old", newText: "new snippet" }],
+          },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_truncated",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: planPath,
+              Content: "[Earlier output truncated]\n\n...tail only",
+            },
+          },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("prefers the full file on disk over truncated or partial tool updates and normalizes /private/tmp", () => {
+    const tmpProfile = "/tmp/t3-plan-profile";
+    const canonicalPlan = `/private${tmpProfile}/antigravity-acp/brain/sess-1/plan.md`;
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_long_edit",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: canonicalPlan,
+              Content: "[Earlier output truncated]\n\n...tail",
+              Append: true,
+            },
+          },
+        },
+        tmpProfile,
+        (filePath) => (filePath === canonicalPlan ? "  # Complete Plan From Disk  \n" : undefined),
+      ),
+    ).toBe("# Complete Plan From Disk");
+  });
+
+  it("folds ask_question schemas whose optional fields are explicitly null", () => {
+    const form = extractAntigravityElicitationForm({
+      sessionId: "session-1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        required: null,
+        properties: {
+          q1: {
+            type: "string",
+            title: "Pick one?",
+            description: null,
+            oneOf: [{ const: "1", title: "Yes", description: null }],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: null,
+            oneOf: null,
+          },
+        },
+      },
+    } as unknown as Parameters<typeof extractAntigravityElicitationForm>[0]);
+    expect(form?.questions).toHaveLength(1);
+    expect(form?.questions[0]?.allowCustomAnswer).toBe(true);
   });
 });

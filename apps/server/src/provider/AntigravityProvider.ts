@@ -446,7 +446,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             type: options.auth?.type ?? "oauth-personal",
             label:
               (options.auth === undefined || options.auth.type === "oauth-personal"
-                ? antigravityTierLabel(started)
+                ? (antigravityTierLabel(started) ??
+                  (draft.auth.status === "authenticated" ? draft.auth.label : undefined))
                 : undefined) ??
               options.auth?.label ??
               "Google account",

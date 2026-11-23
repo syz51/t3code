@@ -140,19 +140,19 @@ function questionLabel(option: EffectAcpSchema.PermissionOption): string {
 
 const AntigravityElicitationFormSchema = Schema.Struct({
   properties: Schema.Record(Schema.String, Schema.Unknown),
-  required: Schema.optional(Schema.Array(Schema.String)),
+  required: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
 });
 const isAntigravityElicitationFormSchema = Schema.is(AntigravityElicitationFormSchema);
 const AntigravityChoiceOption = Schema.Struct({
   const: TrimmedNonEmptyString,
   title: TrimmedNonEmptyString,
-  description: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.NullOr(Schema.String)),
 });
 const isAntigravitySingleChoiceField = Schema.is(
   Schema.Struct({
     type: Schema.Literal("string"),
     title: TrimmedNonEmptyString,
-    description: Schema.optional(Schema.String),
+    description: Schema.optional(Schema.NullOr(Schema.String)),
     oneOf: Schema.NonEmptyArray(AntigravityChoiceOption),
   }),
 );
@@ -160,7 +160,7 @@ const isAntigravityMultiChoiceField = Schema.is(
   Schema.Struct({
     type: Schema.Literal("array"),
     title: TrimmedNonEmptyString,
-    description: Schema.optional(Schema.String),
+    description: Schema.optional(Schema.NullOr(Schema.String)),
     items: Schema.Struct({
       anyOf: Schema.NonEmptyArray(AntigravityChoiceOption),
     }),
@@ -169,8 +169,8 @@ const isAntigravityMultiChoiceField = Schema.is(
 const isAntigravityPlainTextField = Schema.is(
   Schema.Struct({
     type: Schema.Literal("string"),
-    title: Schema.optional(Schema.String),
-    description: Schema.optional(Schema.String),
+    title: Schema.optional(Schema.NullOr(Schema.String)),
+    description: Schema.optional(Schema.NullOr(Schema.String)),
   }),
 );
 
@@ -188,15 +188,13 @@ function splitQuestionAttachments(value: string) {
 
 function isPlainStringProperty(field: unknown): field is {
   readonly type: "string";
-  readonly title?: string;
-  readonly description?: string;
+  readonly title?: string | null;
+  readonly description?: string | null;
 } {
+  if (!isAntigravityPlainTextField(field)) return false;
+  const record: Readonly<Record<string, unknown>> = field;
   return (
-    isAntigravityPlainTextField(field) &&
-    !("enum" in field) &&
-    !("oneOf" in field) &&
-    !("anyOf" in field) &&
-    !("items" in field)
+    record.enum == null && record.oneOf == null && record.anyOf == null && record.items == null
   );
 }
 
@@ -864,7 +862,9 @@ export function antigravitySubagentOutput(toolCall: AcpToolCallState): string | 
 
 function normalizeBrainPath(value: string): string {
   const normalized = value.replaceAll("\\", "/").replace(/\/+$/, "");
-  return normalized.startsWith("/private/var/") ? normalized.slice("/private".length) : normalized;
+  return normalized.startsWith("/private/var/") || normalized.startsWith("/private/tmp/")
+    ? normalized.slice("/private".length)
+    : normalized;
 }
 
 const ANTIGRAVITY_BRAIN_PLAN_FILES = new Set(["plan.md", "implementation_plan.md"]);
@@ -896,8 +896,13 @@ function isAntigravityBrainPlanPath(
 export function extractAntigravityProposedPlanMarkdown(
   toolCall: AcpToolCallState,
   profileDirectory: string,
+  readPlanFile: (filePath: string) => string | undefined = readAntigravityPreEditFile,
 ): string | undefined {
   if (toolCall.status !== "completed") return undefined;
+  const readDiskPlan = (filePath: string): string | undefined => {
+    const onDisk = readPlanFile(filePath)?.trim();
+    return onDisk && onDisk.length > 0 ? onDisk : undefined;
+  };
   const rawInput = Predicate.isObject(toolCall.data.rawInput) ? toolCall.data.rawInput : undefined;
   if (rawInput !== undefined) {
     const filePath =
@@ -906,15 +911,20 @@ export function extractAntigravityProposedPlanMarkdown(
         : typeof rawInput.path === "string"
           ? rawInput.path
           : undefined;
-    const content =
-      typeof rawInput.Content === "string"
-        ? rawInput.Content
-        : typeof rawInput.content === "string"
-          ? rawInput.content
-          : undefined;
-    if (isAntigravityBrainPlanPath(filePath, profileDirectory) && content !== undefined) {
-      const trimmed = content.trim();
-      if (trimmed.length > 0) return trimmed;
+    if (filePath !== undefined && isAntigravityBrainPlanPath(filePath, profileDirectory)) {
+      const fromDisk = readDiskPlan(filePath);
+      if (fromDisk !== undefined) return fromDisk;
+      const isAppend = rawInput.Append === true || rawInput.append === true;
+      const content =
+        typeof rawInput.Content === "string"
+          ? rawInput.Content
+          : typeof rawInput.content === "string"
+            ? rawInput.content
+            : undefined;
+      if (!isAppend && content !== undefined && !content.startsWith(TOOL_TEXT_TRUNCATED)) {
+        const trimmed = content.trim();
+        if (trimmed.length > 0) return trimmed;
+      }
     }
   }
   const blocks = toolCall.data.content;
@@ -922,8 +932,14 @@ export function extractAntigravityProposedPlanMarkdown(
     for (const block of blocks) {
       if (!Predicate.isObject(block) || block.type !== "diff") continue;
       const filePath = typeof block.path === "string" ? block.path : undefined;
+      if (filePath === undefined || !isAntigravityBrainPlanPath(filePath, profileDirectory)) {
+        continue;
+      }
+      const fromDisk = readDiskPlan(filePath);
+      if (fromDisk !== undefined) return fromDisk;
+      const hasOldText = typeof block.oldText === "string" && block.oldText.length > 0;
       const newText = typeof block.newText === "string" ? block.newText : undefined;
-      if (isAntigravityBrainPlanPath(filePath, profileDirectory) && newText !== undefined) {
+      if (!hasOldText && newText !== undefined && !newText.startsWith(TOOL_TEXT_TRUNCATED)) {
         const trimmed = newText.trim();
         if (trimmed.length > 0) return trimmed;
       }
