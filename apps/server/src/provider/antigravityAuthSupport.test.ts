@@ -1,6 +1,7 @@
 import * as Sink from "effect/Sink";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -76,7 +77,9 @@ describe("Antigravity process environment", () => {
       BROWSER: "open-real-browser",
       browser: "another-real-browser",
       PYTHONUNBUFFERED: "0",
-      ELECTRON_RUN_AS_NODE: "0",
+      ELECTRON_RUN_AS_NODE: "1",
+      electron_run_as_node: "0",
+      T3_ANTIGRAVITY_AUTH_URL: "https://stale.invalid",
       CHROME_CRASHPAD_PIPE_NAME: "\\\\.\\pipe\\crashpad_50144_ZUJNJELFHHXPBIRT",
       chrome_crashpad_pipe_name: "\\\\.\\pipe\\crashpad_stale_alias",
       CUSTOM_SETTING: "keep-this",
@@ -105,10 +108,10 @@ describe("Antigravity process environment", () => {
         AGY_CLI_DISABLE_AUTO_UPDATE: "1",
         BROWSER: profile.browserCommand,
         PYTHONUNBUFFERED: "1",
-        ELECTRON_RUN_AS_NODE: "1",
         TMPDIR: profile.tempDirectory,
       },
     });
+    expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
     expect(
       buildAntigravityAcpSpawnInput({
         installation: { executablePath: "/usr/bin/agy" },
@@ -908,17 +911,167 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
-      for (const platform of ["linux", "win32"] as const) {
-        const profileDirectory = path.join(temporaryDirectory, platform);
-        const result = yield* prepareAntigravityProfile({
-          profileDirectory,
-          platform,
-          runtimeExecutablePath: platform === "win32" ? "C:/bad;path/node.exe" : "/bad:path/node",
-        }).pipe(Effect.result);
+      const cases = [
+        {
+          platform: "linux" as const,
+          profileDirectory: path.join(temporaryDirectory, "linux-colon"),
+          runtimeExecutablePath: "/bad:path/node",
+        },
+        {
+          platform: "linux" as const,
+          profileDirectory: path.join(temporaryDirectory, "linux-equals"),
+          runtimeExecutablePath: "/bad=path/node",
+        },
+        {
+          platform: "win32" as const,
+          profileDirectory: path.join(temporaryDirectory, "win32-exe-semi"),
+          runtimeExecutablePath: "C:/bad;path/node.exe",
+        },
+        {
+          platform: "win32" as const,
+          profileDirectory: path.join(temporaryDirectory, "win32;dir", "profile"),
+          runtimeExecutablePath: "C:/good/node.exe",
+        },
+      ];
+      for (const testCase of cases) {
+        const result = yield* prepareAntigravityProfile(testCase).pipe(Effect.result);
         expect(Result.isFailure(result)).toBe(true);
-        expect(yield* fs.exists(profileDirectory)).toBe(false);
+        expect(yield* fs.exists(testCase.profileDirectory)).toBe(false);
       }
     }),
+  );
+
+  caTest(
+    "omits ELECTRON_RUN_AS_NODE from ACP spawns while preflighting a POSIX helper that requires it",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const fakeElectron = path.join(temporaryDirectory, "fake-electron");
+        yield* fs.writeFileString(
+          fakeElectron,
+          `#!/bin/sh\n[ "\${ELECTRON_RUN_AS_NODE:-}" = "1" ] || exit 42\nexec '${process.execPath.replaceAll("'", `'"'"'`)}' "$@"\n`,
+        );
+        yield* fs.chmod(fakeElectron, 0o755);
+
+        const baseEnv = { ELECTRON_RUN_AS_NODE: "1" };
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          userHome: path.join(temporaryDirectory, "home"),
+          runtimeExecutablePath: fakeElectron,
+          platform: "linux",
+          baseEnv,
+        });
+        expect(profile.browserCommand).toContain("'/usr/bin/env' 'ELECTRON_RUN_AS_NODE=1'");
+        expect(profile.browserCommand).not.toContain(":");
+
+        const spawn = buildAntigravityAcpSpawnInput({
+          installation: { executablePath: "/usr/bin/agy" },
+          profile,
+          cwd: temporaryDirectory,
+          baseEnv,
+        });
+        expect(spawn.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+        expect(spawn.env?.BROWSER).toBe(profile.browserCommand);
+      }),
+  );
+
+  it.effect(
+    "writes a Windows PowerShell browser helper with ELECTRON_RUN_AS_NODE=1 and omits it from ACP spawns",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const spawnedCommands: Array<ChildProcess.StandardCommand> = [];
+        const helper = preflightHelper(Effect.void);
+        const inspectingSpawner = ChildProcessSpawner.make((command) => {
+          if (command._tag === "StandardCommand") {
+            spawnedCommands.push(command);
+          }
+          return helper.spawner.spawn(command);
+        });
+        const baseEnv = {
+          ELECTRON_RUN_AS_NODE: "1",
+        };
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          userHome: path.join(temporaryDirectory, "home"),
+          runtimeExecutablePath: "C:\\Users\\O\u2019Connor\\T3 Code\\T3 Code.exe",
+          platform: "win32",
+          baseEnv,
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, inspectingSpawner),
+        );
+
+        expect(spawnedCommands).toHaveLength(1);
+        expect(spawnedCommands[0]?.command).toBe(
+          "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        );
+        expect(spawnedCommands[0]?.args).toEqual([
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          expect.stringMatching(/browser-helper\.ps1$/),
+          "https://example.invalid/t3-antigravity-browser-preflight",
+        ]);
+        expect(spawnedCommands[0]?.options.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect(profile.browserCommand).not.toContain(";");
+        expect(profile.browserCommand).toContain(
+          "'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'",
+        );
+        expect(profile.browserCommand).toContain("'-File'");
+        expect(profile.browserCommand).toContain("browser-helper.ps1");
+        expect(profile.browserCommand).toContain("'%s'");
+
+        const scriptPath = path.join(profile.acpDirectory, "browser-helper.ps1");
+        const scriptBytes = yield* fs.readFile(scriptPath);
+        expect(Array.from(scriptBytes.slice(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+        const script = yield* fs.readFileString(scriptPath);
+        expect(script).toContain("$env:ELECTRON_RUN_AS_NODE = '1'");
+        expect(script).toContain("$env:T3_ANTIGRAVITY_AUTH_URL = $Url");
+        expect(script).toContain("'C:\\Users\\O\u2019\u2019Connor\\T3 Code\\T3 Code.exe'");
+        expect(script).not.toContain('"');
+
+        // Verify the embedded JS helper captures T3_ANTIGRAVITY_AUTH_URL when invoked without argv[1].
+        const helperMatch = /'-e' '((?:''|[^'])+)'/.exec(script);
+        expect(helperMatch).not.toBeNull();
+        const helperCode = helperMatch![1]!.replaceAll("''", "'");
+        const nodeResult = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const child = yield* spawner.spawn(
+              ChildProcess.make(process.execPath, ["-e", helperCode], {
+                env: { T3_ANTIGRAVITY_AUTH_URL: authorizationUrl },
+                extendEnv: false,
+                shell: false,
+              }),
+            );
+            const stderr = yield* Stream.mkString(Stream.decodeText(child.stderr));
+            const exitCode = yield* child.exitCode;
+            return { stderr, exitCode: Number(exitCode) };
+          }),
+        );
+        expect(nodeResult).toEqual({
+          exitCode: 0,
+          stderr: `${ANTIGRAVITY_AUTH_BROWSER_MARKER}${encodeUnknownJson(authorizationUrl)}\n`,
+        });
+
+        const spawn = buildAntigravityAcpSpawnInput({
+          installation: { executablePath: "C:\\release\\agy.exe" },
+          profile,
+          cwd: temporaryDirectory,
+          baseEnv,
+        });
+        expect(spawn.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+        expect(spawn.env?.BROWSER).toBe(profile.browserCommand);
+      }),
   );
 
   it.effect(
