@@ -23,6 +23,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -2784,10 +2785,14 @@ describe("AntigravityAdapterV2 session system prompt", () => {
                 messageText: `turn ${ordinal}`,
               }),
             );
-            yield* Stream.fromQueue(events).pipe(
+            const terminal = yield* Stream.fromQueue(events).pipe(
               Stream.filter((event) => event.type === "turn.terminal"),
               Stream.runHead,
             );
+            assert.isTrue(Option.isSome(terminal));
+            if (Option.isSome(terminal)) {
+              assert.equal(terminal.value.status, "completed");
+            }
           });
 
         // Staying in unrestricted full-access reuses the existing runtime.
@@ -2805,6 +2810,12 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         // Adding a read-only sandbox respawns without --dangerously-skip-permissions.
         yield* runTurn(4, sandboxedFullAccessPolicy);
         assert.deepEqual(skipPermissionsCalls, [true, false, true, false]);
+
+        const methods = (yield* fileSystem.readFileString(requestLog))
+          .trim()
+          .split("\n")
+          .map((line) => (JSON.parse(line) as { method?: string }).method);
+        assert.equal(methods.filter((method) => method === "session/resume").length, 3);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

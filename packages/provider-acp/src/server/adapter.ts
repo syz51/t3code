@@ -2904,16 +2904,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           runtimeGeneration: number,
           agentRequests: Set<string>,
           mcpContext: AcpMcpContext,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
           resumeSessionId?: string,
           onTermination: AcpAdapterV2RuntimeInput["onTermination"] = () =>
             handleRuntimeTerminationAtGeneration(runtimeGeneration),
         ): AcpAdapterV2RuntimeInput => {
+          const workspace = runtimePolicy.workspace ?? input.runtimePolicy.workspace;
           return {
-            cwd: latestRuntimePolicy.cwd ?? process.cwd(),
-            runtimePolicy: latestRuntimePolicy,
-            ...(latestRuntimePolicy.workspace === undefined
-              ? {}
-              : { extraRoots: latestRuntimePolicy.workspace.extraRoots }),
+            cwd: runtimePolicy.cwd ?? input.runtimePolicy.cwd ?? process.cwd(),
+            runtimePolicy,
+            ...(workspace === undefined ? {} : { extraRoots: workspace.extraRoots }),
             mcpServers: mcpContext.servers,
             acpMcpServers: mcpContext.acpServers,
             httpMcpServers: mcpContext.httpServers,
@@ -7847,7 +7847,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const runtimePolicyForSpawn = latestRuntimePolicy;
           runtime = yield* flavor
             .makeRuntime(
-              makeRuntimeInput(runtimeGeneration, openAgentRequests, mcpContext, resumeSessionId),
+              makeRuntimeInput(
+                runtimeGeneration,
+                openAgentRequests,
+                mcpContext,
+                runtimePolicyForSpawn,
+                resumeSessionId,
+              ),
             )
             .pipe(
               Effect.provideService(Scope.Scope, runtimeScope),
@@ -7920,17 +7926,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             Effect.sync(() => {
               stagedSessionUpdates.push(notification);
             });
-          const replacementPolicyForSpawn = latestRuntimePolicy;
           let replacementMcpBridge: AcpMcpOverAcpBridge | undefined;
           const startup = Effect.gen(function* () {
             const mcpContext = yield* readMcpContext(threadId);
             replacementMcpBridge = yield* makeRuntimeMcpBridge(mcpContext, replacementScope);
+            const replacementPolicyForSpawn = latestRuntimePolicy;
             const replacementRuntime = yield* flavor
               .makeRuntime(
                 makeRuntimeInput(
                   replacementGeneration,
                   replacementAgentRequests,
                   mcpContext,
+                  replacementPolicyForSpawn,
                   undefined,
                   handleCandidateTermination,
                 ),
@@ -7947,7 +7954,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             );
             yield* wireAcpRuntimeMcpHandlers(replacementRuntime, replacementMcpBridge);
             const started = yield* replacementRuntime.start();
-            return { replacementRuntime, started };
+            return { replacementRuntime, started, replacementPolicyForSpawn };
           });
           const replacementExit = yield* Effect.exit(
             (flavor.withRuntimeStartup?.(startup) ?? startup).pipe(
@@ -7991,7 +7998,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   }
                   yield* quarantineNativeTransportAtGeneration(previousGeneration);
                   runtime = replacementExit.value.replacementRuntime;
-                  spawnedRuntimePolicy = replacementPolicyForSpawn;
+                  spawnedRuntimePolicy = replacementExit.value.replacementPolicyForSpawn;
                   runtimeScope = replacementScope;
                   runtimeMcpBridge = replacementMcpBridge;
                   openAgentRequests = replacementAgentRequests;
