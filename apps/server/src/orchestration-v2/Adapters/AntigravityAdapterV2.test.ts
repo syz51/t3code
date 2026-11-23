@@ -3,9 +3,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  EnvironmentId,
   MessageId,
   NodeId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   RunAttemptId,
@@ -195,6 +197,11 @@ describe("AntigravityAdapterV2 flavor", () => {
       action: "accept",
       content: { q1_other: "Canary" },
     });
+  });
+
+  it("enables HTTP MCP transport with deferred tool exposure", () => {
+    assert.isTrue(flavor.mcpOverHttp);
+    assert.isTrue(flavor.deferMcpTools);
   });
 });
 
@@ -2816,6 +2823,114 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           .split("\n")
           .map((line) => (JSON.parse(line) as { method?: string }).method);
         assert.equal(methods.filter((method) => method === "session/resume").length, 3);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "sends t3-tool-exposure: deferred on HTTP MCP servers for session/new and session/resume",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-defer-mcp-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const instanceId = ProviderInstanceId.make("antigravity-defer-mcp-test");
+        const threadId = ThreadId.make("thread-antigravity-defer-mcp");
+        const endpoint = "http://127.0.0.1:41999/mcp";
+        const mcpSession = {
+          environmentId: EnvironmentId.make("env-antigravity-defer-mcp"),
+          threadId,
+          providerSessionId: "provider-session-antigravity-defer-mcp",
+          providerInstanceId: instanceId,
+          endpoint,
+          browserToolsAvailable: false,
+        };
+        yield* mcpSessions.set({ ...mcpSession, authorizationHeader: "Bearer opened-token" });
+
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_MCP_HTTP: "1",
+                  T3_ACP_SESSION_LIFECYCLE: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                },
+              },
+            }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-defer-cwd-" });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-defer-mcp"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* mcpSessions.set({ ...mcpSession, authorizationHeader: "Bearer rotated-token" });
+        yield* session.resumeThread({
+          providerThread: {
+            ...providerThread,
+            nativeThreadRef: {
+              driver: ProviderDriverKind.make("antigravity"),
+              nativeId: "mock-session-2",
+              strength: "strong",
+            },
+          },
+        });
+
+        const requests = (yield* fileSystem.readFileString(requestLog))
+          .trim()
+          .split("\n")
+          .map(
+            (line) => JSON.parse(line) as { method?: string; params?: { mcpServers?: unknown } },
+          );
+        const expectedHttpServer = (authorization: string) => [
+          {
+            type: "http",
+            name: "t3-code",
+            url: endpoint,
+            headers: [
+              { name: "Authorization", value: authorization },
+              { name: "t3-tool-exposure", value: "deferred" },
+            ],
+          },
+        ];
+        assert.deepEqual(
+          requests.find((request) => request.method === "session/new")?.params?.mcpServers,
+          expectedHttpServer("Bearer opened-token"),
+        );
+        assert.deepEqual(
+          requests.find((request) => request.method === "session/resume")?.params?.mcpServers,
+          expectedHttpServer("Bearer rotated-token"),
+        );
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
