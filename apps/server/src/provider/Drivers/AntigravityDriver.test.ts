@@ -703,4 +703,49 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(yield* fs.exists(legacyRoot)).toBe(false);
       }),
   );
+
+  it.effect.skipIf(windowsHost)(
+    "runs text generation in an isolated profile under runtimeTemp even with hooks and MCP configured",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const configDir = h.path.join(h.profileDirectory, "config");
+        const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
+        yield* h.fs.makeDirectory(configDir, { recursive: true });
+        yield* h.fs.makeDirectory(acpDir, { recursive: true });
+        yield* h.fs.writeFileString(
+          h.path.join(configDir, "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"false"}]}}',
+        );
+        yield* h.fs.writeFileString(
+          h.path.join(configDir, "mcp_config.json"),
+          '{"mcpServers":{"bad":{"command":"false"}}}',
+        );
+        yield* h.fs.writeFileString(
+          h.path.join(acpDir, "antigravity-oauth-token"),
+          '{"token":{"access_token":"tok"}}',
+        );
+        yield* h.refresh();
+        expect((yield* h.instance.snapshot.getSnapshot).supportsTextGeneration).toBe(true);
+
+        const launchesBefore = h.launches.length;
+        yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name this thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.ignore);
+        const helperLaunch = h.launches
+          .slice(launchesBefore)
+          .find((launch) => launch.tempDirectory !== undefined);
+        expect(helperLaunch).toBeDefined();
+        expect(helperLaunch?.profileDirectory).not.toBe(h.profileDirectory);
+        expect(helperLaunch?.profileDirectory).toContain("text-profile-");
+        if (helperLaunch?.profileDirectory) {
+          expect(yield* h.fs.exists(helperLaunch.profileDirectory)).toBe(false);
+        }
+        yield* h.assertClosed;
+      }),
+  );
 });

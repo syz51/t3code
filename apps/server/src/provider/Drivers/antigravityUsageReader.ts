@@ -132,7 +132,7 @@ const MODEL_IDS: Record<number, string> = {
 // Effort and routing variants share the base model's price.
 export const antigravityRateModel = (model: string) => {
   const base = model.replace(
-    /-(?:extra-low|low|medium|high|tiered|control|thinking|agent|orchestrator)$/,
+    /-(?:extra-low|low|medium|high|xhigh|tiered|control|thinking|agent|orchestrator)$/,
     "",
   );
   return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
@@ -141,7 +141,7 @@ export const antigravityRateModel = (model: string) => {
       ? "gemini-3.7-flash"
       : model === "gemini-pro-orchestrator-neon"
         ? "gemini-4-neon"
-        : model === "gemini-pro-orchestrator-g1-pro"
+        : model === "gemini-pro-orchestrator-g1-pro" || model === "gemini-pro-orchestrator-argon"
           ? "gemini-4-argon"
           : base === "gemini-3-flash"
             ? "gemini-3-flash-preview"

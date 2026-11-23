@@ -1,8 +1,10 @@
 import type {
+  OrchestrationV2UserInputQuestion,
   ProviderApprovalOption,
   ProviderUserInputAnswers,
   UserInputQuestion,
 } from "@t3tools/contracts";
+import { TrimmedNonEmptyString } from "@t3tools/contracts";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -125,11 +127,293 @@ function copyBoundedText(text: string): string {
   return Buffer.from(text, "utf16le").toString("utf16le");
 }
 
+function boundHead(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const head = text.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/u, "");
+  return copyBoundedText(`${head}...`);
+}
+
 function questionLabel(option: EffectAcpSchema.PermissionOption): string {
   const label = option.name.trim() || option.optionId;
-  return label.length > QUESTION_LABEL_LIMIT
-    ? copyBoundedText(`${label.slice(0, QUESTION_LABEL_LIMIT - 3)}...`)
-    : label;
+  return boundHead(label, QUESTION_LABEL_LIMIT);
+}
+
+const AntigravityElicitationFormSchema = Schema.Struct({
+  properties: Schema.Record(Schema.String, Schema.Unknown),
+  required: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+});
+const isAntigravityElicitationFormSchema = Schema.is(AntigravityElicitationFormSchema);
+const AntigravityChoiceOption = Schema.Struct({
+  const: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  description: Schema.optional(Schema.NullOr(Schema.String)),
+});
+const isAntigravitySingleChoiceField = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("string"),
+    title: TrimmedNonEmptyString,
+    description: Schema.optional(Schema.NullOr(Schema.String)),
+    oneOf: Schema.NonEmptyArray(AntigravityChoiceOption),
+  }),
+);
+const isAntigravityMultiChoiceField = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("array"),
+    title: TrimmedNonEmptyString,
+    description: Schema.optional(Schema.NullOr(Schema.String)),
+    items: Schema.Struct({
+      anyOf: Schema.NonEmptyArray(AntigravityChoiceOption),
+    }),
+  }),
+);
+const isAntigravityPlainTextField = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("string"),
+    title: Schema.optional(Schema.NullOr(Schema.String)),
+    description: Schema.optional(Schema.NullOr(Schema.String)),
+  }),
+);
+
+const ANTIGRAVITY_QUESTION_ID = /^q\d+$/;
+const ANTIGRAVITY_OTHER_SUFFIX = "_other";
+const ATTACHMENT_REFERENCE_PATTERN = /^Attached (?:image|file) "(?:\\.|[^"\\\r\n])*": "/;
+
+function splitQuestionAttachments(value: string) {
+  const marker = value.indexOf("\n\n");
+  if (marker < 0) return undefined;
+  const suffix = value.slice(marker);
+  if (!ATTACHMENT_REFERENCE_PATTERN.test(suffix.slice(2))) return undefined;
+  return { prefix: value.slice(0, marker), suffix };
+}
+
+function isPlainStringProperty(field: unknown): field is {
+  readonly type: "string";
+  readonly title?: string | null;
+  readonly description?: string | null;
+} {
+  if (!isAntigravityPlainTextField(field)) return false;
+  const record: Readonly<Record<string, unknown>> = field;
+  return (
+    record.enum == null && record.oneOf == null && record.anyOf == null && record.items == null
+  );
+}
+
+/**
+ * Antigravity 1.5's `ask_question` sends `qN` (with the question text in `title`) plus an optional
+ * `qN_other` free-text companion. Fold each pair into one T3 question so clients show a single
+ * question with an "Other" input instead of two steps, and map human-readable labels back to `const`.
+ */
+export function extractAntigravityElicitationForm(
+  request: EffectAcpSchema.CreateElicitationRequest,
+):
+  | {
+      readonly questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+      readonly respond: (
+        answers: ProviderUserInputAnswers,
+      ) => EffectAcpSchema.CreateElicitationResponse;
+    }
+  | undefined {
+  if (request.mode !== "form" || !isAntigravityElicitationFormSchema(request.requestedSchema)) {
+    return undefined;
+  }
+  const { properties, required: requiredKeys } = request.requestedSchema;
+  const required = new Set(requiredKeys ?? []);
+  const entries = Object.entries(properties);
+  if (entries.length === 0) return undefined;
+
+  type ParsedOption = {
+    readonly constValue: string;
+    readonly submittedValue: string;
+    readonly label: string;
+    readonly description: string;
+    readonly explicitValue: string | undefined;
+  };
+  type ParsedQuestion = {
+    readonly id: string;
+    readonly companionId: string | undefined;
+    readonly multiSelect: boolean;
+    readonly title: string;
+    readonly description: string | undefined;
+    readonly options: ReadonlyArray<ParsedOption>;
+  };
+
+  const parsed: Array<ParsedQuestion> = [];
+  let choiceCount = 0;
+
+  for (const [id, field] of entries) {
+    if (!ANTIGRAVITY_QUESTION_ID.test(id)) {
+      const owner = id.endsWith(ANTIGRAVITY_OTHER_SUFFIX)
+        ? id.slice(0, -ANTIGRAVITY_OTHER_SUFFIX.length)
+        : undefined;
+      if (
+        owner === undefined ||
+        !ANTIGRAVITY_QUESTION_ID.test(owner) ||
+        !Object.hasOwn(properties, owner)
+      ) {
+        return undefined;
+      }
+      continue;
+    }
+    const companionId = `${id}${ANTIGRAVITY_OTHER_SUFFIX}`;
+    const hasCompanion = Object.hasOwn(properties, companionId);
+    if (hasCompanion) {
+      if (required.has(id) || required.has(companionId)) return undefined;
+      if (!isPlainStringProperty(properties[companionId])) return undefined;
+    }
+
+    const rawChoices = isAntigravitySingleChoiceField(field)
+      ? {
+          multiSelect: false,
+          title: field.title,
+          description: field.description,
+          items: field.oneOf,
+        }
+      : isAntigravityMultiChoiceField(field)
+        ? {
+            multiSelect: true,
+            title: field.title,
+            description: field.description,
+            items: field.items.anyOf,
+          }
+        : isPlainStringProperty(field) && field.title?.trim()
+          ? { multiSelect: false, title: field.title, description: field.description, items: [] }
+          : undefined;
+    if (rawChoices === undefined) return undefined;
+
+    const seenConst = new Set<string>();
+    const labelCounts = new Map<string, number>();
+    const normalizedItems = rawChoices.items.map((option) => {
+      const label = boundHead(option.title.trim(), QUESTION_LABEL_LIMIT);
+      const description = option.description?.trim()
+        ? boundHead(option.description.trim(), QUESTION_LABEL_LIMIT)
+        : label;
+      return { constValue: option.const, label, description };
+    });
+    for (const item of normalizedItems) {
+      if (seenConst.has(item.constValue)) return undefined;
+      seenConst.add(item.constValue);
+      labelCounts.set(item.label, (labelCounts.get(item.label) ?? 0) + 1);
+    }
+    const hasDuplicateLabels = [...labelCounts.values()].some((count) => count > 1);
+    const options: ParsedOption[] = normalizedItems.map((item) => ({
+      ...item,
+      explicitValue: hasDuplicateLabels ? item.constValue : undefined,
+      submittedValue: hasDuplicateLabels ? item.constValue : item.label,
+    }));
+    if (options.length > 0) choiceCount += 1;
+    parsed.push({
+      id,
+      companionId: hasCompanion ? companionId : undefined,
+      multiSelect: rawChoices.multiSelect,
+      title: rawChoices.title.trim(),
+      description: rawChoices.description?.trim() || undefined,
+      options,
+    });
+  }
+
+  if (choiceCount === 0) return undefined;
+
+  const questions: OrchestrationV2UserInputQuestion[] = parsed.map((item, index) => {
+    const hasDistinctDescription =
+      item.description !== undefined && item.description !== item.title;
+    return {
+      id: item.id,
+      header: hasDistinctDescription
+        ? boundHead(item.title, QUESTION_LABEL_LIMIT)
+        : parsed.length === 1
+          ? "Question"
+          : `Question ${index + 1}`,
+      question: boundHead(hasDistinctDescription ? item.description : item.title, TOOL_TEXT_LIMIT),
+      options: item.options.map((option) => ({
+        label: option.label,
+        description: option.description,
+        ...(option.explicitValue === undefined ? {} : { value: option.explicitValue }),
+      })),
+      ...(item.multiSelect ? { multiSelect: true } : {}),
+      allowCustomAnswer: item.companionId !== undefined || item.options.length === 0,
+    };
+  });
+
+  return {
+    questions,
+    respond: (answers) => {
+      const contentEntries: Array<[string, EffectAcpSchema.ElicitationContentValue]> = [];
+      for (const item of parsed) {
+        const answer = Object.hasOwn(answers, item.id) ? answers[item.id] : undefined;
+        const optionBySubmitted = new Map(
+          item.options.map((option) => [option.submittedValue, option]),
+        );
+
+        if (item.options.length === 0) {
+          if (typeof answer !== "string" || answer.trim().length === 0) return { action: "cancel" };
+          contentEntries.push([item.id, answer]);
+          continue;
+        }
+
+        if (item.multiSelect) {
+          if (Array.isArray(answer)) {
+            const selected: string[] = [];
+            const seen = new Set<string>();
+            const attachments: string[] = [];
+            for (const entry of answer) {
+              if (typeof entry !== "string") return { action: "cancel" };
+              const matched = optionBySubmitted.get(entry);
+              if (matched !== undefined) {
+                if (!seen.has(matched.constValue)) {
+                  seen.add(matched.constValue);
+                  selected.push(matched.constValue);
+                }
+              } else if (ATTACHMENT_REFERENCE_PATTERN.test(entry)) {
+                attachments.push(entry);
+              } else {
+                return { action: "cancel" };
+              }
+            }
+            if (selected.length === 0 && attachments.length === 0) return { action: "cancel" };
+            if (selected.length > 0) contentEntries.push([item.id, selected]);
+            if (attachments.length > 0) {
+              if (item.companionId === undefined) {
+                if (selected.length === 0) return { action: "cancel" };
+              } else {
+                contentEntries.push([item.companionId, attachments.join("\n")]);
+              }
+            }
+            continue;
+          }
+          if (
+            typeof answer !== "string" ||
+            answer.trim().length === 0 ||
+            item.companionId === undefined
+          ) {
+            return { action: "cancel" };
+          }
+          contentEntries.push([item.companionId, answer]);
+          continue;
+        }
+
+        if (typeof answer !== "string") return { action: "cancel" };
+        const exact = optionBySubmitted.get(answer);
+        if (exact !== undefined) {
+          contentEntries.push([item.id, exact.constValue]);
+          continue;
+        }
+        if (answer.trim().length === 0) return { action: "cancel" };
+        const split = splitQuestionAttachments(answer);
+        const attached = split === undefined ? undefined : optionBySubmitted.get(split.prefix);
+        if (item.companionId !== undefined) {
+          if (attached !== undefined && split !== undefined) {
+            contentEntries.push([item.id, attached.constValue]);
+            contentEntries.push([item.companionId, `${attached.label}${split.suffix}`]);
+          } else {
+            contentEntries.push([item.companionId, answer]);
+          }
+        } else {
+          return { action: "cancel" };
+        }
+      }
+      return { action: "accept", content: Object.fromEntries(contentEntries) };
+    },
+  };
 }
 
 export function extractAntigravityUserInputQuestion(
@@ -574,4 +858,92 @@ export function classifyAntigravitySubagentToolCall(
 export function antigravitySubagentOutput(toolCall: AcpToolCallState): string | undefined {
   const output = toolCall.data.rawOutput;
   return typeof output === "string" && output.trim() ? boundText(output.trim()) : undefined;
+}
+
+function normalizeBrainPath(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/\/+$/, "");
+  return normalized.startsWith("/private/var/") || normalized.startsWith("/private/tmp/")
+    ? normalized.slice("/private".length)
+    : normalized;
+}
+
+const ANTIGRAVITY_BRAIN_PLAN_FILES = new Set(["plan.md", "implementation_plan.md"]);
+
+function isAntigravityBrainPlanPath(
+  filePath: string | undefined,
+  profileDirectory: string,
+): boolean {
+  if (!filePath) return false;
+  const root = `${normalizeBrainPath(profileDirectory)}/antigravity-acp/brain/`;
+  const target = normalizeBrainPath(filePath);
+  const caseInsensitive = /^[a-z]:\//i.test(root) || /^[a-z]:\//i.test(target);
+  const rootKey = caseInsensitive ? root.toLowerCase() : root;
+  const targetKey = caseInsensitive ? target.toLowerCase() : target;
+  if (!targetKey.startsWith(rootKey)) return false;
+  const relative = target.slice(root.length);
+  const segments = relative.split("/");
+  return (
+    segments.length === 2 &&
+    segments[0] !== undefined &&
+    segments[0].length > 0 &&
+    segments[0] !== "." &&
+    segments[0] !== ".." &&
+    ANTIGRAVITY_BRAIN_PLAN_FILES.has((segments[1] ?? "").toLowerCase())
+  );
+}
+
+/** Captures Antigravity's native `brain/<sessionId>/{plan,implementation_plan}.md` artifact as a proposed plan. */
+export function extractAntigravityProposedPlanMarkdown(
+  toolCall: AcpToolCallState,
+  profileDirectory: string,
+  readPlanFile: (filePath: string) => string | undefined = readAntigravityPreEditFile,
+): string | undefined {
+  if (toolCall.status !== "completed") return undefined;
+  const readDiskPlan = (filePath: string): string | undefined => {
+    const onDisk = readPlanFile(filePath)?.trim();
+    return onDisk && onDisk.length > 0 ? onDisk : undefined;
+  };
+  const rawInput = Predicate.isObject(toolCall.data.rawInput) ? toolCall.data.rawInput : undefined;
+  if (rawInput !== undefined) {
+    const filePath =
+      typeof rawInput.Path === "string"
+        ? rawInput.Path
+        : typeof rawInput.path === "string"
+          ? rawInput.path
+          : undefined;
+    if (filePath !== undefined && isAntigravityBrainPlanPath(filePath, profileDirectory)) {
+      const fromDisk = readDiskPlan(filePath);
+      if (fromDisk !== undefined) return fromDisk;
+      const isAppend = rawInput.Append === true || rawInput.append === true;
+      const content =
+        typeof rawInput.Content === "string"
+          ? rawInput.Content
+          : typeof rawInput.content === "string"
+            ? rawInput.content
+            : undefined;
+      if (!isAppend && content !== undefined && !content.startsWith(TOOL_TEXT_TRUNCATED)) {
+        const trimmed = content.trim();
+        if (trimmed.length > 0) return trimmed;
+      }
+    }
+  }
+  const blocks = toolCall.data.content;
+  if (Array.isArray(blocks)) {
+    for (const block of blocks) {
+      if (!Predicate.isObject(block) || block.type !== "diff") continue;
+      const filePath = typeof block.path === "string" ? block.path : undefined;
+      if (filePath === undefined || !isAntigravityBrainPlanPath(filePath, profileDirectory)) {
+        continue;
+      }
+      const fromDisk = readDiskPlan(filePath);
+      if (fromDisk !== undefined) return fromDisk;
+      const hasOldText = typeof block.oldText === "string" && block.oldText.length > 0;
+      const newText = typeof block.newText === "string" ? block.newText : undefined;
+      if (!hasOldText && newText !== undefined && !newText.startsWith(TOOL_TEXT_TRUNCATED)) {
+        const trimmed = newText.trim();
+        if (trimmed.length > 0) return trimmed;
+      }
+    }
+  }
+  return undefined;
 }

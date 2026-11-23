@@ -904,4 +904,57 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       }
     }),
   );
+
+  it.effect(
+    "copies only auth credentials into an isolated helper profile without hooks, MCP, or user links",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(root, "home");
+        const sourceProfile = path.join(root, "source-profile");
+        const isolatedProfile = path.join(root, "isolated-profile");
+        yield* fs.makeDirectory(path.join(userHome, ".gemini", "skills"), { recursive: true });
+        yield* fs.writeFileString(path.join(userHome, ".gemini", "GEMINI.md"), "user rules");
+        yield* fs.makeDirectory(path.join(sourceProfile, "config"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "config", "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"echo nope"}]}}',
+        );
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "config", "mcp_config.json"),
+          '{"mcpServers":{"bad":{"command":"echo nope"}}}',
+        );
+        yield* fs.makeDirectory(path.join(sourceProfile, "antigravity-acp"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "antigravity-acp", "antigravity-oauth-token"),
+          '{"token":{"access_token":"tok"}}',
+        );
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "antigravity-acp", "installation_id"),
+          "install-123",
+        );
+
+        const helper = preflightHelper(Effect.void);
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: isolatedProfile,
+          isolatedSourceProfileDirectory: sourceProfile,
+          userHome,
+          runtimeExecutablePath: "/fake/node",
+          platform: "linux",
+          baseEnv: {},
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, helper.spawner));
+
+        expect(
+          yield* fs.readFileString(path.join(profile.acpDirectory, "antigravity-oauth-token")),
+        ).toBe('{"token":{"access_token":"tok"}}');
+        expect(yield* fs.readFileString(path.join(profile.acpDirectory, "installation_id"))).toBe(
+          "install-123",
+        );
+        expect(yield* fs.exists(path.join(profile.geminiHome, "config"))).toBe(false);
+        expect(yield* fs.exists(path.join(profile.geminiHome, "GEMINI.md"))).toBe(false);
+        expect(yield* fs.exists(path.join(profile.geminiHome, "skills"))).toBe(false);
+      }),
+  );
 });
