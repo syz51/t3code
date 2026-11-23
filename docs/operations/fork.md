@@ -79,6 +79,8 @@ Fix that in `package.json` and run `bun install`.
 
 ### Workflows, scripts and docs
 
+The fork keeps `AGENTS.md` under Antigravity's 24,000-byte per-file rule cap by linking to `docs/internals/glossary.md` and `docs/internals/testing.md` instead of repeating those sections inline. When upstream edits those sections, keep the link summary in `AGENTS.md` and mirror any new rule into `docs/internals/testing.md` or `docs/internals/glossary.md`.
+
 The fork's bun edits conflict when upstream edits the same lines. Keep upstream's change and redo
 the fork's edit in it: `bun install` for pnpm installs, `bun.lock` for `pnpm-lock.yaml`, and
 `package.json` for `pnpm-workspace.yaml`. A filtered bun install leaves out the root package,
