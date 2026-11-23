@@ -19,6 +19,7 @@ import {
   antigravityPermissionDisposition,
   antigravitySessionMeta,
   antigravitySessionMode,
+  antigravityUsesSkipPermissions,
   buildAntigravityPrompt,
 } from "./AntigravityAcpSupport.ts";
 
@@ -100,6 +101,44 @@ describe("Antigravity Auto", () => {
     };
     expect(antigravitySessionMode("auto", modeState)).toBe(expected);
   });
+
+  it.each([
+    { policy: { runtimeMode: "full-access" as const }, expected: true },
+    {
+      policy: {
+        runtimeMode: "full-access" as const,
+        approvalPolicy: "never" as const,
+        sandboxPolicy: { type: "dangerFullAccess" as const },
+      },
+      expected: true,
+    },
+    { policy: { runtimeMode: "approval-required" as const }, expected: false },
+    { policy: { runtimeMode: "auto" as const }, expected: false },
+    { policy: { runtimeMode: "auto-accept-edits" as const }, expected: false },
+    {
+      policy: { runtimeMode: "full-access" as const, approvalPolicy: "on-request" as const },
+      expected: false,
+    },
+    {
+      policy: {
+        runtimeMode: "full-access" as const,
+        sandboxPolicy: { type: "readOnly" as const },
+      },
+      expected: false,
+    },
+    {
+      policy: {
+        runtimeMode: "full-access" as const,
+        sandboxPolicy: { type: "workspaceWrite" as const, writableRoots: [] },
+      },
+      expected: false,
+    },
+  ])(
+    "enables --dangerously-skip-permissions only for unrestricted full-access ($expected)",
+    ({ policy, expected }) => {
+      expect(antigravityUsesSkipPermissions(policy)).toBe(expected);
+    },
+  );
 
   it.each(["execute", "read"] as const)("asks about the %s requests agy's Auto sends", (kind) => {
     const request = {

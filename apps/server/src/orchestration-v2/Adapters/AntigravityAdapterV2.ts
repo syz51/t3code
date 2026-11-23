@@ -25,6 +25,7 @@ import {
   antigravityPermissionMode,
   antigravityRuntimeModeForSessionMode,
   antigravitySteersWithPrompt,
+  antigravityUsesSkipPermissions,
   applyAntigravityAcpModelSelection,
   buildAntigravityPrompt,
   type AntigravityAcpRuntimeInput,
@@ -82,7 +83,10 @@ const AntigravityProviderCapabilitiesV2 = {
 export type AntigravityAdapterV2RuntimeInput = Omit<
   AntigravityAcpRuntimeInput,
   "spawn" | "childProcessSpawner"
-> & { readonly processEnvironment?: NodeJS.ProcessEnv };
+> & {
+  readonly processEnvironment?: NodeJS.ProcessEnv;
+  readonly skipPermissions?: boolean;
+};
 
 export interface AntigravityAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
@@ -161,6 +165,7 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
+            skipPermissions: antigravityUsesSkipPermissions(input.runtimePolicy),
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
@@ -274,6 +279,8 @@ export function makeAntigravityAcpAdapterFlavor(
     }),
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
+    requiresRuntimeRestartForPolicyChange: (previous, next) =>
+      antigravityUsesSkipPermissions(previous) !== antigravityUsesSkipPermissions(next),
     clientFileSystem: {
       readTextFile: (request, cwd) =>
         readAntigravityClientTextFile({

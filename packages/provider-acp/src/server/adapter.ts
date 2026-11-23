@@ -518,6 +518,14 @@ export interface AcpAdapterV2Flavor {
     policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
   ) => string | undefined;
   /**
+   * Whether switching between `previous` and `next` runtime policies requires respawning the
+   * underlying ACP process (for example, changing CLI-level permission flags).
+   */
+  readonly requiresRuntimeRestartForPolicyChange?: (
+    previous: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+    next: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  ) => boolean;
+  /**
    * Native select-option values to apply for a runtime policy (e.g. Kiro's
    * `autopilot`), set on every session configure. A value the session does
    * not advertise is skipped; an agent rejecting it fails the session.
@@ -2281,6 +2289,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const clientPolicyGrants = makeAcpClientPolicyGrants();
         let latestRuntimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy =
           input.runtimePolicy;
+        let spawnedRuntimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy =
+          input.runtimePolicy;
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const activeTurn = yield* Ref.make<ActiveAcpTurn | null>(null);
         // Keyed by the agent's steer id; an injection can arrive before its send returns.
@@ -2899,11 +2909,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             handleRuntimeTerminationAtGeneration(runtimeGeneration),
         ): AcpAdapterV2RuntimeInput => {
           return {
-            cwd: input.runtimePolicy.cwd ?? process.cwd(),
-            runtimePolicy: input.runtimePolicy,
-            ...(input.runtimePolicy.workspace === undefined
+            cwd: latestRuntimePolicy.cwd ?? process.cwd(),
+            runtimePolicy: latestRuntimePolicy,
+            ...(latestRuntimePolicy.workspace === undefined
               ? {}
-              : { extraRoots: input.runtimePolicy.workspace.extraRoots }),
+              : { extraRoots: latestRuntimePolicy.workspace.extraRoots }),
             mcpServers: mcpContext.servers,
             acpMcpServers: mcpContext.acpServers,
             httpMcpServers: mcpContext.httpServers,
@@ -7834,6 +7844,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           runtimeMcpBridge = yield* makeRuntimeMcpBridge(mcpContext, runtimeScope);
           const runtimeGeneration = yield* Ref.get(runtimeCallbackGeneration);
           openAgentRequests = new Set();
+          const runtimePolicyForSpawn = latestRuntimePolicy;
           runtime = yield* flavor
             .makeRuntime(
               makeRuntimeInput(runtimeGeneration, openAgentRequests, mcpContext, resumeSessionId),
@@ -7845,6 +7856,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.provideService(AgentScope, agentScope),
               Effect.provideService(AgentScopeThreadId, threadId ?? undefined),
             );
+          spawnedRuntimePolicy = runtimePolicyForSpawn;
         });
 
         const startAcpRuntime = Effect.fnUntraced(function* (
@@ -7908,6 +7920,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             Effect.sync(() => {
               stagedSessionUpdates.push(notification);
             });
+          const replacementPolicyForSpawn = latestRuntimePolicy;
           let replacementMcpBridge: AcpMcpOverAcpBridge | undefined;
           const startup = Effect.gen(function* () {
             const mcpContext = yield* readMcpContext(threadId);
@@ -7978,6 +7991,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   }
                   yield* quarantineNativeTransportAtGeneration(previousGeneration);
                   runtime = replacementExit.value.replacementRuntime;
+                  spawnedRuntimePolicy = replacementPolicyForSpawn;
                   runtimeScope = replacementScope;
                   runtimeMcpBridge = replacementMcpBridge;
                   openAgentRequests = replacementAgentRequests;
@@ -9556,6 +9570,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             // load/resume can invoke client methods; install the incoming policy before activation.
             latestRuntimePolicy = turnInput.runtimePolicy;
             const requestedSessionId = yield* nativeThreadId(driver, turnInput.providerThread);
+            if (
+              flavor.requiresRuntimeRestartForPolicyChange?.(
+                spawnedRuntimePolicy,
+                turnInput.runtimePolicy,
+              ) === true
+            ) {
+              yield* Ref.set(runtimeRestartRequired, true);
+            }
             const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
               turnInput.threadId,
             );

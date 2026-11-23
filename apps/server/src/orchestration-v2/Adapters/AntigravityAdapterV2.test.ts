@@ -2695,4 +2695,116 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         assert.include(sent, "<pull_request_linking>");
       }).pipe(Effect.provide(layerSession)),
   );
+
+  it.effect(
+    "restarts the ACP runtime with updated skipPermissions when switching between unrestricted full-access and restricted policies",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-skip-perms-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const skipPermissionsCalls: Array<boolean | undefined> = [];
+        const instanceId = ProviderInstanceId.make("antigravity-skip-perms-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) => {
+            skipPermissionsCalls.push(input.skipPermissions);
+            return makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                },
+              },
+            }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto));
+          },
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-sp-ws-" });
+        const fullAccessPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const approvalPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const sandboxedFullAccessPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+          sandboxPolicy: { type: "readOnly" },
+        });
+        const threadId = ThreadId.make("thread-antigravity-skip-perms");
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-skip-perms"),
+          modelSelection,
+          runtimePolicy: fullAccessPolicy,
+        });
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy: fullAccessPolicy,
+        });
+        assert.deepEqual(skipPermissionsCalls, [true]);
+
+        const runTurn = (ordinal: number, policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy) =>
+          Effect.gen(function* () {
+            yield* session.startTurn(
+              makeTurnInput({
+                threadId,
+                providerThread,
+                instanceId,
+                modelSelection,
+                runtimePolicy: policy,
+                now: yield* DateTime.now,
+                ordinal,
+                messageText: `turn ${ordinal}`,
+              }),
+            );
+            yield* Stream.fromQueue(events).pipe(
+              Stream.filter((event) => event.type === "turn.terminal"),
+              Stream.runHead,
+            );
+          });
+
+        // Staying in unrestricted full-access reuses the existing runtime.
+        yield* runTurn(1, fullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true]);
+
+        // Switching to approval-required respawns without --dangerously-skip-permissions.
+        yield* runTurn(2, approvalPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false]);
+
+        // Switching back to unrestricted full-access respawns with --dangerously-skip-permissions.
+        yield* runTurn(3, fullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false, true]);
+
+        // Adding a read-only sandbox respawns without --dangerously-skip-permissions.
+        yield* runTurn(4, sandboxedFullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false, true, false]);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
 });
