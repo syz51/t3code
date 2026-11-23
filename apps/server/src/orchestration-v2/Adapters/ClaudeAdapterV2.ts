@@ -10878,9 +10878,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               message.task_id,
             );
             if (message.status === "stopped") {
-              const listed = (yield* Ref.get(lastProviderThreadByNativeThread))
-                .get(input.nativeThreadId)
-                ?.pendingBackgroundTasks?.find((task) => task.taskId === message.task_id);
+              // A turn running now shows Claude the stop, so only an idle stop is owed on exit.
+              const listed =
+                input.activeContext === null
+                  ? (yield* Ref.get(lastProviderThreadByNativeThread))
+                      .get(input.nativeThreadId)
+                      ?.pendingBackgroundTasks?.find((task) => task.taskId === message.task_id)
+                  : undefined;
               const stopped =
                 stoppedTasksByNativeThread.get(input.nativeThreadId) ??
                 new Map<string, OrchestrationV2PendingBackgroundTask | undefined>();
