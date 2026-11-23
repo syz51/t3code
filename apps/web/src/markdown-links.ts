@@ -68,8 +68,10 @@ export function resolveInlineCodeFileLinkMeta(
   baseDir: string | undefined = cwd,
   rootDir: string | undefined = cwd,
 ): MarkdownFileLinkMeta | null {
-  return memoized(inlineCodeMetas, `${cwd ?? ""}\u0000${baseDir ?? ""}\u0000${codeText}`, () =>
-    resolveInlineCodeFileLinkMetaUncached(codeText, cwd, baseDir),
+  return memoized(
+    inlineCodeMetas,
+    `${cwd ?? ""}\u0000${baseDir ?? ""}\u0000${rootDir ?? ""}\u0000${codeText}`,
+    () => resolveInlineCodeFileLinkMetaUncached(codeText, cwd, baseDir, rootDir),
   );
 }
 
@@ -77,6 +79,7 @@ function resolveInlineCodeFileLinkMetaUncached(
   codeText: string,
   cwd: string | undefined,
   baseDir: string | undefined,
+  rootDir: string | undefined,
 ): MarkdownFileLinkMeta | null {
   const candidate = inlineCodeFilePathCandidate(codeText);
   if (candidate === null) return null;
