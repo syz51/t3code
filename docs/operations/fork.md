@@ -79,7 +79,7 @@ Fix that in `package.json` and run `bun install`.
 
 ### Workflows, scripts and docs
 
-The fork keeps `AGENTS.md` under Antigravity's 24,000-byte per-file rule cap by linking to `docs/internals/glossary.md` and `docs/internals/testing.md` instead of repeating those sections inline. When upstream edits those sections, keep the link summary in `AGENTS.md` and mirror any new rule into `docs/internals/testing.md` or `docs/internals/glossary.md`.
+The fork keeps `AGENTS.md` under Antigravity's 24,000-byte per-file rule cap by linking to `docs/internals/00_glossary.md` and `docs/internals/15_testing.md` instead of repeating those sections inline. When upstream edits those sections, keep the link summary in `AGENTS.md` and mirror any new rule into `docs/internals/15_testing.md` or `docs/internals/00_glossary.md`.
 
 The fork's bun edits conflict when upstream edits the same lines. Keep upstream's change and redo
 the fork's edit in it: `bun install` for pnpm installs, `bun.lock` for `pnpm-lock.yaml`, and
@@ -231,8 +231,8 @@ Still on upstream's tooling, so not usable where pnpm and Vite+ are not installe
 ## Prerequisites
 
 - Bun 1.4 or newer.
-- Node 26.12.1 (`engines.node`), which runs the app. With fnm: `fnm install 26.12.1`, then prefix each command
-  below with `fnm exec --using=26.12.1`.
+- Node 26.13.1 (`engines.node`), which runs the app. With fnm: `fnm install 26.13.1`, then prefix each command
+  below with `fnm exec --using=26.13.1`.
 - `vp` for the build, run and desktop steps below, installed as the
   [root README](../../README.md#install-vp) says.
 

@@ -107,6 +107,7 @@
     "tc": "vp run -r --cache --concurrency-limit 4 typecheck",
     "check:changed": "node scripts/check-changed.ts",
     "report:renders": "node scripts/render-metrics.ts",
+    "report:server": "node scripts/server-metrics.ts",
     "lint": "vp lint --report-unused-disable-directives",
     "i18n:untranslated": "node scripts/i18n-untranslated.ts",
     "knip": "knip --preprocessor ./scripts/knip-schemas.ts",
@@ -199,6 +200,7 @@
     "expo-sharing>@expo/config-plugins": "58.0.12",
     "expo-sharing>@expo/config-types": "58.0.3",
     "expo-widgets": "58.0.27",
+    "gt-react-native": "11.4.18",
     "lightningcss": "catalog:",
     "mdast-util-math": "3.0.0",
     "mdast-util-to-hast": "13.2.1",
@@ -280,6 +282,7 @@
     "alchemy@2.0.0-beta.85": "patches/alchemy@2.0.0-beta.85.patch",
     "react-native-svg@15.16.1": "patches/react-native-svg@15.16.1.patch",
     "react-native-pdf-jsi@6.1.0": "patches/react-native-pdf-jsi@6.1.0.patch",
+    "gt-react-native@11.4.18": "patches/gt-react-native@11.4.18.patch",
     "effect@4.1.5": "patches/effect@4.1.5.patch"
   },
   "trustedDependencies": [

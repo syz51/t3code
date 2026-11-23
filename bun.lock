@@ -1018,8 +1018,9 @@
     "node-pty",
   ],
   "patchedDependencies": {
-    "alchemy@2.0.0-beta.85": "patches/alchemy@2.0.0-beta.85.patch",
+    "@cursor/sdk@1.4.2": "patches/@cursor__sdk@1.4.2.patch",
     "react-native-keyboard-controller@1.23.0": "patches/react-native-keyboard-controller@1.23.0.patch",
+    "alchemy@2.0.0-beta.85": "patches/alchemy@2.0.0-beta.85.patch",
     "@effect/platform-node-shared@4.1.5": "patches/@effect__platform-node-shared@4.1.5.patch",
     "@ff-labs/fff-node@0.11.0": "patches/@ff-labs__fff-node@0.11.0.patch",
     "electron-updater@6.8.9": "patches/electron-updater@6.8.9.patch",
@@ -1052,8 +1053,8 @@
     "@muse-code/sdk@1.4.6": "patches/@muse-code__sdk@1.4.6.patch",
     "mdast-util-math@3.0.0": "patches/mdast-util-math@3.0.0.patch",
     "@effect/vitest@4.1.5": "patches/@effect__vitest@4.1.5.patch",
+    "gt-react-native@11.4.18": "patches/gt-react-native@11.4.18.patch",
     "react-native-image-viewing@0.2.2": "patches/react-native-image-viewing@0.2.2.patch",
-    "@cursor/sdk@1.4.2": "patches/@cursor__sdk@1.4.2.patch",
   },
   "overrides": {
     "@clerk/backend": "catalog:",
@@ -1125,6 +1126,7 @@
       "@expo/config-types": "58.0.3",
     },
     "expo-widgets": "58.0.27",
+    "gt-react-native": "11.4.18",
     "lightningcss": "catalog:",
     "mdast-util-math": "3.0.0",
     "mdast-util-to-hast": "13.2.1",
