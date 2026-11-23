@@ -60,7 +60,7 @@ wait_free() {
 }
 reopen() {
   log "reopening the unchanged app"
-  open "$app"
+  env -u ELECTRON_RUN_AS_NODE open "$app"
 }
 
 [[ -d "$new" ]] || fail "no new build at $new; build it first"
@@ -160,7 +160,7 @@ if ! run ditto "$new" "$app"; then
   reopen
   exit 1
 fi
-run open "$app" || log "warning: could not open $app; open it by hand"
+run env -u ELECTRON_RUN_AS_NODE open "$app" || log "warning: could not open $app; open it by hand"
 
 if [[ $dry_run -eq 1 ]]; then
   echo
