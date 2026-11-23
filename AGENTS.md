@@ -42,19 +42,7 @@ Of note: Most T3 Code contributions will come from T3 Code itself, often control
 
 ## A small glossary
 
-We need to be on the same page with terminology. When communicating, use this language:
-
-- **you** means the agent reading this file and changing T3 Code.
-- **we, us, and maintainers** mean Theo, Julius and the people building T3 Code. These are who you are talking to now.
-- **user** means the person using T3 Code to direct coding agents.
-- **agent** means the coding agent a user runs inside T3 Code. Depending on context, that may also include you.
-- **provider** means the agent runtime or harness T3 Code talks to, such as Codex, Claude, Cursor, or OpenCode.
-- **client** means the web, desktop, or mobile UI.
-- **environment** means one running T3 server and the machine, filesystem, provider credentials, and state it owns.
-- **project** means an environment-local workspace record rooted at a directory.
-- **thread** means the durable conversation and work history for a project.
-- **turn** means one user-to-agent cycle, including follow-up work such as checkpointing.
-- **T3 home** means the base data directory. Runtime state normally lives below its userdata directory.
+In this file, **you** is the agent changing T3 Code; **we, us, and maintainers** are Theo, Julius, and the people building T3 Code; **user** is the person using T3 Code to direct coding agents; **agent** is a coding agent run inside T3 Code (and depending on context, you). For domain terms (`environment`, `client`, `project`, `thread`, `turn`, `provider`, `T3 home`, etc.), see [Glossary](docs/internals/glossary.md).
 
 ## The three ways to hurt yourself
 
@@ -104,39 +92,10 @@ An empty database is a bad test. Seed your worktree's `.t3` with a copy of real 
 - While you iterate, run `vp test run <files>`. For big files, add `-t "<name>"`.
 - Use `vp run typecheck`; it caches per package. Each package runs `effect-tsgo tsrs --noEmit`, the Rust TypeScript 7 checker with Effect's diagnostics built in. There is no `typescript` package to run.
 - Run `node -e` snippets from `apps/server` or the owning package. `effect` does not resolve from the repo root.
-- Test behavior that can break, such as orchestration and event-sourcing, provider protocol translation, auth and permission guards, persistence and migrations, external-format parsing, race fixes, and the logic a bug fix changed. Leave out tests for what types already guarantee, trivial logic, copy text, smoke runs, mock-call mirrors, callback wiring, and props rendered to static markup.
-- Extend before you add. When an existing test or table covers the behavior, add a row or an assertion there. Write a new `it` only when no case fits.
-- Test at one layer: the lowest one that fails on `main`. Do not repeat the case in a wrapper test, at each call site, or in web and mobile copies of the same logic.
-- Write a browser test only for behavior that needs a real browser: layout and scrolling, focus and pointer input, real workers, or a component wired to its hooks. Logic a component calls gets a unit test beside it (`*.logic.test.ts`). A browser test file spends seconds in CI loading its module graph before its first test runs; a unit test takes milliseconds.
-- [Testing](docs/internals/testing.md) carries these same test rules, plus review guidance, for review bots. Change both together.
+- Follow [Testing](docs/internals/testing.md) for what to test and review: test behavior that can break (skip trivial/type-guaranteed/static-markup tests), extend existing tests/tables before adding new `it` blocks, test at the lowest layer that fails on `main`, reserve browser tests for behavior needing a real browser (`*.logic.test.ts` for logic), ship focused tests for backend changes, and prove bug fixes with a failing test first (before/after captures for purely visual bugs; `vp run scenarios:prove` for web-reproducible bugs, see [Scenarios](docs/operations/scenarios.md)).
 - **Do not run repo-wide checks.** No `vp check`, no `vp run -r test`, no `vp run -r typecheck` unless I ask. CI owns the full suite.
-- Backend behavior changes ship with focused tests for that behavior.
-- Proof for a bug fix depends on the bug. Logic, data, state, and protocol bugs get a failing test first (the fewest that fail on `main` for that reason, in an existing case of the module's test file where one fits), then the fix. Purely visual bugs (spacing, colour, alignment, a layout shift) get before/after captures as their proof and no test: do not add UI tests for nitpicks, and do not ask for one in review when a capture already shows it. A server-only fix with no visible surface ships the test plus a short runtime transcript. For a bug a user can reproduce in the web client, `vp run scenarios:prove` shows it failing on base and passing on the fix in the real app; see [Scenarios](docs/operations/scenarios.md).
-- The server is event-sourced, and side effects run after the command commits. In tests, drain the effect worker (`OrchestrationEffectWorkerV2.drain`) or await the specific persisted event or `Deferred` that marks the milestone. Never wait on sleeps or polling. A test that needs a timeout to pass is wrong. Concretely:
-  - `it.effect` runs on a `TestClock`; `Effect.sleep` only advances through `TestClock.adjust`. `it.live` is wall-clock and only for subprocess or network fixtures.
-  - No `yieldNow` or `sleep` polling loops. Await the `Deferred`, take from the `Queue`, or drain the worker.
-  - No per-test timeout argument or `retry`. The project timeout is the ceiling, and flaky tests are fixed, not retried.
-  - No `performance.now()` or `Date.now()` deltas. Assert on events and counts, not elapsed time.
-  - Browser tests assert through `expect.element` or `vi.waitFor`, never `requestAnimationFrame` or `transitionend`.
-  - `vi.mock` factories must not spread a real module that pulls in Shiki or the diff workers.
-  - `it.skip` and friends need a tracking issue on the line above: `// quarantine: #1234 <why>`.
-  - Lint enforces this: `t3code/no-test-timeout-or-unreasoned-skip`, `t3code/no-frame-waits-in-browser-tests`, `t3code/no-wall-clock-in-tests`, `t3code/no-real-time-wait-in-tests`, `t3code/no-polling-loop-in-tests`.
-- Web browser tests are `*.browser.test.tsx` or `*.browser.test.ts` and render with `await using screen = await render(...)` from `apps/web/test/render.tsx`. `t3code/require-disposable-render` errors on the old patterns.
-  - Acquire what the test drives after mounting (fake timers it advances, spies it sets up after mounting) after the render, so it disposes before the unmount. Anything the first render reads comes before it.
-  - A helper that renders and then waits or clicks puts the screen in an `AsyncDisposableStack` and `move()`s it out only on success, so a failed wait still unmounts.
-  - `rerender` needs a fresh element on every call.
-  - No lifecycle hooks and no module-level mutable state. Shared mock state that `vi.mock` factories read is reset by a `setup()` call at the top of the test.
-  - `router` is on by default. Pass `router: false` only with a one-line comment saying why.
-
-  ```tsx
-  it("saves on Enter", async () => {
-    const onSave = vi.fn();
-    using _now = vi.spyOn(Date, "now").mockReturnValue(0);
-    await using screen = await render(<TitleEditor onSave={onSave} />, { router: "/threads/1" });
-    await userEvent.type(screen.getByRole("textbox"), "Title{Enter}");
-    expect(onSave).toHaveBeenCalledWith("Title");
-  });
-  ```
+- The server is event-sourced, and side effects run after the command commits. Drain the effect worker (`OrchestrationEffectWorkerV2.drain`) or await the persisted event / `Deferred`; never use sleeps, polling, per-test timeouts, retries, wall-clock deltas, or `requestAnimationFrame` waits (enforced by `t3code/no-*-in-tests` lint rules). See [Testing § Waiting for work](docs/internals/testing.md#waiting-for-work) for the full checklist (`TestClock`, `vi.mock`, quarantine comments).
+- Web browser tests (`*.browser.test.{ts,tsx}`) render with `await using screen = await render(...)` from `apps/web/test/render.tsx` (`t3code/require-disposable-render`), with no lifecycle hooks or module-level mutable state. See [Testing § Web browser tests](docs/internals/testing.md#web-browser-tests) for disposal order, `AsyncDisposableStack`, `router: false`, and the canonical example.
 
 - User-visible frontend changes should get one integrated pass in a real client: `test-t3-app` for web, `test-t3-mobile` for mobile. The primary agent does this once after integrating. Subagents do not launch their own dev servers.
 
