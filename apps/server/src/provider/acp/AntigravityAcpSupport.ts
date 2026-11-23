@@ -167,6 +167,20 @@ export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
 }
 
 /**
+ * Unrestricted `full-access` passes `--dangerously-skip-permissions` so child `invoke_subagent`
+ * calls do not stall 60s on unforwarded ACP prompts; all other policies stay gated by T3.
+ */
+export function antigravityUsesSkipPermissions(
+  policy: Pick<AcpRuntimePolicy, "runtimeMode" | "approvalPolicy" | "sandboxPolicy">,
+): boolean {
+  if (policy.runtimeMode !== "full-access") return false;
+  if (policy.approvalPolicy != null && policy.approvalPolicy !== "never") return false;
+  if (policy.sandboxPolicy == null) return true;
+  const sandboxType = unknownRecord(policy.sandboxPolicy)?.type;
+  return sandboxType === "dangerFullAccess" || sandboxType === "externalSandbox";
+}
+
+/**
  * The agy CLI rejects `yolo` and `auto_edit`, and sessions without native Auto reject `auto`.
  * Those stay in `default`, where it asks before acting and T3 answers from the live runtime
  * policy, so permission changes apply on the next turn without a restart.

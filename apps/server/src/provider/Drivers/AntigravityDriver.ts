@@ -225,6 +225,7 @@ export const AntigravityDriver: ProviderDriver<
       cwd: string,
       baseEnv: NodeJS.ProcessEnv,
       isolatedProfileDirectory?: string,
+      skipPermissions?: boolean,
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
@@ -308,6 +309,7 @@ export const AntigravityDriver: ProviderDriver<
           baseEnv,
           auth,
           runtimeTempDirectory,
+          ...(skipPermissions === true ? { skipPermissions: true } : {}),
         }),
       };
     });
@@ -324,6 +326,7 @@ export const AntigravityDriver: ProviderDriver<
       const {
         processEnvironment: threadEnvironment,
         isolatedProfileDirectory,
+        skipPermissions,
         ...runtimeInput
       } = input;
       const { executable, spawn } = yield* prepareSpawn(
@@ -332,6 +335,7 @@ export const AntigravityDriver: ProviderDriver<
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
         isolatedProfileDirectory,
+        skipPermissions,
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
