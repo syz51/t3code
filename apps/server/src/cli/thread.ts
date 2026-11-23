@@ -197,6 +197,15 @@ const toolFailureDetail = (result: typeof ToolResult.Type) => {
   });
 };
 
+/** JSON-RPC's invalid params: the arguments failed the tool's schema. */
+const INVALID_PARAMS = -32602;
+const rpcErrorDetail = (error: { readonly code: number; readonly message: string }) => {
+  const message = error.message.replaceAll(/\s*\n\s*/g, " ");
+  return error.code === INVALID_PARAMS
+    ? `The server refused the arguments: ${message}`
+    : `The server refused the request: ${message}`;
+};
+
 const makeThreadTools = (session: McpToolSession, origin: string) => {
   const unexpected = (tool: string) =>
     new ThreadToolFailedError({
@@ -214,10 +223,13 @@ const makeThreadTools = (session: McpToolSession, origin: string) => {
     > {
       const raw = yield* session.call(tool, args).pipe(
         Effect.mapError((cause) =>
-          // Effect's MCP server words an unknown or hidden tool exactly this way.
-          cause.rpcError?.code === -32602 && cause.rpcError.message === `Tool '${tool}' not found`
-            ? new ThreadToolMissingError({ tool })
-            : new ThreadServerUnreachableError({ origin, cause }),
+          cause.rpcError === undefined
+            ? new ThreadServerUnreachableError({ origin, cause })
+            : // Effect's MCP server words an unknown or hidden tool exactly this way.
+              cause.rpcError.code === -32602 &&
+                cause.rpcError.message === `Tool '${tool}' not found`
+              ? new ThreadToolMissingError({ tool })
+              : new ThreadToolFailedError({ tool, detail: rpcErrorDetail(cause.rpcError) }),
         ),
       );
       const result = yield* decodeToolResult(raw).pipe(Effect.mapError(() => unexpected(tool)));
@@ -413,7 +425,7 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
   view: "messages" | "activity",
 ) {
   const items: Array<OrchestratorMcpThreadReadToolItem> = [];
-  let afterPosition: number | undefined;
+  let afterPosition: number | null = -1;
   let page: OrchestratorMcpThreadReadToolResult;
   do {
     page = yield* tools.call(
@@ -425,13 +437,13 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
         maxCharsPerItem: READ_ITEM_MAX_CHARS,
         runLimit: 1,
         include: ["runs"],
-        ...(afterPosition === undefined ? {} : { afterPosition }),
+        afterPosition,
       },
       OrchestratorMcpThreadReadToolResult,
     );
     items.push(...page.items);
-    afterPosition = page.nextPosition ?? undefined;
-  } while (page.hasMore && afterPosition !== undefined);
+    afterPosition = page.nextPosition;
+  } while (page.hasMore && afterPosition !== null);
   return { items };
 });
 
@@ -473,7 +485,7 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
           maxCharsPerItem: READ_ITEM_MAX_CHARS,
           runLimit: 1,
           include: ["thread", "runs"],
-          ...(afterPosition < 0 ? {} : { afterPosition }),
+          afterPosition,
         },
         OrchestratorMcpThreadReadToolResult,
       );
@@ -845,14 +857,16 @@ const outputSchemaFlag = Flag.String("output-schema").pipe(
 const decodeOutputSchema = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Json)),
 );
-const readOutputSchema = Effect.fn("cli.thread.readOutputSchema")(function* (
+export const readOutputSchema = Effect.fn("cli.thread.readOutputSchema")(function* (
   path: Option.Option<string>,
 ) {
   if (Option.isNone(path)) return {};
   const fileSystem = yield* FileSystem.FileSystem;
   const usage = () =>
     new ThreadUsageError({ detail: `${path.value} does not hold a JSON Schema object.` });
-  const text = yield* fileSystem.readFileString(path.value).pipe(Effect.mapError(usage));
+  const text = yield* fileSystem
+    .readFileString(yield* expandHomePath(path.value))
+    .pipe(Effect.mapError(usage));
   return { outputSchema: yield* decodeOutputSchema(text).pipe(Effect.mapError(usage)) };
 });
 const messageArgument = Argument.String("message").pipe(

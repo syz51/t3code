@@ -127,15 +127,14 @@ function copyBoundedText(text: string): string {
   return Buffer.from(text, "utf16le").toString("utf16le");
 }
 
-function boundHead(text: string, limit: number): string {
+function boundQuestionText(text: string, limit: number): string {
   if (text.length <= limit) return text;
-  const head = text.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/u, "");
-  return copyBoundedText(`${head}...`);
+  const prefix = text.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/u, "");
+  return copyBoundedText(`${prefix}...`);
 }
 
 function questionLabel(option: EffectAcpSchema.PermissionOption): string {
-  const label = option.name.trim() || option.optionId;
-  return boundHead(label, QUESTION_LABEL_LIMIT);
+  return boundQuestionText(option.name.trim() || option.optionId, QUESTION_LABEL_LIMIT);
 }
 
 const AntigravityElicitationFormSchema = Schema.Struct({
@@ -283,9 +282,9 @@ export function extractAntigravityElicitationForm(
     const seenConst = new Set<string>();
     const labelCounts = new Map<string, number>();
     const normalizedItems = rawChoices.items.map((option) => {
-      const label = boundHead(option.title.trim(), QUESTION_LABEL_LIMIT);
+      const label = boundQuestionText(option.title.trim(), QUESTION_LABEL_LIMIT);
       const description = option.description?.trim()
-        ? boundHead(option.description.trim(), QUESTION_LABEL_LIMIT)
+        ? boundQuestionText(option.description.trim(), QUESTION_LABEL_LIMIT)
         : label;
       return { constValue: option.const, label, description };
     });
@@ -319,11 +318,14 @@ export function extractAntigravityElicitationForm(
     return {
       id: item.id,
       header: hasDistinctDescription
-        ? boundHead(item.title, QUESTION_LABEL_LIMIT)
+        ? boundQuestionText(item.title, QUESTION_LABEL_LIMIT)
         : parsed.length === 1
           ? "Question"
           : `Question ${index + 1}`,
-      question: boundHead(hasDistinctDescription ? item.description : item.title, TOOL_TEXT_LIMIT),
+      question: boundQuestionText(
+        hasDistinctDescription ? item.description : item.title,
+        TOOL_TEXT_LIMIT,
+      ),
       options: item.options.map((option) => ({
         label: option.label,
         description: option.description,
@@ -433,10 +435,7 @@ export function extractAntigravityUserInputQuestion(
   return {
     id: request.toolCall.toolCallId,
     header: "Question",
-    question:
-      question.length > TOOL_TEXT_LIMIT
-        ? copyBoundedText(`${question.slice(0, TOOL_TEXT_LIMIT - 3)}...`)
-        : question,
+    question: boundQuestionText(question, TOOL_TEXT_LIMIT),
     multiSelect: false,
     allowCustomAnswer: false,
     options: request.options.map((option) => ({
