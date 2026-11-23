@@ -6324,8 +6324,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const scheduledWakeupsByNativeThread = new Map<string, number>();
         // Native threads whose current turn Claude started by itself inside the early-fire margin.
         const possibleEarlyWakeNativeThreads = new Set<string>();
-        // Claude may open no wake for a task someone stopped, so its exit owes none.
-        const stoppedTaskIdsByNativeThread = new Map<string, Set<string>>();
+        // Claude may open no wake for a task someone stopped, so it owes none. An exit still owes
+        // the outcome of a stopped task the agent awaited, so its listed entry is kept.
+        const stoppedTasksByNativeThread = new Map<
+          string,
+          Map<string, OrchestrationV2PendingBackgroundTask | undefined>
+        >();
         // Turn starts a due or nearly due ScheduleWakeup may have caused.
         const possibleScheduledWakeStarts = new WeakSet<SDKMessage>();
         // A Monitor event wakes Claude with a bare turn and no task_notification frame, so the
@@ -6916,7 +6920,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             nativeThreadId,
           );
           const tasks: OrchestrationV2PendingBackgroundTask[] = [];
-          const stopped = stoppedTaskIdsByNativeThread.get(nativeThreadId);
+          const stopped = stoppedTasksByNativeThread.get(nativeThreadId);
           for (const task of previous?.pendingBackgroundTasks ?? []) {
             if (
               !roster.has(task.taskId) &&
@@ -7224,11 +7228,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     ),
                   ),
                   ...(yield* owedWakeTasksForNativeThread(nativeThreadId)),
+                  ...[...(stoppedTasksByNativeThread.get(nativeThreadId)?.values() ?? [])].flatMap(
+                    (task) => (task?.awaited === true ? [task] : []),
+                  ),
                 ].filter((task) => !(wakeRequested && bufferedTaskNotificationIds.has(task.taskId)))
               : [];
           scheduledWakeupsByNativeThread.delete(nativeThreadId);
           possibleEarlyWakeNativeThreads.delete(nativeThreadId);
-          stoppedTaskIdsByNativeThread.delete(nativeThreadId);
+          stoppedTasksByNativeThread.delete(nativeThreadId);
           yield* clearPendingBackgroundTasksForNativeThread(nativeThreadId);
           yield* clearNativeThreadTaskIdSet(
             wakeEligibleBackgroundTasksByNativeThread,
@@ -10591,7 +10598,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           ];
           if (!(yield* replaceWakeBuffer(nativeThreadId, buffered, kept, retiredTaskIds))) return;
           for (const taskId of retiredTaskIds) {
-            stoppedTaskIdsByNativeThread.get(nativeThreadId)?.delete(taskId);
+            stoppedTasksByNativeThread.get(nativeThreadId)?.delete(taskId);
             yield* clearPendingBackgroundTask(nativeThreadId, taskId);
             yield* clearTaskIdFromNativeThreadSet(
               wakeEligibleBackgroundTasksByNativeThread,
@@ -10835,7 +10842,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (message.is_backgrounded === false) {
               return false;
             }
-            stoppedTaskIdsByNativeThread.get(input.nativeThreadId)?.delete(message.task_id);
+            stoppedTasksByNativeThread.get(input.nativeThreadId)?.delete(message.task_id);
             yield* upsertPendingBackgroundTask(input.nativeThreadId, {
               ...backgroundTaskLaunch(input.activeContext, message.tool_use_id),
               ...claudePendingBackgroundTask({
@@ -10871,8 +10878,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               message.task_id,
             );
             if (message.status === "stopped") {
-              const stopped = stoppedTaskIdsByNativeThread.get(input.nativeThreadId) ?? new Set();
-              stoppedTaskIdsByNativeThread.set(input.nativeThreadId, stopped.add(message.task_id));
+              const listed = (yield* Ref.get(lastProviderThreadByNativeThread))
+                .get(input.nativeThreadId)
+                ?.pendingBackgroundTasks?.find((task) => task.taskId === message.task_id);
+              const stopped =
+                stoppedTasksByNativeThread.get(input.nativeThreadId) ??
+                new Map<string, OrchestrationV2PendingBackgroundTask | undefined>();
+              stoppedTasksByNativeThread.set(
+                input.nativeThreadId,
+                stopped.set(message.task_id, listed),
+              );
             }
             rosterChanged = removed || message.status === "stopped";
           }
