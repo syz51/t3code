@@ -157,6 +157,44 @@ describe("AntigravityAdapterV2 flavor", () => {
       outcome: { outcome: "selected", optionId: "opt-dev" },
     });
   });
+
+  it("folds Antigravity ask_question elicitation forms into single questions with Other", () => {
+    const form = flavor.extractElicitationForm?.({
+      sessionId: "session-1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "string",
+            title: "Deploy target?",
+            oneOf: [
+              { const: "1", title: "Staging" },
+              { const: "2", title: "Production" },
+            ],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Deploy target?",
+          },
+        },
+      },
+    } as Parameters<NonNullable<typeof flavor.extractElicitationForm>>[0]);
+    assert.isDefined(form);
+    assert.strictEqual(form?.questions.length, 1);
+    assert.strictEqual(form?.questions[0]?.question, "Deploy target?");
+    assert.strictEqual(form?.questions[0]?.allowCustomAnswer, true);
+    assert.deepEqual(form?.respond({ q1: "Production" }), {
+      action: "accept",
+      content: { q1: "2" },
+    });
+    assert.deepEqual(form?.respond({ q1: "Canary" }), {
+      action: "accept",
+      content: { q1_other: "Canary" },
+    });
+  });
 });
 
 const layerSession = Layer.mergeAll(
@@ -1788,6 +1826,40 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
         awaited: true,
       });
       assert.deepEqual(result.matched, taskIds);
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("captures native brain plan.md writes as a proposed_plan turn item", () =>
+    Effect.gen(function* () {
+      const profileDirectory = "/tmp/antigravity-plan-profile";
+      const planMarkdown = "# Rollout Plan\n\n1. Ship it";
+      const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, {
+        profileDirectory,
+        initialToolCalls: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_write_plan",
+            kind: "edit",
+            title: "Write plan.md",
+            status: "completed",
+            rawInput: {
+              Path: `${profileDirectory}/antigravity-acp/brain/mock-session-1/plan.md`,
+              Content: `${planMarkdown}\n`,
+            },
+          },
+        ],
+      });
+      yield* opened.startTurn(1, false);
+      const events = yield* opened.until(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "proposed_plan",
+      );
+      const planItem = events.find(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "proposed_plan",
+      );
+      assert.isDefined(planItem);
+      if (planItem?.type === "turn_item.updated" && planItem.turnItem.type === "proposed_plan") {
+        assert.strictEqual(planItem.turnItem.markdown, planMarkdown);
+      }
     }).pipe(Effect.provide(layerSession)),
   );
 

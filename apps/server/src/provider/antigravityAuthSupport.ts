@@ -390,6 +390,12 @@ const copyAntigravityUserConfigFiles = Effect.fn("copyAntigravityUserConfigFiles
   },
 );
 
+const antigravityIsolatedAuthFiles = [
+  "antigravity-oauth-token",
+  "acp_token.json",
+  "installation_id",
+] as const;
+
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
   readonly baseEnv?: NodeJS.ProcessEnv;
@@ -398,6 +404,8 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly auth?: AntigravityAuthConfig;
   readonly userHome?: string;
   readonly tempDirectory?: string;
+  /** Copy only credentials from this profile and skip user config/hooks/MCP links. */
+  readonly isolatedSourceProfileDirectory?: string;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -536,6 +544,32 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         authSupportError("The Antigravity profile settings could not be written."),
       ),
     );
+  if (input.isolatedSourceProfileDirectory !== undefined) {
+    const sourceAcpDirectory = path.join(
+      path.resolve(input.isolatedSourceProfileDirectory),
+      "antigravity-acp",
+    );
+    for (const fileName of antigravityIsolatedAuthFiles) {
+      const sourcePath = path.join(sourceAcpDirectory, fileName);
+      if (!(yield* fs.exists(sourcePath).pipe(Effect.orElseSucceed(() => false)))) continue;
+      const targetPath = path.join(acpDirectory, fileName);
+      const data = yield* fs
+        .readFile(sourcePath)
+        .pipe(Effect.orElseSucceed((): Uint8Array | undefined => undefined));
+      if (data === undefined) continue;
+      yield* fs
+        .writeFile(targetPath, data)
+        .pipe(
+          Effect.mapError(() =>
+            authSupportError("The Antigravity helper profile credentials could not be copied."),
+          ),
+        );
+      if (platform !== "win32") {
+        yield* fs.chmod(targetPath, 0o600).pipe(Effect.ignore);
+      }
+    }
+    return profile;
+  }
   yield* linkAntigravityUserConfig({ profileDirectory: geminiHome, userHome, platform });
   if (platform === "win32") {
     yield* copyAntigravityUserConfigFiles({ profileDirectory: geminiHome, userHome });

@@ -58,6 +58,8 @@ type AntigravityTextRuntime = Pick<
 
 export interface AntigravityTextGenerationOptions {
   readonly profileDirectory: string;
+  /** True when `makeRuntime` launches against a disposable hook/MCP-free profile directory. */
+  readonly isolatedProfile?: boolean;
   readonly defaultModel?: Effect.Effect<string | undefined>;
   readonly makeRuntime: (
     cwd: string,
@@ -137,10 +139,12 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     return true;
   });
 
-  const available = isAntigravityTextGenerationAvailable(options.profileDirectory).pipe(
-    Effect.provideService(FileSystem.FileSystem, fs),
-    Effect.provideService(Path.Path, path),
-  );
+  const available = options.isolatedProfile
+    ? Effect.succeed(true)
+    : isAntigravityTextGenerationAvailable(options.profileDirectory).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path),
+      );
 
   const runAntigravityJson = Effect.fn("AntigravityTextGeneration.runJson")(
     function* <S extends Schema.Top>(input: TextGenerationOperations.Request<S>) {
@@ -158,16 +162,18 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
 
         const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-text-" });
         let sessionId: string | undefined;
-        yield* Effect.addFinalizer(() =>
-          removeAntigravitySessionFiles({
-            profileDirectory: options.profileDirectory,
-            sessionId,
-            cwd,
-          }).pipe(
-            Effect.provideService(FileSystem.FileSystem, fs),
-            Effect.provideService(Path.Path, path),
-          ),
-        );
+        if (!options.isolatedProfile) {
+          yield* Effect.addFinalizer(() =>
+            removeAntigravitySessionFiles({
+              profileDirectory: options.profileDirectory,
+              sessionId,
+              cwd,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+              Effect.provideService(Path.Path, path),
+            ),
+          );
+        }
 
         const rawResult = yield* Effect.gen(function* () {
           const runtime = yield* options.makeRuntime(cwd);

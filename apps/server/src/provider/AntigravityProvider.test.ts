@@ -312,7 +312,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         auth: { status: "unknown" },
         models: [],
         setup: { canAuthenticate: true, canInstall: true },
-        showInteractionModeToggle: false,
+        showInteractionModeToggle: true,
         supportsConversationRollback: true,
         supportsTextGeneration: false,
       });
@@ -437,6 +437,42 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         expectedCommands,
       );
       expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("uses the session subscription tier label for Google account sign-ins", () =>
+    Effect.gen(function* () {
+      const personal = yield* makeHarness();
+      yield* personal.initialize;
+      yield* personal.provider.onSessionStarted({
+        ...started,
+        sessionSetupResult: {
+          ...sessionSetupResult,
+          _meta: { antigravity: { tier: { name: "Google AI Ultra", id: "g1-ultra-tier" } } },
+        },
+      });
+      expect((yield* personal.provider.snapshot.getSnapshot).auth).toEqual({
+        status: "authenticated",
+        type: "oauth-personal",
+        label: "Google AI Ultra",
+      });
+
+      const apiKey = yield* makeHarness({
+        auth: { type: "gemini-api-key", label: "Gemini API key" },
+      });
+      yield* apiKey.initialize;
+      yield* apiKey.provider.onSessionStarted({
+        ...started,
+        sessionSetupResult: {
+          ...sessionSetupResult,
+          _meta: { antigravity: { tier: { name: "Google AI Ultra", id: "g1-ultra-tier" } } },
+        },
+      });
+      expect((yield* apiKey.provider.snapshot.getSnapshot).auth).toEqual({
+        status: "authenticated",
+        type: "gemini-api-key",
+        label: "Gemini API key",
+      });
     }),
   );
 

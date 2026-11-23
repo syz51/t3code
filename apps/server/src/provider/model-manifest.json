@@ -141,6 +141,9 @@
     ],
     "claudeAgent": ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
     "antigravity": [
+      "gemini-4-neon",
+      "gemini-4-hydrogen",
+      "gemini-pro-orchestrator-neon",
       "gemini-4-carbon",
       "gemini-4-argon",
       "gemini-3.8-flash",
@@ -954,6 +957,13 @@
       },
       "profiles": {},
       "models": [
+        { "slug": "gemini-4-neon", "name": "Gemini 4 Neon", "status": "current" },
+        { "slug": "gemini-4-hydrogen", "name": "Gemini 4 Hydrogen", "status": "current" },
+        {
+          "slug": "gemini-pro-orchestrator-neon",
+          "name": "Gemini Pro Orchestrator Neon",
+          "status": "current"
+        },
         {
           "slug": "gemini-4-carbon",
           "name": "Gemini 4 Carbon",

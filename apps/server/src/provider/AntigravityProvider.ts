@@ -194,6 +194,18 @@ function antigravityRuntimeModes(
     : RUNTIME_MODES_WITHOUT_AUTO;
 }
 
+function antigravityTierLabel(
+  started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
+): string | undefined {
+  for (const meta of [started.sessionSetupResult._meta, started.initializeResult._meta]) {
+    const antigravity = Predicate.isObject(meta) ? meta.antigravity : undefined;
+    const tier = Predicate.isObject(antigravity) ? antigravity.tier : undefined;
+    const name = Predicate.isObject(tier) && typeof tier.name === "string" ? tier.name.trim() : "";
+    if (name.length > 0) return name;
+  }
+  return undefined;
+}
+
 export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(function* (
   settings: AntigravitySettings,
   options: AntigravityProviderOptions,
@@ -211,7 +223,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     ...buildServerProvider({
       presentation: {
         displayName: "Antigravity",
-        showInteractionModeToggle: false,
+        showInteractionModeToggle: true,
         supportedRuntimeModes: options.rememberedRuntimeModes ?? RUNTIME_MODES_WITHOUT_AUTO,
       },
       enabled: settings.enabled,
@@ -432,7 +444,12 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            label:
+              (options.auth === undefined || options.auth.type === "oauth-personal"
+                ? antigravityTierLabel(started)
+                : undefined) ??
+              options.auth?.label ??
+              "Google account",
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
