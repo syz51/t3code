@@ -1965,6 +1965,9 @@ const layerThreadWorktreeRestoreNoop = Layer.succeed(ThreadWorktreeRestore, {
   restore: Effect.fn("ThreadWorktreeRestore.restore")(function () {
     return Effect.void;
   }),
+  takeRecreated: Effect.fn("ThreadWorktreeRestore.takeRecreated")(function () {
+    return Effect.undefined;
+  }),
 });
 
 const layerLegacyV1ThreadImporterNoop = Layer.succeed(

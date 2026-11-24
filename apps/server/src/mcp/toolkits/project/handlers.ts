@@ -87,24 +87,29 @@ function worktreeCheckHint(
   }`;
 }
 
-/** Require project worktrees so launches cannot target arbitrary host directories. */
-const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
+/**
+ * Require project worktrees so launches cannot target arbitrary host directories. Returns the
+ * path Git registered, so the thread stays bound to that worktree.
+ */
+const projectWorktreePath = Effect.fn("mcp.assertProjectWorktree")(function* (
   workspaceRoot: string,
   worktreePath: string,
 ) {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const fileSystem = yield* FileSystem.FileSystem;
   const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
-  const worktrees = yield* git.listWorktreePaths(workspaceRoot).pipe(
-    Effect.flatMap((paths) => Effect.forEach(paths, real)),
-    Effect.orElseSucceed((): ReadonlyArray<string> => []),
-  );
-  if (!worktrees.includes(yield* real(worktreePath)))
-    return yield* new OrchestratorMcpFailure({
-      code: "invalid_request",
-      message:
-        "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
-    });
+  const registered = yield* git
+    .listWorktreePaths(workspaceRoot)
+    .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+  const requested = yield* real(worktreePath);
+  for (const candidate of registered) {
+    if ((yield* real(candidate)) === requested) return candidate;
+  }
+  return yield* new OrchestratorMcpFailure({
+    code: "invalid_request",
+    message:
+      "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
+  });
 });
 
 /** The composer falls back to the project's t3.json when no setting picks the mode. */
@@ -307,15 +312,23 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                   }),
                 ),
               );
-        if (project !== undefined && input.workspaceStrategy?.type === "existing_worktree")
-          yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
+        const workspaceStrategy =
+          project !== undefined && input.workspaceStrategy?.type === "existing_worktree"
+            ? {
+                ...input.workspaceStrategy,
+                worktreePath: yield* projectWorktreePath(
+                  project.workspaceRoot,
+                  input.workspaceStrategy.worktreePath,
+                ),
+              }
+            : input.workspaceStrategy;
         if (!replaying && input.modelSelection !== undefined) {
           const { instanceId, model } = input.modelSelection;
           const registry = yield* ProviderRegistry.ProviderRegistry;
           // The thread runs in this folder, whose own provider config can add models.
           const cwd =
-            input.workspaceStrategy?.type === "existing_worktree"
-              ? input.workspaceStrategy.worktreePath
+            workspaceStrategy?.type === "existing_worktree"
+              ? workspaceStrategy.worktreePath
               : project?.workspaceRoot;
           const requireModel = (
             providers: ReadonlyArray<ServerProvider>,
@@ -358,7 +371,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         // An outside caller follows the new-threads-in-a-worktree default from the checkout's
         // current branch, as the composer does; a thread caller follows the project's setting.
         const requestedStrategy =
-          input.workspaceStrategy ??
+          workspaceStrategy ??
           (input.delegatedFrom !== undefined
             ? undefined
             : caller !== undefined
