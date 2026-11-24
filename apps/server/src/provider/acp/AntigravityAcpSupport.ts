@@ -123,6 +123,8 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       authenticateEagerly: true,
+      // agy acp supports HTTP MCP servers without advertising mcpCapabilities.http.
+      assumeHttpMcpSupport: true,
       resumeMethod: "resume",
       cancelBehavior: "wait-for-prompt",
       clientInfo: antigravityClientInfo(input.runtimeVersion),
