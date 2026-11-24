@@ -86,6 +86,58 @@ function projectHostAndProvider(project: OrchestrationProjectShell | undefined):
   };
 }
 
+const TWO_SEGMENT_REPOSITORY_PROVIDERS = new Set<string>([
+  "github",
+  "bitbucket",
+  "cursor-origin",
+  "gitcafe",
+  "tanstack-source",
+]);
+
+export const validateTargetRepository = Effect.fn("PullRequestsToolkit.validateTargetRepository")(
+  function* (repository: string, project: OrchestrationProjectShell | undefined) {
+    const trimmed = repository.trim();
+    const segments = trimmed.split("/");
+    if (
+      trimmed.length === 0 ||
+      /[\s?#:\\]/u.test(trimmed) ||
+      segments.length < 2 ||
+      segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    ) {
+      return yield* new PullRequestRepositoryInvalidError({});
+    }
+    const projectHost = projectHostAndProvider(project);
+    if (
+      (projectHost.kind === null || TWO_SEGMENT_REPOSITORY_PROVIDERS.has(projectHost.kind)) &&
+      segments.length !== 2
+    ) {
+      return yield* new PullRequestRepositoryInvalidError({});
+    }
+    const firstSegment = segments[0]!.toLowerCase();
+    if (
+      (projectHost.host !== null && firstSegment === projectHost.host.toLowerCase()) ||
+      sourceControlDefinitions.findByPublicHost(firstSegment) !== undefined
+    ) {
+      return yield* new PullRequestRepositoryInvalidError({});
+    }
+    if (projectHost.host !== null && projectHost.kind !== null) {
+      const definition = sourceControlDefinitions.get(projectHost.kind);
+      if (definition.kind !== "unknown") {
+        const url = definition.changeRequestUrl({
+          host: projectHost.host,
+          repository: trimmed,
+          number: 1,
+          remoteUrl: project?.repositoryIdentity?.locator.remoteUrl,
+        });
+        if (url === null) {
+          return yield* new PullRequestRepositoryInvalidError({});
+        }
+      }
+    }
+    return trimmed;
+  },
+);
+
 export const resolveTarget = Effect.fn("PullRequestsToolkit.resolveTarget")(function* (
   input: PullRequestTarget,
   project: OrchestrationProjectShell | undefined,

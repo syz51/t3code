@@ -1356,6 +1356,168 @@ it.effect.each([
 );
 
 it.effect(
+  "targets an explicit fork repository for create, lookup, and default branch while rejecting malformed values",
+  () => {
+    const restCalls: Array<{
+      readonly host: string;
+      readonly method?: string;
+      readonly path: string;
+      readonly body?: unknown;
+    }> = [];
+    const forkPr = {
+      ...node(54, "feature", "me"),
+      title: "Fork PR",
+      url: "https://github.com/me/web/pull/54",
+      baseRefName: "fork",
+      isCrossRepository: false,
+      headRepository: { name: "web", nameWithOwner: "me/web" },
+    };
+    const { layer, graphqlCalls } = harness({
+      remotes: remotesOutput(
+        ["origin", "git@github.com:me/web.git"],
+        ["upstream", "git@github.com:acme/web.git"],
+      ),
+      resolved: "remote.upstream.gh-resolved base",
+      api: {
+        rest: (input) =>
+          Effect.sync(() => {
+            restCalls.push({
+              host: input.host,
+              ...(input.method ? { method: input.method } : {}),
+              path: input.path,
+              ...(input.body !== undefined ? { body: input.body } : {}),
+            });
+            const isFork = input.path.startsWith("repos/me/web");
+            return restResponse({
+              full_name: isFork ? "me/web" : "acme/web",
+              html_url: `https://github.com/${isFork ? "me/web" : "acme/web"}`,
+              ssh_url: `git@github.com:${isFork ? "me/web" : "acme/web"}.git`,
+              default_branch: isFork ? "fork" : "main",
+            });
+          }),
+      },
+      graphql: () => ({ pullRequests: { nodes: [forkPr] } }),
+    });
+    return Effect.gen(function* () {
+      const provider = yield* GitHubSourceControlProvider.make;
+      const fs = yield* FileSystem.FileSystem;
+      const bodyFile = yield* fs.makeTempFileScoped();
+      yield* fs.writeFileString(bodyFile, "Body");
+      const input = {
+        cwd: "/repo",
+        context: {
+          provider: {
+            kind: SourceControlProviderKind.make("github"),
+            name: "GitHub",
+            baseUrl: "https://github.com",
+          },
+          remoteName: "origin",
+          remoteUrl: "git@github.com:me/web.git",
+        },
+      };
+
+      assert.strictEqual(
+        yield* provider.getDefaultBranch({ ...input, repository: "me/web" }),
+        "fork",
+      );
+      yield* provider.createChangeRequest({
+        ...input,
+        baseRefName: "fork",
+        target: { repository: "me/web", refName: "fork" },
+        headSelector: "feature",
+        title: "Fork PR",
+        bodyFile,
+      });
+      const listedFiber = yield* Effect.forkChild(
+        provider.listChangeRequests({
+          ...input,
+          headSelector: "feature",
+          state: "open",
+          repository: "me/web",
+        }),
+      );
+      yield* TestClock.adjust("100 millis");
+      const listed = yield* Fiber.join(listedFiber);
+      assert.strictEqual(listed[0]?.url, "https://github.com/me/web/pull/54");
+
+      // Omitting target/repository preserves upstream default resolution.
+      assert.strictEqual(yield* provider.getDefaultBranch(input), "main");
+      yield* provider.createChangeRequest({
+        ...input,
+        baseRefName: "main",
+        headSelector: "me:feature",
+        title: "Upstream PR",
+        bodyFile,
+      });
+
+      assert.deepStrictEqual(
+        restCalls.map(({ host, method, path, body }) => ({ host, method, path, body })),
+        [
+          { host: "github.com", method: undefined, path: "repos/me/web", body: undefined },
+          {
+            host: "github.com",
+            method: "POST",
+            path: "repos/me/web/pulls",
+            body: {
+              base: "fork",
+              head: "feature",
+              title: "Fork PR",
+              body: "Body",
+              maintainer_can_modify: true,
+            },
+          },
+          { host: "github.com", method: undefined, path: "repos/acme/web", body: undefined },
+          {
+            host: "github.com",
+            method: "POST",
+            path: "repos/acme/web/pulls",
+            body: {
+              base: "main",
+              head: "me:feature",
+              title: "Upstream PR",
+              body: "Body",
+              maintainer_can_modify: true,
+            },
+          },
+        ],
+      );
+      assert.deepStrictEqual(
+        graphqlCalls.flatMap((call) => call.lookups.map(({ owner, name }) => `${owner}/${name}`)),
+        ["me/web"],
+      );
+
+      // Malformed target repositories fail clearly without issuing API requests.
+      const callsBeforeErrors = restCalls.length;
+      const graphqlBeforeErrors = graphqlCalls.length;
+      for (const bad of ["github.com/me/web", "https://evil.test/me/web", "me", "me/web/extra"]) {
+        const createError = yield* Effect.flip(
+          provider.createChangeRequest({
+            ...input,
+            baseRefName: "fork",
+            target: { repository: bad, refName: "fork" },
+            headSelector: "feature",
+            title: "Bad",
+            bodyFile,
+          }),
+        );
+        assert.include(createError.detail, "owner/repo");
+        const listError = yield* Effect.flip(
+          provider.listChangeRequests({
+            ...input,
+            headSelector: "feature",
+            state: "open",
+            repository: bad,
+          }),
+        );
+        assert.include(listError.detail, "owner/repo");
+      }
+      assert.strictEqual(restCalls.length, callsBeforeErrors);
+      assert.strictEqual(graphqlCalls.length, graphqlBeforeErrors);
+    }).pipe(Effect.provide(layer), Effect.provideService(HostProcess.Environment, {}));
+  },
+);
+
+it.effect(
   "says a GH_REPO naming an unparseable host falls back to the remotes, as creation does",
   () => {
     const { layer } = harness({

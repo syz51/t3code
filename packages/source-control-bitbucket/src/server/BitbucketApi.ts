@@ -357,6 +357,7 @@ export class BitbucketApi extends Context.Service<
       readonly source?: SourceControlProvider.SourceControlRefSelector;
       readonly state: "open" | "closed" | "merged" | "all";
       readonly limit?: number;
+      readonly repository?: string;
     }) => Effect.Effect<ReadonlyArray<NormalizedBitbucketPullRequestRecord>, BitbucketApiError>;
     readonly getPullRequest: (input: {
       readonly cwd: string;
@@ -386,6 +387,7 @@ export class BitbucketApi extends Context.Service<
     readonly getDefaultBranch: (input: {
       readonly cwd: string;
       readonly context?: SourceControlProvider.SourceControlProviderContext;
+      readonly repository?: string;
     }) => Effect.Effect<string | null, BitbucketApiError>;
     readonly checkoutPullRequest: (input: {
       readonly cwd: string;
@@ -1141,7 +1143,9 @@ export const make = Effect.gen(function* () {
       );
     }),
     createPullRequest: Effect.fn("BitbucketApi.createPullRequest")(function* (input) {
-      const repository = yield* resolveRepository(input);
+      const repository = yield* resolveRepository(
+        input.target?.repository ? { ...input, repository: input.target.repository } : input,
+      );
       const description = yield* fileSystem.readFileString(input.bodyFile).pipe(
         Effect.mapError(
           (cause) =>

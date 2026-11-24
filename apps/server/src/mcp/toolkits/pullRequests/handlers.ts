@@ -26,7 +26,11 @@ import * as GitManager from "../../../git/GitManager.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as PullRequestWatchService from "../../../pullRequest/PullRequestWatchService.ts";
-import { resolveTarget, type ResolvedTarget } from "../../../pullRequest/pullRequestTarget.ts";
+import {
+  resolveTarget,
+  validateTargetRepository,
+  type ResolvedTarget,
+} from "../../../pullRequest/pullRequestTarget.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import { reviewPositionInPatch } from "../../../pullRequest/pullRequestReviewPosition.ts";
@@ -1052,8 +1056,12 @@ const make = Effect.gen(function* () {
         const thread = yield* requireThread(PullRequestForgeError, undefined);
         const project = yield* projectOf(thread, PullRequestForgeError);
         if (project === undefined) {
-          return yield* new PullRequestProjectNotFoundError({ repository: "" });
+          return yield* new PullRequestProjectNotFoundError({ repository: input.repository ?? "" });
         }
+        const repository =
+          input.repository === undefined
+            ? undefined
+            : yield* validateTargetRepository(input.repository, project);
         const created = yield* git
           .createPullRequest({
             cwd: thread.worktreePath ?? project.workspaceRoot,
@@ -1061,6 +1069,7 @@ const make = Effect.gen(function* () {
             title: input.title,
             body: input.body,
             baseBranch: input.base,
+            ...(repository === undefined ? {} : { repository }),
             draft: input.draft,
             private: input.private,
           })

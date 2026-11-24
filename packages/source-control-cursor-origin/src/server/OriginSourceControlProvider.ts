@@ -143,7 +143,7 @@ export const make = Effect.gen(function* () {
 
     listChangeRequests: Effect.fn("OriginSourceControlProvider.listChangeRequests")(
       function* (input) {
-        const repository = yield* cli.resolveRepository(input);
+        const repository = input.repository ?? (yield* cli.resolveRepository(input));
         const head = SourceControlProvider.sourceBranch(input);
         const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
         const query = new URLSearchParams({
@@ -303,7 +303,7 @@ export const make = Effect.gen(function* () {
 
     getDefaultBranch: Effect.fn("OriginSourceControlProvider.getDefaultBranch")(
       function* (input) {
-        const repository = yield* cli.resolveRepository(input);
+        const repository = input.repository ?? (yield* cli.resolveRepository(input));
         return (
           (yield* getRepository(input.cwd, repository, "getDefaultBranch")).defaultBranch ?? null
         );
