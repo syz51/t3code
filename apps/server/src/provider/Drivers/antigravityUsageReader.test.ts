@@ -404,6 +404,15 @@ describe("readAntigravityUsage", () => {
             20,
             new Uint8Array(protoBytes(9, [...protoNumber(1, 1537), ...protoNumber(2, 30)])),
           ]);
+          // Gemini 4 Neon effort slots (MODEL_PLACEHOLDER_M532..M536) with no name in metadata.
+          for (const [offset, id] of [1532, 1534].entries()) {
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              21 + offset,
+              new Uint8Array(
+                protoBytes(9, [...protoNumber(1, id), ...protoNumber(2, 31 + offset)]),
+              ),
+            ]);
+          }
         }),
       );
       const result = yield* readAntigravityUsage(dir, 0);
@@ -423,9 +432,129 @@ describe("readAntigravityUsage", () => {
           ["gemini-4-neon-xhigh", "gemini-4-neon"],
           ["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen"],
           ["gemini-pro-orchestrator-neon", "gemini-4-neon"],
+          ["gemini-4-neon", undefined],
+          ["gemini-4-neon", undefined],
         ],
       );
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "resolves step-only model IDs when generations alternate between base slug and effort display name",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const dir = yield* tempDir;
+        yield* seedDatabase(path.join(dir, "a-neon-effort-mix.db"), (db) =>
+          Effect.gen(function* () {
+            yield* createTables(db);
+            // Mirrors live 1532 rows where field 19 carries the base slug on most rows but is empty on some.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              0,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1532),
+                  ...protoText(19, "gemini-4-neon"),
+                  ...protoText(21, "Gemini 4 Neon (High)"),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              1,
+              new Uint8Array(
+                protoBytes(1, [...protoNumber(3, 1532), ...protoText(21, "Gemini 4 Neon (High)")]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              10,
+              new Uint8Array(protoBytes(9, [...protoNumber(1, 1532), ...protoNumber(2, 25)])),
+            ]);
+            // Effort display name before base slug for an unmapped ID learned solely from metadata.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              2,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 9010),
+                  ...protoText(21, "Gemini 9.4 Flash (High)"),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              3,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 9010),
+                  ...protoText(19, "gemini-9.4-flash"),
+                  ...protoText(21, "Gemini 9.4 Flash (High)"),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              11,
+              new Uint8Array(protoBytes(9, [...protoNumber(1, 9010), ...protoNumber(2, 26)])),
+            ]);
+            // Multi-suffix names (thinking + effort) must stay order-independent.
+            for (const [idx, name] of [
+              "claude-opus-4-6-thinking-high",
+              "claude-opus-4-6-thinking",
+              "claude-opus-4-6-thinking-low",
+            ].entries()) {
+              yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+                4 + idx,
+                new Uint8Array(protoBytes(1, [...protoNumber(3, 9011), ...protoText(19, name)])),
+              ]);
+            }
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              12,
+              new Uint8Array(protoBytes(9, [...protoNumber(1, 9011), ...protoNumber(2, 27)])),
+            ]);
+            // Intra-DB genuine conflict (null) must propagate across later DBs.
+            for (const [idx, name] of ["Gemini 9.1 Flash", "Gemini 9.2 Flash"].entries()) {
+              yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+                7 + idx,
+                new Uint8Array(protoBytes(1, [...protoNumber(3, 9012), ...protoText(19, name)])),
+              ]);
+            }
+          }),
+        );
+        yield* seedDatabase(path.join(dir, "b-cross-db.db"), (db) =>
+          Effect.gen(function* () {
+            yield* createTables(db);
+            // Cross-DB effort variant merges with DB 1's learned base model.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              0,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 9010),
+                  ...protoText(21, "Gemini 9.4 Flash (Low)"),
+                ]),
+              ),
+            ]);
+            // Single clean name in DB 2 must not override DB 1's genuine conflict for 9012.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              1,
+              new Uint8Array(
+                protoBytes(1, [...protoNumber(3, 9012), ...protoText(19, "Gemini 9.1 Flash")]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              0,
+              new Uint8Array(protoBytes(9, [...protoNumber(1, 9012), ...protoNumber(2, 28)])),
+            ]);
+          }),
+        );
+        const result = yield* readAntigravityUsage(dir, 0);
+        assert.deepStrictEqual(result.errors, []);
+        assert.deepStrictEqual(
+          records(result).map(({ model, rateModel }) => [model, rateModel]),
+          [
+            ["gemini-4-neon", undefined],
+            ["gemini-9.4-flash", undefined],
+            ["claude-opus-4-6", undefined],
+            ["antigravity-model-9012", undefined],
+          ],
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("merges Antigravity aliases that bridge previously separate step records", () =>
