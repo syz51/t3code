@@ -181,8 +181,58 @@ export function isAntigravitySignInRequiredError(error: unknown): boolean {
 
 export interface AntigravityInstanceDirectories {
   readonly profile: string;
-  /** Keep beside the profile: 120-character archive members under its longer name would exceed Windows' 260-character limit. */
+  /** Short, dot-free temp root exported as TMPDIR/TEMP/TMP so unpack globs and POSIX SUN_LEN stay healthy. */
   readonly runtimeTemp: string;
+  /** Private dir inside stateDir for OAuth-bearing isolated text-generation profiles (also sweeps legacy runtimeTemp). */
+  readonly isolatedProfiles: string;
+}
+
+function hasDotDirectorySegment(directory: string): boolean {
+  return directory.split(/[\\/]+/).some((segment) => segment.startsWith("."));
+}
+
+function lookupCaseInsensitiveEnv(env: NodeJS.ProcessEnv, targetKey: string): string | undefined {
+  const upper = targetKey.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === upper && value && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function isWindowsDrivePath(value: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+function resolveWindowsRuntimeTempParent(
+  path: Path.Path,
+  stateDir: string,
+  env: NodeJS.ProcessEnv,
+): string {
+  const localAppData = lookupCaseInsensitiveEnv(env, "LOCALAPPDATA");
+  const candidates: Array<string> = [];
+  if (localAppData && isWindowsDrivePath(localAppData)) {
+    candidates.push(path.join(localAppData, "Temp"));
+  }
+  for (const key of ["TEMP", "TMP"] as const) {
+    const value = lookupCaseInsensitiveEnv(env, key);
+    if (value && isWindowsDrivePath(value)) {
+      candidates.push(value);
+    }
+  }
+  const userProfileMatch = /^([a-zA-Z]:\\Users\\[^\\/]+)(?:[\\/]|$)/i.exec(stateDir);
+  if (userProfileMatch?.[1]) {
+    candidates.push(path.join(userProfileMatch[1], "AppData", "Local", "Temp"));
+  }
+  for (const candidate of candidates) {
+    const normalized = path.normalize(candidate);
+    if (!hasDotDirectorySegment(normalized)) {
+      return path.join(normalized, "t3a");
+    }
+  }
+  const root = path.parse(stateDir).root || "C:\\";
+  return path.join(root, "Temp", "t3a");
 }
 
 /** Hashes the instance ID so case-only differences stay separate on case-insensitive filesystems. */
@@ -192,9 +242,28 @@ export const resolveAntigravityInstanceDirectories = Effect.fn(
   const digest = yield* Digest.Digest;
   const path = yield* Path.Path;
   const key = Hex.encode(yield* digest.digest(Digest.sha256, new TextEncoder().encode(instanceId)));
+  const tempKey = Hex.encode(
+    yield* digest.digest(
+      Digest.sha256,
+      new TextEncoder().encode(`${path.normalize(stateDir)}\0${instanceId}`),
+    ),
+  ).slice(0, 8);
+  const isolatedProfiles = path.join(stateDir, "antigravity-tmp", key.slice(0, 12));
+  if (path.sep === "\\") {
+    const env = yield* HostProcess.Environment;
+    const parent = resolveWindowsRuntimeTempParent(path, stateDir, env);
+    return {
+      profile: path.join(stateDir, "providers", "antigravity", key),
+      runtimeTemp: path.join(parent, tempKey),
+      isolatedProfiles,
+    } satisfies AntigravityInstanceDirectories;
+  }
+  const uid = yield* HostProcess.UserId;
+  const posixParent = uid === undefined ? "/tmp/t3a" : `/tmp/t3-${uid}`;
   return {
     profile: path.join(stateDir, "providers", "antigravity", key),
-    runtimeTemp: path.join(stateDir, "antigravity-tmp", key.slice(0, 12)),
+    runtimeTemp: path.join(posixParent, tempKey),
+    isolatedProfiles,
   } satisfies AntigravityInstanceDirectories;
 });
 
@@ -426,6 +495,45 @@ const copyAntigravityUserConfigFiles = Effect.fn("copyAntigravityUserConfigFiles
   },
 );
 
+const ensurePrivatePosixDirectory = Effect.fn("ensurePrivatePosixDirectory")(function* (
+  directory: string,
+  expectedUid: number | undefined,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs
+    .makeDirectory(directory, { recursive: true, mode: 0o700 })
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory could not be created."),
+      ),
+    );
+  const isSymlink = yield* fs.readLink(directory).pipe(
+    Effect.as(true),
+    Effect.orElseSucceed(() => false),
+  );
+  const info = yield* fs
+    .stat(directory)
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory could not be verified."),
+      ),
+    );
+  if (
+    isSymlink ||
+    info.type !== "Directory" ||
+    (expectedUid !== undefined && Option.isSome(info.uid) && info.uid.value !== expectedUid)
+  ) {
+    return yield* authSupportError("The Antigravity runtime temp directory is not private.");
+  }
+  yield* fs
+    .chmod(directory, 0o700)
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory permissions could not be set."),
+      ),
+    );
+});
+
 const antigravityIsolatedAuthFiles = [
   "antigravity-oauth-token",
   "acp_token.json",
@@ -638,7 +746,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     ),
   );
 
-  for (const directory of [geminiHome, acpDirectory, tempDirectory]) {
+  for (const directory of [geminiHome, acpDirectory]) {
     yield* fs
       .makeDirectory(directory, { recursive: true, mode: 0o700 })
       .pipe(
@@ -655,6 +763,23 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
           ),
         );
     }
+  }
+  if (platform === "win32") {
+    yield* fs
+      .makeDirectory(tempDirectory, { recursive: true, mode: 0o700 })
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity profile directory could not be created."),
+        ),
+      );
+  } else {
+    const currentUid = yield* HostProcess.UserId;
+    const tempParent = path.dirname(tempDirectory);
+    const tempGrandparent = path.dirname(tempParent);
+    if (tempGrandparent === "/tmp" || tempGrandparent === "/private/tmp") {
+      yield* ensurePrivatePosixDirectory(tempParent, currentUid);
+    }
+    yield* ensurePrivatePosixDirectory(tempDirectory, currentUid);
   }
   yield* fs
     .writeFileString(path.join(acpDirectory, "settings.json"), antigravityProfileSettings(auth))

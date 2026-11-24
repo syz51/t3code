@@ -206,39 +206,101 @@ describe("Antigravity process environment", () => {
   it.effect("keeps accounts separate even when instance IDs differ only by case", () =>
     Effect.gen(function* () {
       const first = yield* resolveAntigravityInstanceDirectories(
-        "/userdata",
+        "/Users/developer/.t3/userdata",
         ProviderInstanceId.make("antigravity"),
       );
       const second = yield* resolveAntigravityInstanceDirectories(
-        "/userdata",
+        "/Users/developer/.t3/userdata",
         ProviderInstanceId.make("Antigravity"),
       );
+      const otherState = yield* resolveAntigravityInstanceDirectories(
+        "/Users/developer/.t3-fork/userdata",
+        ProviderInstanceId.make("antigravity"),
+      );
       expect(first.profile).toBe(
-        "/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32",
+        "/Users/developer/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32",
       );
       expect(first.profile.toLowerCase()).not.toBe(second.profile.toLowerCase());
       expect(first.runtimeTemp.toLowerCase()).not.toBe(second.runtimeTemp.toLowerCase());
-    }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix))),
+      expect(first.runtimeTemp).not.toBe(otherState.runtimeTemp);
+      expect(first.isolatedProfiles.toLowerCase()).not.toBe(second.isolatedProfiles.toLowerCase());
+      expect(first.isolatedProfiles).toBe(
+        "/Users/developer/.t3/userdata/antigravity-tmp/ac0a3dfd6ddd",
+      );
+    }).pipe(
+      Effect.provideService(HostProcess.UserId, 501),
+      Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix)),
+    ),
   );
 
-  it.effect("keeps the unpacked Windows runtime under MAX_PATH for long user names", () =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      // Deepest member of the official agy_acp_server_1.1.1 windows-x86_64 bundle.
-      const deepestMember =
-        "google3\\cloud\\developer_experience\\antigravity_extensions\\acp_server\\_private__agy_acp_server_bin.lazy_imports_info.json";
-      const directories = yield* resolveAntigravityInstanceDirectories(
-        "C:\\Users\\a-twenty-char-person\\.t3\\userdata",
-        ProviderInstanceId.make("antigravity"),
-      );
-      const extracted = (tempDirectory: string) =>
-        path.join(tempDirectory, "run-AbC123", "_MEI000012ab2", deepestMember);
-      // MAX_PATH is 260 including the terminating NUL.
-      expect(extracted(directories.runtimeTemp).length).toBeLessThan(260);
-      expect(
-        extracted(path.join(directories.profile, "antigravity-acp", "tmp")).length,
-      ).toBeGreaterThanOrEqual(260);
-    }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerWin32))),
+  it.effect(
+    "keeps POSIX runtime temp dot-free and within 40 chars per run for SUN_LEN safety",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        for (const uid of [501, 1000, 4_294_967_295, undefined] as const) {
+          const directories = yield* resolveAntigravityInstanceDirectories(
+            "/Users/a-long-username/.t3/userdata",
+            ProviderInstanceId.make("antigravity"),
+          ).pipe(Effect.provideService(HostProcess.UserId, uid));
+          const runDir = path.join(directories.runtimeTemp, "run-AbC123");
+          expect(runDir.split("/").some((segment) => segment.startsWith("."))).toBe(false);
+          expect(runDir.length).toBeLessThanOrEqual(40);
+          expect(directories.runtimeTemp.startsWith("/tmp/")).toBe(true);
+          expect(
+            directories.isolatedProfiles.startsWith("/Users/a-long-username/.t3/userdata/"),
+          ).toBe(true);
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix))),
+  );
+
+  it.effect(
+    "keeps the unpacked Windows runtime dot-free and under MAX_PATH for long user names",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        // Deepest member of the official agy_acp_server_1.1.1 windows-x86_64 bundle.
+        const deepestMember =
+          "google3\\cloud\\developer_experience\\antigravity_extensions\\acp_server\\_private__agy_acp_server_bin.lazy_imports_info.json";
+        const directories = yield* resolveAntigravityInstanceDirectories(
+          "C:\\Users\\a-twenty-char-person\\.t3\\userdata",
+          ProviderInstanceId.make("antigravity"),
+        ).pipe(
+          Effect.provideService(HostProcess.Environment, {
+            LOCALAPPDATA: "C:\\Users\\a-twenty-char-person\\AppData\\Local",
+            TEMP: "C:\\Users\\a-twenty-char-person\\.t3\\userdata\\antigravity-tmp\\legacy\\run-1",
+          }),
+        );
+        const extracted = (tempDirectory: string) =>
+          path.join(tempDirectory, "run-AbC123", "_MEI000012ab2", deepestMember);
+        // MAX_PATH is 260 including the terminating NUL.
+        expect(
+          directories.runtimeTemp.split(/[\\/]+/).some((segment) => segment.startsWith(".")),
+        ).toBe(false);
+        expect(directories.runtimeTemp).toContain("AppData\\Local\\Temp\\t3a\\");
+        expect(extracted(directories.runtimeTemp).length).toBeLessThan(260);
+        expect(
+          extracted(path.join(directories.profile, "antigravity-acp", "tmp")).length,
+        ).toBeGreaterThanOrEqual(260);
+        expect(directories.isolatedProfiles).toBe(
+          "C:\\Users\\a-twenty-char-person\\.t3\\userdata\\antigravity-tmp\\ac0a3dfd6ddd",
+        );
+
+        // Even if LOCALAPPDATA and TEMP contain dot segments, fall back to a dot-free drive root Temp.
+        const dotFallback = yield* resolveAntigravityInstanceDirectories(
+          "C:\\Users\\.dotuser\\.t3\\userdata",
+          ProviderInstanceId.make("antigravity"),
+        ).pipe(
+          Effect.provideService(HostProcess.Environment, {
+            LOCALAPPDATA: "C:\\Users\\.dotuser\\AppData\\Local",
+            TEMP: "C:\\Users\\.dotuser\\AppData\\Local\\Temp",
+          }),
+        );
+        expect(
+          dotFallback.runtimeTemp.split(/[\\/]+/).some((segment) => segment.startsWith(".")),
+        ).toBe(false);
+        expect(dotFallback.runtimeTemp.startsWith("C:\\Temp\\t3a\\")).toBe(true);
+      }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerWin32))),
   );
 });
 
@@ -654,6 +716,49 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       yield* prepareAntigravityProfile({ profileDirectory: profile.geminiHome });
       expect(yield* fs.readFileString(profile.tokenPath)).toBe("synthetic-token-fixture");
     }),
+  );
+
+  caTest(
+    "enforces 0o700 permissions on shared /tmp runtime temp parents and rejects symlinked targets",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const sharedParent = yield* fs.makeTempDirectoryScoped({
+          directory: "/tmp",
+          prefix: "t3-ag-priv-",
+        });
+        yield* fs.chmod(sharedParent, 0o755);
+        const tempDirectory = path.join(sharedParent, "abcd1234");
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          tempDirectory,
+        });
+        expect(profile.tempDirectory).toBe(tempDirectory);
+        expect((yield* fs.stat(sharedParent)).mode & 0o777).toBe(0o700);
+        expect((yield* fs.stat(tempDirectory)).mode & 0o777).toBe(0o700);
+
+        const symlinkTarget = path.join(temporaryDirectory, "redirected");
+        yield* fs.makeDirectory(symlinkTarget, { recursive: true });
+        const symlinkParent = `${sharedParent}-link`;
+        yield* fs.symlink(symlinkTarget, symlinkParent);
+        yield* Effect.addFinalizer(() =>
+          fs.remove(symlinkParent, { force: true }).pipe(Effect.ignore),
+        );
+
+        const rejected = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile-2"),
+          tempDirectory: path.join(symlinkParent, "abcd1234"),
+        }).pipe(Effect.result);
+        expect(Result.isFailure(rejected)).toBe(true);
+        if (Result.isFailure(rejected)) {
+          expect(rejected.failure).toMatchObject({
+            _tag: "AcpTransportError",
+            detail: "The Antigravity runtime temp directory is not private.",
+          });
+        }
+      }),
   );
 
   it.effect.skipIf(!symlinksSupported)(

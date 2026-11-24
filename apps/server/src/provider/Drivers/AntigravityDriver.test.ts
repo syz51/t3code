@@ -61,6 +61,21 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+const cleanupRuntimeTempRoot = Effect.fnUntraced(function* (runtimeTemp: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const parent = path.dirname(runtimeTemp);
+  const retiredPrefix = `${path.basename(runtimeTemp)}.old-`;
+  yield* fs.remove(runtimeTemp, { recursive: true, force: true }).pipe(Effect.ignore);
+  const entries = yield* fs.readDirectory(parent).pipe(Effect.orElseSucceed(() => []));
+  yield* Effect.forEach(
+    entries.filter((entry) => entry.startsWith(retiredPrefix)),
+    (entry) =>
+      fs.remove(path.join(parent, entry), { recursive: true, force: true }).pipe(Effect.ignore),
+    { discard: true },
+  );
+});
+
 const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   options: {
     readonly config?: Partial<AntigravitySettings>;
@@ -83,6 +98,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   );
   const requestLog = path.join(root, "requests.jsonl");
   const directories = yield* resolveAntigravityInstanceDirectories(config.stateDir, instanceId);
+  yield* Effect.addFinalizer(() => cleanupRuntimeTempRoot(directories.runtimeTemp));
   const profileDirectory = directories.profile;
   const instancePath = `${path.join(root, "instance-bin")}:${baseEnv.PATH ?? ""}`;
 
@@ -693,8 +709,13 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           config.stateDir,
           instanceId,
         );
-        const legacyRoot = path.join(directories.profile, "antigravity-acp", "tmp");
-        for (const root of [directories.runtimeTemp, legacyRoot]) {
+        yield* Effect.addFinalizer(() => cleanupRuntimeTempRoot(directories.runtimeTemp));
+        const legacyProfileRoot = path.join(directories.profile, "antigravity-acp", "tmp");
+        for (const root of [
+          directories.runtimeTemp,
+          directories.isolatedProfiles,
+          legacyProfileRoot,
+        ]) {
           const orphan = path.join(root, "run-orphan", "_MEI123", "google3");
           yield* fs.makeDirectory(orphan, { recursive: true });
           yield* fs.writeFileString(path.join(orphan, "payload.bin"), "stale");
@@ -715,15 +736,17 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           ),
         );
         expect(yield* fs.exists(directories.runtimeTemp)).toBe(false);
-        expect(yield* fs.exists(legacyRoot)).toBe(false);
+        expect(yield* fs.exists(directories.isolatedProfiles)).toBe(false);
+        expect(yield* fs.exists(legacyProfileRoot)).toBe(false);
       }),
   );
 
   it.effect.skipIf(windowsHost)(
-    "runs text generation in an isolated profile under runtimeTemp even with hooks and MCP configured",
+    "runs text generation in an isolated profile inside private stateDir with short dot-free runtimeTemp",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness();
+        const config = yield* ServerConfig.ServerConfig;
         const configDir = h.path.join(h.profileDirectory, "config");
         const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
         yield* h.fs.makeDirectory(configDir, { recursive: true });
@@ -757,6 +780,21 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(helperLaunch).toBeDefined();
         expect(helperLaunch?.profileDirectory).not.toBe(h.profileDirectory);
         expect(helperLaunch?.profileDirectory).toContain("text-profile-");
+        expect(
+          helperLaunch?.profileDirectory?.startsWith(
+            `${h.directories.isolatedProfiles}${h.path.sep}`,
+          ),
+        ).toBe(true);
+        expect(helperLaunch?.profileDirectory?.startsWith(`${config.stateDir}${h.path.sep}`)).toBe(
+          true,
+        );
+        expect(
+          helperLaunch?.tempDirectory?.startsWith(`${h.directories.runtimeTemp}${h.path.sep}`),
+        ).toBe(true);
+        expect(helperLaunch?.tempDirectory?.length).toBeLessThanOrEqual(40);
+        expect(
+          helperLaunch?.tempDirectory?.split("/").some((segment) => segment.startsWith(".")),
+        ).toBe(false);
         if (helperLaunch?.profileDirectory) {
           expect(yield* h.fs.exists(helperLaunch.profileDirectory)).toBe(false);
         }
