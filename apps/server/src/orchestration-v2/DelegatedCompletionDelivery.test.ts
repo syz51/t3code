@@ -760,7 +760,7 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
       const notice = projection.turnItems.find((item) => item.type === "notification");
       assert.match(
         notice?.type === "notification" ? notice.summary : "",
-        /^2 of 3 delegated tasks finished:/,
+        /^2 of 3 delegated task turns ended:/,
       );
     }),
   );
@@ -1188,7 +1188,7 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
       assert.equal(wake.status, "queued");
       const message = rewritten.messages.find((row) => row.id === delivery.messageId);
       assert.deepEqual(message?.delegatedCompletion?.taskIds, [siblingId]);
-      assert.equal(message?.text, `Delegated task ${siblingId} [completed]:\nchild finished`);
+      assert.equal(message?.text, `Delegated task ${siblingId} [turn ended]:\nchild finished`);
 
       yield* acknowledge(siblingId);
       const cancelled = yield* orchestrator.getThreadProjection(threadId);

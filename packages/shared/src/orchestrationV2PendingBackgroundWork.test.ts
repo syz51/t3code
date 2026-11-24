@@ -543,5 +543,82 @@ describe("derivePendingBackgroundWork kinds", () => {
         }),
       ).toEqual([]);
     });
+
+    it("clears derived waiting state when a background wait fires, child finishes, or watch ends", () => {
+      const settledRun = { id: "run-1" as never, ordinal: 1, status: "completed" as const };
+      const awaitedCmd = derivePendingBackgroundWork({
+        latestRun: settledRun,
+        providerThreads: [
+          {
+            id: ProviderThreadId.make("pt-1"),
+            pendingBackgroundTasks: [
+              { taskId: "cmd-1", kind: "command", description: "gh run watch", awaited: true },
+            ],
+          },
+        ],
+        turnItems: [],
+      });
+      expect(backgroundWorkHoldsCompletion(awaitedCmd)).toBe(true);
+      expect(
+        backgroundWorkHoldsCompletion(
+          derivePendingBackgroundWork({
+            latestRun: settledRun,
+            providerThreads: [{ id: ProviderThreadId.make("pt-1"), pendingBackgroundTasks: [] }],
+            turnItems: [],
+          }),
+        ),
+      ).toBe(false);
+
+      const activeChild = derivePendingBackgroundWork({
+        latestRun: settledRun,
+        providerThreads: [],
+        turnItems: [
+          {
+            id: "subagent-1",
+            type: "subagent",
+            status: "running",
+            title: "Investigate auth bug",
+            childThreadId: "thread:child" as never,
+          },
+        ],
+      });
+      expect(backgroundWorkHoldsCompletion(activeChild)).toBe(true);
+      expect(activeChild[0]?.description).toBe("Investigate auth bug");
+      expect(
+        backgroundWorkHoldsCompletion(
+          derivePendingBackgroundWork({
+            latestRun: settledRun,
+            providerThreads: [],
+            turnItems: [
+              {
+                id: "subagent-1",
+                type: "subagent",
+                status: "completed",
+                title: "Investigate auth bug",
+                childThreadId: "thread:child" as never,
+              },
+            ],
+          }),
+        ),
+      ).toBe(false);
+
+      const watchedPr = derivePendingBackgroundWork({
+        latestRun: settledRun,
+        providerThreads: [],
+        turnItems: [],
+        pullRequests,
+      });
+      expect(backgroundWorkHoldsCompletion(watchedPr)).toBe(true);
+      expect(
+        backgroundWorkHoldsCompletion(
+          derivePendingBackgroundWork({
+            latestRun: settledRun,
+            providerThreads: [],
+            turnItems: [],
+            pullRequests: [{ ...link(1, {}), watch: undefined }],
+          }),
+        ),
+      ).toBe(false);
+    });
   });
 });

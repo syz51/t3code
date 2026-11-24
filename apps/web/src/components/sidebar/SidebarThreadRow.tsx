@@ -27,6 +27,7 @@ import {
   formatWorkingDurationLabel,
   resolveThreadProviderStack,
 } from "@t3tools/client-runtime/state/models";
+import { presentPendingBackgroundWork } from "@t3tools/client-runtime/state/thread-execution";
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { toServerClock } from "@t3tools/client-runtime/clock";
 import {
@@ -293,6 +294,7 @@ function SidebarThreadTooltip({
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
   const gt = useGT();
   const m = useMessages();
+  const pendingBackgroundWork = presentPendingBackgroundWork(thread.pendingBackgroundTasks, m);
   return (
     <ThreadHoverCardPopup side="right" align="start" sideOffset={4}>
       <ThreadHoverCard
@@ -369,6 +371,19 @@ function SidebarThreadTooltip({
               <T>
                 Handed off from <Var>{previousProviderNames.join(", ")}</Var>
               </T>
+            </div>
+          </div>
+        ) : null}
+        {pendingBackgroundWork ? (
+          <div className="flex min-w-0 items-start gap-2">
+            <CircleDashedIcon className="mt-0.5 size-3 shrink-0 stroke-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-foreground/75">{pendingBackgroundWork.title}</div>
+              {pendingBackgroundWork.items.length > 1 ? (
+                <div className="truncate text-muted-foreground">
+                  {pendingBackgroundWork.items.map((item) => item.label).join(", ")}
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -1064,9 +1079,22 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
       </span>
     ) : null;
 
+  const pendingBackgroundWork = presentPendingBackgroundWork(
+    thread.pendingBackgroundTasks,
+    messages,
+  );
+  const waitingWork =
+    status === "waiting" && pendingBackgroundWork?.waiting ? pendingBackgroundWork : null;
+  const waitingDetail =
+    waitingWork === null
+      ? null
+      : waitingWork.items.length === 1
+        ? (waitingWork.items[0]?.label ?? waitingWork.title)
+        : waitingWork.title;
+
   const accessibility = resolveSidebarRowAccessibility({
     title: thread.title,
-    statusLabel: topStatus?.label ?? null,
+    statusLabel: waitingWork?.title ?? topStatus?.label ?? null,
     projectDisplayName: props.projectDisplayName,
     isActive: props.isActive,
   });
@@ -1262,6 +1290,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const diff = latestRunDiff(thread);
   // Only the trailing icons would remain, so the row moves them to the title line instead.
   const metaLineEmpty =
+    waitingDetail === null &&
     props.environmentLabel === null &&
     prBadge === null &&
     issueBadge === null &&
@@ -1269,7 +1298,15 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     runningTerminalIds.length === 0;
   const metaLine = metaLineEmpty ? null : (
     <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
-      {props.environmentLabel !== null ? (
+      {waitingDetail !== null ? (
+        <span
+          data-testid="sidebar-waiting-detail"
+          className="flex min-w-0 flex-1 items-center gap-1 text-muted-foreground"
+        >
+          <CircleDashedIcon aria-hidden className="size-3 shrink-0" />
+          <span className="min-w-0 truncate">{waitingDetail}</span>
+        </span>
+      ) : props.environmentLabel !== null ? (
         <>
           <EnvironmentMachineIcon
             aria-hidden

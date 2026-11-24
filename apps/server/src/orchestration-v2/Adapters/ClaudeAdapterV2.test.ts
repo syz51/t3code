@@ -14032,6 +14032,88 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect("matches a running Claude background Agent subagent in awaitBackgroundTasks", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      const awaitBackgroundTasks = harness.runtime.awaitBackgroundTasks;
+      if (awaitBackgroundTasks === undefined) {
+        throw new Error("Claude adapter runtime must expose awaitBackgroundTasks.");
+      }
+      const subagentTaskId = "claude-agent-task-1";
+      const subagentToolUseId = "toolu_agent_wait_1";
+      const startFrame = claudeSdkFrame({
+        type: "system",
+        subtype: "task_started",
+        task_id: subagentTaskId,
+        tool_use_id: subagentToolUseId,
+        description: "Review PR diff",
+        task_type: "local_agent",
+        uuid: "00000000-0000-4000-8000-000000000311",
+        session_id: WAKE_NATIVE_SESSION,
+      });
+      const finishFrame = claudeSdkFrame({
+        type: "system",
+        subtype: "task_notification",
+        task_id: subagentTaskId,
+        tool_use_id: subagentToolUseId,
+        status: "completed",
+        output_file: "",
+        summary: "Review complete",
+        uuid: "00000000-0000-4000-8000-000000000312",
+        session_id: WAKE_NATIVE_SESSION,
+      });
+
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("attempt-claude-await-subagent"),
+          text: "Start a background reviewer agent.",
+          attachments: [],
+        }),
+      );
+      yield* harness.offerAndWait(startFrame);
+
+      const matchedRunning = yield* awaitBackgroundTasks({
+        providerThread: harness.providerThread,
+        taskIds: [subagentTaskId, "unknown-id"],
+        awaited: true,
+      });
+      assert.deepStrictEqual(matchedRunning.matched, [subagentTaskId]);
+
+      // Clearing wait does not claim to un-await a subagent that always wakes the session.
+      const clearAttempt = yield* awaitBackgroundTasks({
+        providerThread: harness.providerThread,
+        taskIds: [subagentTaskId],
+        awaited: false,
+      });
+      assert.deepStrictEqual(clearAttempt.matched, []);
+
+      // Once the subagent completes, awaitBackgroundTasks stops matching it.
+      yield* harness.offerAndWait(finishFrame);
+      const matchedFinished = yield* awaitBackgroundTasks({
+        providerThread: harness.providerThread,
+        taskIds: [subagentTaskId],
+        awaited: true,
+      });
+      assert.deepStrictEqual(matchedFinished.matched, []);
+
+      yield* Queue.offer(harness.sdkMessages, turnOneResult);
+      yield* Queue.take(harness.terminalReceipts);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
   it.effect("keeps a running Claude monitor typed after many newer monitors end", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
