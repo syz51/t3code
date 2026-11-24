@@ -140,6 +140,8 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     readonly enabled?: boolean;
     readonly safe?: boolean;
     readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+    readonly clearUsageBackoff?: Effect.Effect<void>;
+    readonly readAccountEmail?: Effect.Effect<string | undefined>;
     readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   } = {},
 ) {
@@ -157,6 +159,8 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
       ...(options.auth ? { auth: options.auth } : {}),
       ...(options.probeUsage ? { probeUsage: options.probeUsage } : {}),
+      ...(options.clearUsageBackoff ? { clearUsageBackoff: options.clearUsageBackoff } : {}),
+      ...(options.readAccountEmail ? { readAccountEmail: options.readAccountEmail } : {}),
       ...(options.rememberedRuntimeModes
         ? { rememberedRuntimeModes: options.rememberedRuntimeModes }
         : {}),
@@ -171,20 +175,22 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       ),
     },
   );
-  const initialUpdate = yield* Stream.toPull(
-    provider.snapshot.streamChanges.pipe(
-      Stream.filter((snapshot) => snapshot.installed || snapshot.status === "error"),
-    ),
+  // Subscribe before the trigger; yield the returned pull to await the publish.
+  const nextPublish = (predicate: (snapshot: ServerProvider) => boolean) =>
+    Stream.runCollect(
+      provider.snapshot.streamChanges.pipe(Stream.filter(predicate), Stream.take(1)),
+    ).pipe(
+      Effect.forkChild,
+      Effect.tap(() => Effect.yieldNow),
+      Effect.map((fiber) => Fiber.join(fiber).pipe(Effect.map((snapshots) => snapshots[0]))),
+    );
+  const initialUpdate = yield* nextPublish(
+    (snapshot) => snapshot.installed || snapshot.status === "error",
   );
   const initialize = Deferred.succeed(initialProbe, initializeResult).pipe(
     Effect.andThen(initialUpdate),
     Effect.asVoid,
   );
-  // Subscribe before the trigger; yield the returned pull to await the publish.
-  const nextPublish = (predicate: (snapshot: ServerProvider) => boolean) =>
-    Stream.toPull(provider.snapshot.streamChanges.pipe(Stream.filter(predicate))).pipe(
-      Effect.map((pull) => pull.pipe(Effect.map((snapshots) => snapshots[0]))),
-    );
   return {
     provider,
     probe,
@@ -1000,6 +1006,160 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
       yield* harness.provider.onSessionStarted(started);
       expect((yield* republished)?.usageLimits).toEqual(failed);
+    }),
+  );
+
+  it.effect(
+    "explicit refresh clears renewal backoff, awaits updated limits, and populates account email",
+    () =>
+      Effect.gen(function* () {
+        const readStarted = yield* Deferred.make<void>();
+        const readResult = yield* Deferred.make<ServerProviderUsageLimits>();
+        const backoffClears = yield* Ref.make(0);
+        const initialLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 4 }],
+        };
+        const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+          Effect.succeed(initialLimits),
+        );
+        const harness = yield* makeHarness({
+          probeUsage: Ref.get(usage).pipe(Effect.flatten),
+          clearUsageBackoff: Ref.update(backoffClears, (count) => count + 1),
+          readAccountEmail: Effect.succeed("user@example.com"),
+        });
+        const firstPublished = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* firstPublished)?.auth.email).toBe("user@example.com");
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+        const updatedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:05:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 18 },
+          ],
+        };
+        yield* Ref.set(
+          usage,
+          Deferred.succeed(readStarted, undefined).pipe(Effect.andThen(Deferred.await(readResult))),
+        );
+        const refreshFiber = yield* harness.provider.snapshot.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(readStarted);
+        expect(yield* Ref.get(backoffClears)).toBe(1);
+        yield* Deferred.succeed(readResult, updatedLimits);
+        const refreshed = yield* Fiber.join(refreshFiber);
+        expect(refreshed.usageLimits).toEqual(updatedLimits);
+        expect(refreshed.auth.email).toBe("user@example.com");
+
+        yield* harness.provider.onSignedOut;
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.email).toBeUndefined();
+      }),
+  );
+
+  it.effect(
+    "clears stale auth.email on account switch and drops probeFailed limits while unauthenticated",
+    () =>
+      Effect.gen(function* () {
+        const email = yield* Ref.make<string | undefined>("alice@example.com");
+        const usage = yield* Ref.make<ServerProviderUsageLimits>({
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 5 }],
+        });
+        const harness = yield* makeHarness({
+          probeUsage: Ref.get(usage),
+          readAccountEmail: Ref.get(email),
+        });
+        const firstPublished = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+        yield* harness.initialize;
+        expect((yield* firstPublished)?.auth.email).toBe("alice@example.com");
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.email).toBe("alice@example.com");
+
+        // Switching to a credential without id_token_email clears the previous account email.
+        yield* Ref.set(email, undefined);
+        yield* harness.provider.onSignedIn;
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.email).toBeUndefined();
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.email).toBeUndefined();
+
+        // Removing id_token_email on disk clears auth.email on the next health check.
+        yield* Ref.set(email, "bob@example.com");
+        expect((yield* harness.provider.snapshot.refresh).auth.email).toBe("bob@example.com");
+        yield* Ref.set(email, undefined);
+        expect((yield* harness.provider.snapshot.refresh).auth.email).toBeUndefined();
+
+        // When auth is required, a probeFailed renewal result must not attach to the snapshot.
+        yield* Ref.set(usage, {
+          checkedAt: "2026-10-09T12:05:00.000Z",
+          windows: [],
+          unavailable: {
+            reason: "probeFailed",
+            message: "Antigravity's saved sign-in has expired.",
+          },
+        });
+        yield* harness.provider.onAuthRequired;
+        const afterRefresh = yield* harness.provider.snapshot.refresh;
+        expect(afterRefresh.auth.status).toBe("unauthenticated");
+        expect(afterRefresh.usageLimits).toBeUndefined();
+      }),
+  );
+
+  it.effect("refreshes stale limits on session start and when an isolated token is renewed", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-09T12:00:00.000Z"));
+      const reads = yield* Ref.make(0);
+      const backoffClears = yield* Ref.make(0);
+      const currentLimits = yield* Ref.make<ServerProviderUsageLimits>({
+        checkedAt: "2026-10-09T12:00:00.000Z",
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 4 }],
+      });
+      const harness = yield* makeHarness({
+        probeUsage: Ref.update(reads, (count) => count + 1).pipe(
+          Effect.andThen(Ref.get(currentLimits)),
+        ),
+        clearUsageBackoff: Ref.update(backoffClears, (count) => count + 1),
+      });
+      const firstPublished = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
+      yield* harness.initialize;
+      yield* firstPublished;
+      expect(yield* Ref.get(reads)).toBe(1);
+      yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+
+      // Fresh limits within 60s do not trigger a redundant read on session start.
+      yield* harness.provider.onSessionStarted(started, "/workspace");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(reads)).toBe(1);
+
+      // Once limits age past 60s, starting a session refreshes them in the background.
+      yield* TestClock.adjust("61 seconds");
+      const nextLimits: ServerProviderUsageLimits = {
+        checkedAt: "2026-10-09T12:01:01.000Z",
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 12 }],
+      };
+      yield* Ref.set(currentLimits, nextLimits);
+      const secondPublished = yield* harness.nextPublish(
+        (snapshot) => snapshot.usageLimits?.checkedAt === nextLimits.checkedAt,
+      );
+      yield* harness.provider.onSessionStarted(started, "/workspace");
+      expect((yield* secondPublished)?.usageLimits).toEqual(nextLimits);
+      expect(yield* Ref.get(reads)).toBe(2);
+
+      // Token renewal clears backoff and refreshes once stale.
+      yield* TestClock.adjust("61 seconds");
+      const renewedLimits: ServerProviderUsageLimits = {
+        checkedAt: "2026-10-09T12:02:02.000Z",
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 15 }],
+      };
+      yield* Ref.set(currentLimits, renewedLimits);
+      const thirdPublished = yield* harness.nextPublish(
+        (snapshot) => snapshot.usageLimits?.checkedAt === renewedLimits.checkedAt,
+      );
+      yield* harness.provider.onTokenRefreshed;
+      expect((yield* thirdPublished)?.usageLimits).toEqual(renewedLimits);
+      expect(yield* Ref.get(backoffClears)).toBe(1);
+      expect(yield* Ref.get(reads)).toBe(3);
     }),
   );
 });

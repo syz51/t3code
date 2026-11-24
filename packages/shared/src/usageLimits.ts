@@ -451,11 +451,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   return [...accounts.values()];
 }
 
-/** Hub accounts whose read failed and that no other report shows as a row, with their names. */
-export function unshownFailedHubAccounts(
+function shownLimitRowKeys(
   presentations: LimitPresentations,
-): ReadonlyMap<UsageLimitSourceAccount, string> {
-  const resolveKey = limitAccountKeyResolver(presentations);
+  resolveKey: ReturnType<typeof accountKeyResolver>,
+): ReadonlySet<string> {
   const shownRows = new Set<string>();
   for (const [environmentId, presentation] of presentations) {
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
@@ -471,6 +470,15 @@ export function unshownFailedHubAccounts(
       }
     }
   }
+  return shownRows;
+}
+
+/** Hub accounts whose read failed and that no other report shows as a row, with their names. */
+export function unshownFailedHubAccounts(
+  presentations: LimitPresentations,
+): ReadonlyMap<UsageLimitSourceAccount, string> {
+  const resolveKey = limitAccountKeyResolver(presentations);
+  const shownRows = shownLimitRowKeys(presentations, resolveKey);
   const failed = new Map<UsageLimitSourceAccount, string>();
   for (const [environmentId, presentation] of presentations) {
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
@@ -482,6 +490,22 @@ export function unshownFailedHubAccounts(
     }
   }
   return failed;
+}
+
+/** Native providers whose read failed even though another report already shows that account as a row. */
+export function shownNativeProviderKeys(presentations: LimitPresentations): ReadonlySet<string> {
+  const resolveKey = limitAccountKeyResolver(presentations);
+  const shownRows = shownLimitRowKeys(presentations, resolveKey);
+  const covered = new Set<string>();
+  for (const [environmentId, presentation] of presentations) {
+    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
+      if (provider.usageLimits?.unavailable?.reason !== "probeFailed") continue;
+      if (shownRows.has(nativeRowKey(resolveKey, environmentId, provider))) {
+        covered.add(`${environmentId}:${provider.instanceId}`);
+      }
+    }
+  }
+  return covered;
 }
 
 export interface LimitPoolMember {

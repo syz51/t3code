@@ -4,6 +4,7 @@ import {
   ProviderDriverKind,
   ProviderSetupError,
   RuntimeMode,
+  type ServerProvider,
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
@@ -91,6 +92,18 @@ const RememberedRuntimeModes = Schema.fromJsonString(
 );
 const decodeRememberedRuntimeModes = Schema.decodeUnknownOption(RememberedRuntimeModes);
 const encodeRememberedRuntimeModes = Schema.encodeSync(RememberedRuntimeModes);
+const CliOAuthTokenFile = Schema.fromJsonString(
+  Schema.Struct({
+    token: Schema.Struct({
+      access_token: Schema.NonEmptyString,
+      refresh_token: Schema.optional(Schema.String),
+      expiry: Schema.optional(Schema.String),
+    }),
+    id_token_email: Schema.optional(Schema.String),
+  }),
+);
+const decodeCliOAuthTokenFile = Schema.decodeUnknownOption(CliOAuthTokenFile);
+const CLI_RENEW_TIMEOUT = "20 seconds";
 const REFRESH_FAILED =
   "Could not refresh Antigravity models. The previous model list is unchanged.";
 const PYTHON_SOCKS_REQUIRED = "python-socks is required to use a SOCKS proxy";
@@ -586,9 +599,56 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    let readProviderAuthStatus: () => Effect.Effect<ServerProvider["auth"]["status"]> = () =>
+      Effect.succeed("unknown");
+
+    const renewCliToken =
+      auth.authMethod !== "oauth-personal"
+        ? undefined
+        : Effect.fn("AntigravityDriver.renewCliToken")(
+            function* () {
+              if ((yield* readProviderAuthStatus()) === "unauthenticated") {
+                return;
+              }
+              const processScope = yield* Scope.make();
+              yield* Effect.addFinalizer((exit) => Scope.close(processScope, exit));
+              yield* authFlow
+                .withProcess(
+                  Scope.close(processScope, Exit.void),
+                  Effect.gen(function* () {
+                    const cwd = yield* fileSystem.makeTempDirectoryScoped({
+                      prefix: "t3-antigravity-renew-",
+                    });
+                    // Strip display vars alongside SSH_CONNECTION so a revoked token fails fast without opening a browser.
+                    const {
+                      DISPLAY: _display,
+                      WAYLAND_DISPLAY: _wayland,
+                      ...headlessEnv
+                    } = processEnvironment;
+                    const { executable, spawn } = yield* prepareSpawn(cwd, headlessEnv);
+                    const runtime = yield* makeAntigravityAcpRuntime({
+                      cwd,
+                      mcpServers: [],
+                      runtimeVersion: executable.version,
+                      authMethod: auth.authMethod,
+                      childProcessSpawner: spawner,
+                      spawn,
+                    }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
+                    yield* runtime.initialize();
+                    yield* runtime.request("authenticate", { methodId: auth.authMethod });
+                  }),
+                )
+                .pipe(Effect.provideService(Scope.Scope, processScope));
+            },
+            Effect.scoped,
+            Effect.timeout(CLI_RENEW_TIMEOUT),
+            Effect.ignore,
+          );
+
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      ...(renewCliToken ? { renewCliToken: renewCliToken() } : {}),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
@@ -601,6 +661,8 @@ export const AntigravityDriver: ProviderDriver<
       probe,
       probeUsage: usage.probe,
       clearUsage: usage.clear,
+      clearUsageBackoff: usage.clearRenewBackoff,
+      readAccountEmail: usage.readStoredEmail,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>
@@ -624,6 +686,8 @@ export const AntigravityDriver: ProviderDriver<
           }),
       ),
     );
+    readProviderAuthStatus = () =>
+      provider.snapshot.getSnapshot.pipe(Effect.map((snapshot) => snapshot.auth.status));
     const defaultModel = currentCatalog.pipe(Effect.map((catalog) => catalog?.defaultChatModel));
     const orchestrationAdapter = yield* makeAntigravityAdapterV2({
       instanceId,
@@ -655,6 +719,69 @@ export const AntigravityDriver: ProviderDriver<
           threadId,
         }),
     });
+    const readCliTokenRecord = (filePath: string) =>
+      fileSystem.readFileString(filePath).pipe(
+        Effect.map((contents) =>
+          decodeCliOAuthTokenFile(contents).pipe(
+            Option.map((decoded) => ({
+              contents,
+              refreshToken: decoded.token.refresh_token?.trim() || undefined,
+              expiryMs: Date.parse(decoded.token.expiry ?? ""),
+              email: decoded.id_token_email?.trim().toLowerCase() || undefined,
+            })),
+            Option.getOrUndefined,
+          ),
+        ),
+        Effect.orElseSucceed(() => undefined),
+      );
+
+    const syncRenewedCliToken = Effect.fn("AntigravityDriver.syncRenewedCliToken")(
+      function* (input: {
+        readonly sourceTokenPath: string;
+        readonly isolatedTokenPath: string;
+        readonly originalSource:
+          | {
+              readonly refreshToken: string | undefined;
+              readonly email: string | undefined;
+            }
+          | undefined;
+      }) {
+        if (input.originalSource === undefined) return false;
+        const isolated = yield* readCliTokenRecord(input.isolatedTokenPath);
+        if (isolated === undefined || !Number.isFinite(isolated.expiryMs)) return false;
+        const currentSource = yield* readCliTokenRecord(input.sourceTokenPath);
+        if (currentSource === undefined) return false;
+        if (
+          (input.originalSource.refreshToken !== undefined &&
+            currentSource.refreshToken !== input.originalSource.refreshToken) ||
+          (input.originalSource.email !== undefined &&
+            currentSource.email !== input.originalSource.email) ||
+          (isolated.email !== undefined &&
+            currentSource.email !== undefined &&
+            isolated.email !== currentSource.email)
+        ) {
+          return false;
+        }
+        if (
+          Number.isFinite(currentSource.expiryMs) &&
+          isolated.expiryMs <= currentSource.expiryMs
+        ) {
+          return false;
+        }
+        yield* writeFileStringAtomically({
+          filePath: input.sourceTokenPath,
+          contents: isolated.contents,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
+        if ((yield* HostProcess.Platform) !== "win32") {
+          yield* fileSystem.chmod(input.sourceTokenPath, 0o600).pipe(Effect.ignore);
+        }
+        return true;
+      },
+    );
+
     const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
       function* (cwd: string) {
         yield* fileSystem
@@ -684,6 +811,28 @@ export const AntigravityDriver: ProviderDriver<
                 }),
             ),
           );
+        const sourceTokenPath = path.join(
+          profileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const isolatedTokenPath = path.join(
+          isolatedProfileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const originalSource = yield* readCliTokenRecord(sourceTokenPath);
+        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
+        yield* Effect.addFinalizer(() =>
+          syncRenewedCliToken({
+            sourceTokenPath,
+            isolatedTokenPath,
+            originalSource,
+          }).pipe(
+            Effect.flatMap((synced) => (synced ? provider.onTokenRefreshed : Effect.void)),
+            Effect.ignore,
+          ),
+        );
         return yield* makeRuntime({
           cwd,
           mcpServers: [],

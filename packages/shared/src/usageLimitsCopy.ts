@@ -15,6 +15,7 @@ import {
   providersWithLimits,
   type ResetCreditChoice,
   resetCountdown,
+  shownNativeProviderKeys,
   unshownFailedHubAccounts,
 } from "./usageLimits.ts";
 
@@ -87,9 +88,10 @@ export function collectLimitNotices(
   const label = (environmentLabel: string, subject: string) =>
     presentations.size > 1 ? `${environmentLabel} · ${subject}` : subject;
   const notices = new Set<string>();
-  // A failed hub read needs no notice when another report already shows the account's row.
+  // A failed read needs no notice when another report already shows that account's row.
   const failedAccounts = unshownFailedHubAccounts(presentations);
-  for (const presentation of presentations.values()) {
+  const coveredNativeProviders = shownNativeProviderKeys(presentations);
+  for (const [environmentId, presentation] of presentations) {
     const environmentLabel = presentation.entry.target.label;
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       const limits = provider.usageLimits;
@@ -100,6 +102,7 @@ export function collectLimitNotices(
       ) {
         continue;
       }
+      if (coveredNativeProviders.has(`${environmentId}:${provider.instanceId}`)) continue;
       const notice = limits ? limitsNotice(limits, resolve) : null;
       const name = provider.displayName?.trim() || String(provider.driver);
       if (notice) notices.add(`${label(environmentLabel, name)}: ${notice}`);

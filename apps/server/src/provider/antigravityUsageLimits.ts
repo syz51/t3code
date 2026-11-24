@@ -41,14 +41,17 @@ const TokenFile = Schema.Struct({
   project_id: Schema.optional(Schema.String),
 });
 // The 1.5.x CLI never writes acp_token.json: it keeps its sign-in in the OS keyring, or in
-// antigravity-oauth-token without one or when T3 bypasses the keyring. It stores no OAuth client, so T3 cannot refresh it.
+// antigravity-oauth-token without one or when T3 bypasses the keyring. It stores no OAuth client,
+// so T3 asks the CLI to renew expired file-backed tokens via headless ACP authenticate.
 const CliToken = Schema.Struct({
   token: Schema.Struct({
     access_token: Schema.NonEmptyString,
     refresh_token: Schema.optional(Schema.String),
     expiry: Schema.optional(Schema.String),
   }),
+  id_token_email: Schema.optional(Schema.String),
 });
+const CLI_RENEW_FAILURE_BACKOFF_MS = 15 * 60_000;
 const TokenResponse = Schema.Struct({
   access_token: Schema.NonEmptyString,
   expires_in: Schema.Number.check(Schema.isGreaterThan(0)),
@@ -321,6 +324,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly readKeyringSecret?: Effect.Effect<string | undefined, AntigravityKeyringError>;
+  readonly renewCliToken?: Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -338,7 +342,24 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   let cached:
     | { fingerprint: string; account: string; accessToken: string; expiresAt: number }
     | undefined;
+  let failedRenew: { readonly key: string; readonly retryAfter: number } | undefined;
   let generation = 0;
+
+  const isFreshCliToken = (expiry: string | undefined, at: number) =>
+    Date.parse(expiry ?? "") > at + 60_000;
+
+  const readStoredEmail = Effect.gen(function* () {
+    if (input.authMethod !== "oauth-personal" && input.authMethod !== "oauth-business") {
+      return undefined;
+    }
+    if (yield* fs.exists(tokenPath)) return undefined;
+    if (!(yield* fs.exists(cliTokenPath))) return undefined;
+    const decoded = yield* fs
+      .readFileString(cliTokenPath)
+      .pipe(Effect.flatMap(decodeCliToken), Effect.option);
+    const email = Option.isSome(decoded) ? decoded.value.id_token_email?.trim() : undefined;
+    return email && email.length > 0 ? email : undefined;
+  }).pipe(Effect.orElseSucceed(() => undefined));
 
   const request = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(
@@ -360,7 +381,8 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     if (!(yield* fs.exists(tokenPath))) {
       cached = undefined;
       // Google account instances bypass the keyring, whose one entry every profile shares.
-      const stored = (yield* fs.exists(cliTokenPath))
+      const fromFile = yield* fs.exists(cliTokenPath);
+      const stored = fromFile
         ? yield* fs.readFileString(cliTokenPath)
         : input.authMethod === "oauth-business"
           ? yield* readKeyringSecret
@@ -372,14 +394,38 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
           message: "Sign in with Google to see Antigravity limits.",
         });
       }
-      const { token } = yield* decodeCliToken(stored);
-      if (!(Date.parse(token.expiry ?? "") > now + 60_000)) {
-        return makeUnavailableUsageLimits({
-          checkedAt,
-          reason: "probeFailed",
-          message:
-            "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.",
-        });
+      let { token } = yield* decodeCliToken(stored);
+      if (!isFreshCliToken(token.expiry, now)) {
+        const refreshToken = token.refresh_token?.trim();
+        if (fromFile && input.renewCliToken !== undefined && refreshToken) {
+          const renewKey = `${refreshToken}\0${token.expiry ?? ""}`;
+          if (failedRenew?.key !== renewKey || now >= failedRenew.retryAfter) {
+            yield* input.renewCliToken;
+            const renewed = (yield* fs.exists(cliTokenPath))
+              ? yield* fs
+                  .readFileString(cliTokenPath)
+                  .pipe(Effect.flatMap(decodeCliToken), Effect.option)
+              : Option.none();
+            const renewedAt = yield* Clock.currentTimeMillis;
+            if (Option.isSome(renewed) && isFreshCliToken(renewed.value.token.expiry, renewedAt)) {
+              token = renewed.value.token;
+              if (generation === startedGeneration) failedRenew = undefined;
+            } else if (generation === startedGeneration) {
+              failedRenew = {
+                key: renewKey,
+                retryAfter: renewedAt + CLI_RENEW_FAILURE_BACKOFF_MS,
+              };
+            }
+          }
+        }
+        if (!isFreshCliToken(token.expiry, yield* Clock.currentTimeMillis)) {
+          return makeUnavailableUsageLimits({
+            checkedAt,
+            reason: "probeFailed",
+            message:
+              "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.",
+          });
+        }
       }
       accessToken = token.access_token;
       account = yield* request(
@@ -497,8 +543,13 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   );
   return {
     probe,
+    readStoredEmail,
+    clearRenewBackoff: Effect.sync(() => {
+      failedRenew = undefined;
+    }),
     clear: Effect.sync(() => {
       cached = undefined;
+      failedRenew = undefined;
       generation++;
     }),
   };
