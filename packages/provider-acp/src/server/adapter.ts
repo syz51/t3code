@@ -652,6 +652,7 @@ export interface AcpAdapterV2Flavor {
     ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   };
   readonly runtimeHarness?: string;
+  readonly orchestrationInstructions?: string;
   readonly registerExtensions?: (
     context: AcpAdapterV2ExtensionContext,
   ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
@@ -9303,6 +9304,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const text = t3AcpPromptWithInstructions({
             prompt: messageText,
             state: instructionState,
+            ...(flavor.orchestrationInstructions === undefined
+              ? {}
+              : { orchestrationInstructions: flavor.orchestrationInstructions }),
             ...(previousInstructionState === undefined || compactionMarker !== undefined
               ? {}
               : { previousState: previousInstructionState }),
