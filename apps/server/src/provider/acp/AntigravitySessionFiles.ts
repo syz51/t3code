@@ -2,8 +2,10 @@
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -180,6 +182,22 @@ export const retireAntigravityRuntimeTempDirs = Effect.fn("retireAntigravityRunt
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const parent = path.dirname(tempDirectory);
+    const parentIsSymlink = yield* fs.readLink(parent).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (parentIsSymlink) return Effect.void;
+    const currentUid = yield* HostProcess.UserId;
+    const parentInfo = yield* fs.stat(parent).pipe(Effect.option);
+    if (
+      Option.isSome(parentInfo) &&
+      (parentInfo.value.type !== "Directory" ||
+        (currentUid !== undefined &&
+          Option.isSome(parentInfo.value.uid) &&
+          parentInfo.value.uid.value !== currentUid))
+    ) {
+      return Effect.void;
+    }
     const prefix = `${path.basename(tempDirectory)}.old-`;
     if (yield* fs.exists(tempDirectory)) {
       yield* fs.makeTempDirectory({ directory: parent, prefix }).pipe(

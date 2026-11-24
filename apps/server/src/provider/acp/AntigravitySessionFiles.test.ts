@@ -4,6 +4,7 @@ import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -275,5 +276,44 @@ it.layer(NodeServices.layer)("retireAntigravityRuntimeTempDirs", (it) => {
         yield* removeRetired;
         expect(removed).toEqual(["/state/antigravity-tmp/abc123"]);
       }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "refuses to sweep through a symlinked parent directory",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const targetParent = path.join(root, "real-parent");
+        const orphan = path.join(targetParent, "abc123", "run-orphan");
+        yield* fs.makeDirectory(orphan, { recursive: true });
+        const symlinkParent = path.join(root, "link-parent");
+        yield* fs.symlink(targetParent, symlinkParent);
+
+        const removeRetired = yield* retireAntigravityRuntimeTempDirs(
+          path.join(symlinkParent, "abc123"),
+        );
+        yield* removeRetired;
+        expect(yield* fs.exists(orphan)).toBe(true);
+      }),
+  );
+
+  it.effect("refuses to sweep inside a parent directory owned by another user", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const parent = yield* fs.makeTempDirectoryScoped();
+      const orphan = path.join(parent, "abc123", "run-orphan");
+      yield* fs.makeDirectory(orphan, { recursive: true });
+      const actualUid = (yield* fs.stat(parent)).uid;
+      if (actualUid._tag !== "Some") return;
+
+      const removeRetired = yield* retireAntigravityRuntimeTempDirs(
+        path.join(parent, "abc123"),
+      ).pipe(Effect.provideService(HostProcess.UserId, actualUid.value + 1));
+      yield* removeRetired;
+      expect(yield* fs.exists(orphan)).toBe(true);
+    }),
   );
 });

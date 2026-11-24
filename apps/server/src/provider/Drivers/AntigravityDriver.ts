@@ -210,6 +210,7 @@ export const AntigravityDriver: ProviderDriver<
     );
     for (const directory of [
       directories.runtimeTemp,
+      directories.isolatedProfiles,
       path.join(profileDirectory, "antigravity-acp", "tmp"),
     ]) {
       const removeRetired = yield* retireAntigravityRuntimeTempDirs(directory).pipe(
@@ -785,7 +786,7 @@ export const AntigravityDriver: ProviderDriver<
     const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
       function* (cwd: string) {
         yield* fileSystem
-          .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+          .makeDirectory(directories.isolatedProfiles, { recursive: true, mode: 0o700 })
           .pipe(
             Effect.mapError(
               () =>
@@ -796,9 +797,12 @@ export const AntigravityDriver: ProviderDriver<
                 }),
             ),
           );
+        if ((yield* HostProcess.Platform) !== "win32") {
+          yield* fileSystem.chmod(directories.isolatedProfiles, 0o700).pipe(Effect.ignore);
+        }
         const isolatedProfileDirectory = yield* fileSystem
           .makeTempDirectoryScoped({
-            directory: directories.runtimeTemp,
+            directory: directories.isolatedProfiles,
             prefix: "text-profile-",
           })
           .pipe(
