@@ -1114,8 +1114,6 @@ export interface AcpSessionActivationOptions {
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly acpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly httpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
-  /** Use `httpMcpServers` even when `initialize` omits `mcpCapabilities.http`. */
-  readonly assumeHttpMcpSupport?: boolean;
 }
 
 export class AcpSessionRuntime extends Context.Service<

@@ -35,6 +35,7 @@ import { normalizeAntigravitySessionUpdate } from "./AntigravityProtocol.ts";
 
 export interface AntigravityAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
+  | "assumeHttpMcpSupport"
   | "authMethodId"
   | "authenticateEagerly"
   | "cancelBehavior"
