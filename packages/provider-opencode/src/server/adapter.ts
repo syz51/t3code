@@ -3517,6 +3517,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               buildRuntimeInstructions({
                 harness: "OpenCode",
                 model: turn.modelSelection.model,
+                delegatedChild: turn.appThread.lineage.relationshipToParent === "subagent",
                 agentFeedback: hasT3Mcp ? turn.agentFeedback : "off",
                 runtimePolicy: turn.runtimePolicy,
               }),

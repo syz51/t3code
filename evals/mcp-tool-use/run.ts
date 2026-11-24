@@ -41,6 +41,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
 import { advertisedJsonSchema } from "../../apps/server/src/mcp/advertisedJsonSchema.ts";
+import { compactToolResult } from "../../apps/server/src/mcp/compactResults.ts";
 import * as Contracts from "@t3tools/contracts";
 import {
   EnvironmentId,
@@ -610,6 +611,7 @@ const claudeQueryOptions = (
   model: Model,
   device = true,
   browser = true,
+  delegatedChild = false,
   agentFeedback: Contracts.AgentFeedbackMode = "off",
 ) => {
   // Refs whose text follows a capability read its flag; older ones ignore it.
@@ -625,18 +627,26 @@ const claudeQueryOptions = (
     agentFeedback,
     deviceToolsAvailable: device,
     browserToolsAvailable: browser,
+    delegatedChild,
   };
   return makeClaudeQueryOptions(input);
 };
 
-/** Text T3 appends to Claude Code's system prompt. Delegated children get the same text. */
+/** Text T3 appends to Claude Code's system prompt. A delegated child gets its own PR block. */
 export const t3SystemAppend = (
   model: Model,
   device = true,
   browser = true,
+  delegatedChild = false,
   agentFeedback: Contracts.AgentFeedbackMode = "off",
 ) => {
-  const { systemPrompt } = claudeQueryOptions(model, device, browser, agentFeedback);
+  const { systemPrompt } = claudeQueryOptions(
+    model,
+    device,
+    browser,
+    delegatedChild,
+    agentFeedback,
+  );
   if (isRecord(systemPrompt) && systemPrompt.type === "preset" && systemPrompt.append) {
     return systemPrompt.append;
   }
@@ -755,7 +765,13 @@ export const buildBase = (
   const append = options.nativeSubagent
     ? ""
     : forArm(
-        t3SystemAppend(model, options.deviceAccess, options.browserAccess, options.agentFeedback),
+        t3SystemAppend(
+          model,
+          options.deviceAccess,
+          options.browserAccess,
+          options.subagent,
+          options.agentFeedback,
+        ),
         options.arm,
       );
   const modelLine = `You are powered by the model named ${MODELS[model]}. The exact model ID is ${model}.`;
@@ -867,6 +883,7 @@ const buildCodexBase = (
     {
       model: options.model,
       reasoningEffort: effort,
+      delegatedChild: options.subagent === true,
       agentFeedback: options.agentFeedback ?? "off",
     },
     { browser: options.browserAccess ?? true, device: options.deviceAccess ?? true },
@@ -1825,6 +1842,12 @@ const unsavedSecretNote = (Contracts as Record<string, unknown>).SECRET_REQUEST_
   | Readonly<Record<string, string>>
   | undefined;
 
+/** A thread or task result as T3 sends it: with its product fields, less what the transport cuts. */
+const asSent = (name: string, input: unknown, value: unknown, child: boolean): unknown => {
+  const whole = withProductFields(name, value, child);
+  return compactToolResult(name, input, whole) ?? whole;
+};
+
 /** Fields T3 adds to real thread and task results, applied to mocks and defaults alike. */
 const withProductFields = (name: string, value: unknown, child: boolean): unknown => {
   if (!isRecord(value)) return value;
@@ -2344,7 +2367,7 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
       call.id,
       name === "orchestrator_capabilities"
         ? capabilities(sample, mock)
-        : withProductFields(name, mock, testCase.setup.role === "delegated-child"),
+        : asSent(name, input, mock, testCase.setup.role === "delegated-child"),
     );
   }
   if (isT3Name(call.name)) {
@@ -2370,7 +2393,7 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
       call.id,
       name === "orchestrator_capabilities"
         ? capabilities(sample, value)
-        : withProductFields(name, value, testCase.setup.role === "delegated-child"),
+        : asSent(name, input, value, testCase.setup.role === "delegated-child"),
     );
   }
   if (call.name === "clock__curr_time")

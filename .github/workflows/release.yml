@@ -54,8 +54,8 @@ jobs:
   resolve_commit:
     name: Resolve release commit
     if: github.repository == 'pingdotgg/t3code' && (github.event_name != 'schedule' || vars.PAUSE_NIGHTLY != 'true')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10 # fork-scaled: 5
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
       nightly_version: ${{ steps.resolve.outputs.nightly_version }}
@@ -110,8 +110,8 @@ jobs:
     if: |
       needs.resolve_commit.result == 'success' &&
       (github.event_name != 'schedule' || needs.resolve_commit.outputs.has_changes == 'true')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
       version: ${{ steps.release_meta.outputs.version }}
@@ -138,8 +138,6 @@ jobs:
         uses: ./.github/actions/setup-ci-deps
         with:
           task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
-        env:
-          pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
 
       - id: release_meta
         name: Resolve release version
@@ -223,20 +221,12 @@ jobs:
             --current-tag "${{ steps.release_meta.outputs.tag }}" \
             --github-output
 
-      # Share only the verification results, not the large registry metadata cache.
-      - name: Upload dependency verification
-        continue-on-error: true
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-dependency-verification
-          path: ${{ runner.temp }}/pnpm-metadata/lockfile-verified.jsonl
-
   quality:
     name: Release quality checks
     needs: [preflight]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -267,8 +257,8 @@ jobs:
     name: Release tests
     needs: [preflight]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -303,8 +293,8 @@ jobs:
     name: Release web tests ${{ matrix.shard }}
     needs: [preflight]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     strategy:
       fail-fast: false
       matrix:
@@ -362,7 +352,7 @@ jobs:
     name: Release server tests ${{ matrix.shard }}
     needs: [preflight]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -400,8 +390,8 @@ jobs:
     if: |
       needs.resolve_commit.result == 'success' &&
       (github.event_name != 'schedule' || needs.resolve_commit.outputs.has_changes == 'true')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10 # fork-scaled: 5
     # Previews build any branch, but production admits only main and v* tags.
     # The empty name runs previews with no environment, so their Clerk and relay
     # ids come from .env.example. Everything else matches nightly: the tracing
@@ -434,7 +424,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=t3code-relay...
+          install-args: --filter=t3code-relay... --filter=@t3tools/monorepo
 
       # The deployed stack's outputs, read from Alchemy's state store without
       # planning or applying. Select the backend explicitly to avoid loading
@@ -522,8 +512,8 @@ jobs:
     # this runs alongside preflight. See the condition comment there.
     needs: [preflight, relay_public_config]
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.relay_public_config.result == 'success' }}
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 240 # fork-scaled: 30
     outputs:
       npm_launcher_artifact_id: ${{ steps.npm_launcher.outputs.artifact-id }}
     env:
@@ -541,21 +531,10 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
 
-      # pnpm checks the lockfile and policy before reusing this result. A missing
-      # artifact leaves the cache empty, so installation runs the checks again.
-      - name: Download dependency verification
-        continue-on-error: true
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-dependency-verification
-          path: ${{ runner.temp }}/pnpm-metadata
-
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
-        env:
-          pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       - name: Download relay client tracing config
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -652,7 +631,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS arm64
-      runner: blacksmith-12vcpu-macos-26
+      runner: macos-26 # fork-mapped: blacksmith-12vcpu-macos-26
       platform: mac
       target: dmg
       arch: arm64
@@ -660,8 +639,8 @@ jobs:
       resource_key: darwin-arm64
       cli_archive: true
       launch_check: true
-      # desktop_mac_x64 saves the shared pnpm store; this job finishes last.
-      save_pnpm_store: false
+      # desktop_mac_x64 saves the shared install cache; this job finishes last.
+      save_install_cache: false
 
   desktop_mac_x64:
     name: Desktop macOS x64
@@ -678,7 +657,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS x64
-      runner: blacksmith-12vcpu-macos-26
+      runner: macos-26 # fork-mapped: blacksmith-12vcpu-macos-26
       platform: mac
       target: dmg
       arch: x64
@@ -704,7 +683,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Linux x64
-      runner: blacksmith-32vcpu-ubuntu-2404
+      runner: ubuntu-24.04 # fork-mapped: blacksmith-32vcpu-ubuntu-2404
       platform: linux
       target: AppImage
       arch: x64
@@ -730,7 +709,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Linux arm64
-      runner: blacksmith-16vcpu-ubuntu-2404-arm
+      runner: ubuntu-24.04-arm # fork-mapped: blacksmith-16vcpu-ubuntu-2404-arm
       platform: linux
       target: AppImage
       arch: arm64
@@ -758,7 +737,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Windows x64
-      runner: blacksmith-16vcpu-ubuntu-2404
+      runner: ubuntu-24.04 # fork-mapped: blacksmith-16vcpu-ubuntu-2404
       verify_runner: windows-2025
       platform: win
       target: nsis
@@ -782,7 +761,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Windows arm64
-      runner: blacksmith-16vcpu-ubuntu-2404
+      runner: ubuntu-24.04 # fork-mapped: blacksmith-16vcpu-ubuntu-2404
       verify_runner: windows-11-arm
       platform: win
       target: nsis
@@ -809,8 +788,8 @@ jobs:
         desktop_win_arm64,
       ]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.relay_public_config.result == 'success' && needs.quality.result == 'success' && needs.test.result == 'success' && needs.test_web.result == 'success' && needs.test_server.result == 'success' && needs.desktop_mac_arm64.result == 'success' && needs.desktop_mac_x64.result == 'success' && needs.desktop_linux_x64.result == 'success' && needs.desktop_linux_arm64.result == 'success' && needs.desktop_win_x64.result == 'success' && needs.desktop_win_arm64.result == 'success' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60 # fork-scaled: 30
     permissions:
       contents: write
       # Release notes read PR bodies and authors.
@@ -831,7 +810,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       # Overlaps the artifact downloads. The wait below ends it before any
       # workspace script runs, so the Play key lives only in this process.
@@ -841,7 +820,7 @@ jobs:
         if: needs.preflight.outputs.release_channel == 'nightly'
         background: true
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 10 # fork-scaled: 5
         env:
           GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
           PACKAGE_NAME: com.t3tools.t3code
@@ -944,7 +923,7 @@ jobs:
       - name: Write release notes
         if: needs.preflight.outputs.release_channel != 'preview' && needs.preflight.outputs.previous_tag != ''
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 10 # fork-scaled: 5
         env:
           GH_TOKEN: ${{ github.token }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -1032,7 +1011,7 @@ jobs:
     name: Check the update feed
     needs: [preflight, release]
     if: ${{ !cancelled() && github.repository == 'pingdotgg/t3code' && ((github.event_name == 'schedule' && vars.PAUSE_NIGHTLY != 'true') || needs.preflight.outputs.release_channel == 'nightly') }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: write
@@ -1118,7 +1097,6 @@ jobs:
           sparse-checkout: |
             /.github/actions/setup-ci-deps/
             /package.json
-            /pnpm-workspace.yaml
           sparse-checkout-cone-mode: false
 
       - name: Setup Node.js
@@ -1185,8 +1163,8 @@ jobs:
     name: Build hosted web app
     needs: [preflight, relay_public_config]
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.relay_public_config.result == 'success' && needs.preflight.outputs.release_channel != 'preview' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     outputs:
       deployment_url: ${{ steps.deploy.outputs.deployment_url }}
     env:
@@ -1209,7 +1187,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts... --filter=@t3tools/web...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/web... --filter=@t3tools/monorepo
 
       - name: Download relay client tracing config
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1288,7 +1266,7 @@ jobs:
     name: Deploy hosted web app
     needs: [preflight, build_web, release, publish_cli]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build_web.result == 'success' && needs.release.result == 'success' && needs.publish_cli.result == 'success' && needs.preflight.outputs.release_channel != 'preview' }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     env:
       DEPLOYMENT_URL: ${{ needs.build_web.outputs.deployment_url }}
@@ -1309,7 +1287,6 @@ jobs:
           sparse-checkout: |
             /.github/actions/setup-ci-deps/
             /package.json
-            /pnpm-workspace.yaml
           sparse-checkout-cone-mode: false
 
       - name: Setup Vite+
@@ -1363,8 +1340,8 @@ jobs:
     name: Build marketing site
     needs: [preflight]
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.preflight.outputs.release_channel == 'nightly' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     outputs:
       deployment_url: ${{ steps.deploy.outputs.deployment_url }}
       project_id: ${{ steps.deploy.outputs.project_id }}
@@ -1383,7 +1360,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/marketing...
+          install-args: --filter=@t3tools/marketing... --filter=@t3tools/monorepo
 
       # The Vercel secrets are on this step only, not on the install above.
       - id: deploy
@@ -1432,7 +1409,7 @@ jobs:
     name: Deploy marketing site
     needs: [preflight, build_marketing, release]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.build_marketing.result == 'success' && needs.release.result == 'success' && needs.preflight.outputs.release_channel == 'nightly' }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     env:
       DEPLOYMENT_URL: ${{ needs.build_marketing.outputs.deployment_url }}
@@ -1475,8 +1452,8 @@ jobs:
     name: Finalize release
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.release.result == 'success' && needs.preflight.outputs.release_channel == 'stable' }}
     needs: [preflight, release]
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - id: app_token
         name: Mint release app token
@@ -1511,7 +1488,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code... --filter=@t3tools/monorepo
 
       - id: update_versions
         name: Update version strings
@@ -1533,7 +1510,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if git diff --quiet -- apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json pnpm-lock.yaml; then
+          if git diff --quiet -- apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json bun.lock; then
             echo "No version changes to commit."
             exit 0
           fi
@@ -1541,7 +1518,7 @@ jobs:
           git config user.name "${{ steps.app_bot.outputs.name }}"
           git config user.email "${{ steps.app_bot.outputs.email }}"
 
-          git add apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json pnpm-lock.yaml
+          git add apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json bun.lock
           git commit --no-verify -m "chore(release): prepare $RELEASE_TAG"
 
           # main moves while this job runs, so a rejected push rebases and retries.
@@ -1567,8 +1544,8 @@ jobs:
       needs.deploy_web.result == 'success' &&
       (needs.finalize.result == 'success' || needs.finalize.result == 'skipped')
     needs: [preflight, relay_public_config, release, deploy_web, finalize]
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -1582,7 +1559,7 @@ jobs:
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       - name: Read published release notes
         if: needs.preflight.outputs.is_prerelease == 'true'

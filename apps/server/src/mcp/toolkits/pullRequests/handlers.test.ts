@@ -563,7 +563,16 @@ describe("pull request toolkit handlers", () => {
           makeLink(1, { headBranch: "feat-a", baseBranch: "main", source: "created" }),
           makeLink(2, { headBranch: "feat-b", baseBranch: "feat-a", source: "agent" }),
           makeLink(9, { source: "stack-dismissed" }),
-          makeLink(10),
+          makeLink(10, {
+            watchRecord: {
+              ended: { reason: "merged", at: "2026-01-02T00:00:00.000Z" },
+              skipped: {
+                reason: "rate-limited",
+                at: "2026-01-01T12:00:00.000Z",
+                resumedAt: "2026-01-01T12:30:00.000Z",
+              },
+            },
+          }),
         ]),
       });
       const result = yield* harness.call("list_thread_pull_requests", {});
@@ -582,12 +591,25 @@ describe("pull request toolkit handlers", () => {
         isDraft: false,
         stack: { kind: "derived", position: 3, size: 3 },
       });
-      expect(result.pullRequests[3]).toMatchObject({
+      expect(result.pullRequests[3]).toEqual({
+        host: "github.com",
+        repository: "t3tools/t3code",
         number: 10,
+        url: "https://github.com/t3tools/t3code/pull/10",
+        source: "manual",
+        watching: false,
         state: null,
         title: null,
         headBranch: null,
+        baseBranch: null,
+        isDraft: null,
         stack: null,
+        watchEnded: { reason: "merged", at: "2026-01-02T00:00:00.000Z" },
+        watchSkipped: {
+          reason: "rate-limited",
+          at: "2026-01-01T12:00:00.000Z",
+          resumedAt: "2026-01-01T12:30:00.000Z",
+        },
       });
       expect(result.chains).toEqual([
         { kind: "derived", numbers: [1, 2, 3] },
@@ -1231,6 +1253,8 @@ describe("source control tools", () => {
     Effect.gen(function* () {
       const opened: Array<{
         readonly cwd: string;
+        readonly baseBranch: string | undefined;
+        readonly repository: string | undefined;
         readonly draft: boolean | undefined;
         readonly private: boolean | undefined;
       }> = [];
@@ -1242,13 +1266,19 @@ describe("source control tools", () => {
         git: {
           createPullRequest: (input) =>
             Effect.sync(() =>
-              opened.push({ cwd: input.cwd, draft: input.draft, private: input.private }),
+              opened.push({
+                cwd: input.cwd,
+                baseBranch: input.baseBranch,
+                repository: input.repository,
+                draft: input.draft,
+                private: input.private,
+              }),
             ).pipe(
               Effect.as({
                 status: "created" as const,
-                url: "https://github.com/t3tools/t3code/pull/43",
+                url: `https://github.com/${input.repository ?? "t3tools/t3code"}/pull/43`,
                 number: 43,
-                baseBranch: "main",
+                baseBranch: input.baseBranch ?? "main",
                 headBranch: "tools",
                 title: input.title,
               }),
@@ -1261,11 +1291,82 @@ describe("source control tools", () => {
         draft: true,
         private: true,
       });
-      expect(result).toMatchObject({ number: 43, created: true });
-      expect(opened).toEqual([{ cwd: "/workspace/worktree", draft: true, private: true }]);
-      expect(yield* Ref.get(harness.commands)).toMatchObject([
-        { type: "thread.pull-request.link", number: 43, source: "created" },
+      expect(result).toMatchObject({ repository: "t3tools/t3code", number: 43, created: true });
+      expect(opened).toEqual([
+        {
+          cwd: "/workspace/worktree",
+          baseBranch: undefined,
+          repository: undefined,
+          draft: true,
+          private: true,
+        },
       ]);
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        {
+          type: "thread.pull-request.link",
+          repository: "t3tools/t3code",
+          number: 43,
+          source: "created",
+        },
+      ]);
+
+      // An explicit repository targets and links the named fork repository.
+      const forkResult = yield* harness.call("pull_request_create", {
+        title: "Fork change",
+        body: "Targets fork.",
+        base: "fork",
+        repository: "syz51/t3code",
+      });
+      expect(forkResult).toMatchObject({
+        host: "github.com",
+        repository: "syz51/t3code",
+        number: 43,
+        url: "https://github.com/syz51/t3code/pull/43",
+        created: true,
+      });
+      expect(opened[1]).toEqual({
+        cwd: "/workspace/worktree",
+        baseBranch: "fork",
+        repository: "syz51/t3code",
+        draft: undefined,
+        private: undefined,
+      });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        {
+          type: "thread.pull-request.link",
+          repository: "t3tools/t3code",
+          number: 43,
+          source: "created",
+        },
+        {
+          type: "thread.pull-request.link",
+          repository: "syz51/t3code",
+          number: 43,
+          url: "https://github.com/syz51/t3code/pull/43",
+          source: "created",
+        },
+      ]);
+
+      // Malformed repository values fail before pushing or opening a PR.
+      for (const badRepository of [
+        "github.com/syz51/t3code",
+        "https://github.com/syz51/t3code",
+        "syz51",
+        "syz51/t3code/extra",
+        "syz51/..",
+        "syz51/t3code?foo=bar",
+      ]) {
+        const error = yield* harness
+          .call("pull_request_create", {
+            title: "Bad repo",
+            body: "Should fail.",
+            repository: badRepository,
+          })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({ _tag: "PullRequestRepositoryInvalidError" });
+        expect(error.message).toContain("owner/repo");
+      }
+      expect(opened).toHaveLength(2);
     }),
   );
 

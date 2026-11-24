@@ -9,7 +9,7 @@ import {
   CommandId,
   EnvironmentId,
   NodeId,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -81,7 +81,7 @@ const declaredFailure = (result: McpSchema.CallToolResult) => {
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 
 const decodeMcpAttachmentInput = Schema.decodeUnknownEffect(McpAttachmentInput);
-const decodeThreadReadResult = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
+const decodeThreadReadResult = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadToolResult);
 const decodeThreadSearchResult = Schema.decodeUnknownEffect(
   ThreadToolkit.tools.t3_thread_search.successSchema,
 );

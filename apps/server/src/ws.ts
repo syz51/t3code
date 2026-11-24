@@ -122,6 +122,7 @@ import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as ShellThreadReads from "./orchestration-v2/ShellThreadReads.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as ThreadViewers from "./orchestration-v2/ThreadViewers.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
@@ -267,6 +268,7 @@ import * as IssueService from "./issue/IssueService.ts";
 import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
+import * as PullRequestWatchService from "./pullRequest/PullRequestWatchService.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -1162,6 +1164,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const shellThreadReads = yield* ShellThreadReads.ShellThreadReads;
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
     const projects = yield* ProjectStore.ProjectStoreV2;
     const projectService = yield* ProjectService.ProjectService;
@@ -1241,24 +1244,13 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
       const coalesced = coalesceShellApplicationEvents(events);
-      const threadIds = coalesced.flatMap((stored) =>
-        "aggregateKind" in stored ? [] : [stored.event.threadId],
+      const shells = yield* shellThreadReads.read(
+        coalesced.flatMap((stored) =>
+          "aggregateKind" in stored
+            ? []
+            : [{ threadId: stored.event.threadId, sequence: stored.sequence }],
+        ),
       );
-      // A failed batch can't name its thread, so the scalar reads below report which one is bad.
-      const batch =
-        threadIds.length > 1
-          ? yield* threadManagement
-              .getShellSnapshot({ threadIds })
-              .pipe(Effect.orElseSucceed(() => null))
-          : null;
-      const batchedShells =
-        batch === null
-          ? null
-          : new Map(
-              [...batch.threads, ...batch.archivedThreads].map(
-                (shell) => [shell.id, shell] as const,
-              ),
-            );
       return yield* Effect.forEach(
         coalesced,
         (stored) =>
@@ -1266,12 +1258,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const threadId = stored.event.threadId;
-            const shell =
-              batchedShells === null
-                ? yield* threadManagement.getThreadShell(threadId)
-                : (batchedShells.get(threadId) ?? null);
-            return shellStreamItemFromThreadShell({ stored, shell });
+            return shellStreamItemFromThreadShell({
+              stored,
+              shell: shells.get(stored.event.threadId) ?? null,
+            });
           }),
         { concurrency: 8 },
       );
@@ -1506,6 +1496,7 @@ export const layerWsRpc = (
       const feedbackStore = yield* FeedbackStore.FeedbackStore;
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
+      const pullRequestWatch = yield* PullRequestWatchService.PullRequestWatchService;
       const issues = yield* IssueService.IssueService;
       const threadIssues = yield* ThreadIssueService.ThreadIssueService;
       const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
@@ -2043,17 +2034,23 @@ export const layerWsRpc = (
                 .enqueueCommand(
                   (command.type === "prepared-run.retry"
                     ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                        {
-                          managesProviders:
-                            currentSession.scopes.includes(AuthProvidersManageScope),
-                        },
-                      )
+                    : Effect.gen(function* () {
+                        const checked =
+                          command.type === "thread.pull-request.watch"
+                            ? yield* pullRequestWatch.withChecksAtStart(command)
+                            : command;
+                        return yield* ThreadMessageIntake.dispatchCommand(
+                          ThreadManagementService.withCreationProvenance(checked, {
+                            createdBy: "user",
+                            creationSource:
+                              "creationSource" in command ? command.creationSource : "web",
+                          }),
+                          {
+                            managesProviders:
+                              currentSession.scopes.includes(AuthProvidersManageScope),
+                          },
+                        );
+                      })
                   ).pipe(Effect.provide(intakeContext)),
                 )
                 .pipe(
@@ -3717,7 +3714,7 @@ export const layerWsRpc = (
         yield* OtherWsRpcGroup.toHandlers(otherHandlers),
       );
     }),
-  );
+  ).pipe(Layer.provide(PullRequestWatchService.layer));
 
 // Default socket-level Defect frames end every pending client request.
 export const WS_RPC_SERVER_OPTIONS = {

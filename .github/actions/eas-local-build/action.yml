@@ -40,9 +40,9 @@ runs:
           echo "CCACHE_MAXSIZE=5G"
           # Gradle installs the NDK fresh each run, so key on the compiler's version, not its mtime.
           echo "CCACHE_COMPILERCHECK=%compiler% -v"
-          echo "pnpm_config_store_dir=$cache/pnpm-store"
+          echo "BUN_INSTALL_CACHE_DIR=$cache/bun-cache"
           # eas build --local copies the project here. A fixed path keeps
-          # ccache keys stable, and the same disk as the store lets pnpm hardlink.
+          # ccache keys stable, and the same disk as the cache lets bun hardlink.
           echo "EAS_LOCAL_BUILD_WORKINGDIR=$cache/eas-build"
           echo "CCACHE_BASEDIR=$cache/eas-build"
           # CMake (3.17+) reads these, and AGP passes Gradle's environment through.
@@ -98,18 +98,16 @@ runs:
       with:
         node-version-file: package.json
 
-    - name: Enable corepack
-      shell: bash
-      run: |
-        npm install --global corepack@latest
-        corepack enable
-        pnpm --version
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version-file: package.json
 
     # EAS commands load app.config.ts, whose plugins must resolve. Keep install
     # scripts: some download native assets that the build's fingerprint check hashes.
     - name: Install mobile dependencies
       shell: bash
-      run: pnpm install --frozen-lockfile --prefer-offline --filter=@t3tools/mobile...
+      run: bun install --frozen-lockfile --prefer-offline --filter=@t3tools/mobile... --filter=@t3tools/monorepo
 
     - name: Setup Java
       if: inputs.platform == 'android'

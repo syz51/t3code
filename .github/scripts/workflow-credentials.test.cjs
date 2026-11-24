@@ -210,7 +210,7 @@ test("the Vite+ toolchain is cached before the job installs or runs project code
   const index = (name) => names.findIndex((step) => step.name === name);
   assert.match(names[index("Restore Vite+")].uses, /^actions\/cache\/restore@/);
   assert.match(names[index("Save Vite+")].uses, /^actions\/cache\/save@/);
-  assert.ok(index("Save Vite+") < index("Resolve pnpm store"));
+  assert.ok(index("Save Vite+") < index("Resolve install cache"));
   assert.ok(index("Save Vite+") < index("Install dependencies"));
   // The combined action saves at the end of the job, after everything ran.
   assert.ok(names.every((step) => !step.uses.startsWith("actions/cache@")));

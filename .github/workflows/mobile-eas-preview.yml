@@ -11,7 +11,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, '🚀 Mobile Continuous Deployment') &&
       (github.event.action != 'labeled' || github.event.label.name == '🚀 Mobile Continuous Deployment')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
     concurrency:
       group: mobile-eas-preview-ios-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -52,6 +52,12 @@ jobs:
         if: steps.expo-token.outputs.present == 'true'
         uses: ./.github/actions/drop-checkout-credentials
 
+      - name: Setup Bun
+        if: steps.expo-token.outputs.present == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
       - name: Setup Vite+
         if: steps.expo-token.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
@@ -61,14 +67,7 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.expo-token.outputs.present == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
+              - --filter=@t3tools/monorepo
 
       - name: Setup EAS
         if: steps.expo-token.outputs.present == 'true'
@@ -133,7 +132,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, '🚀 Mobile Continuous Deployment') &&
       (github.event.action != 'labeled' || github.event.label.name == '🚀 Mobile Continuous Deployment')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
     concurrency:
       group: mobile-eas-preview-android-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -174,6 +173,12 @@ jobs:
         if: steps.expo-token.outputs.present == 'true'
         uses: ./.github/actions/drop-checkout-credentials
 
+      - name: Setup Bun
+        if: steps.expo-token.outputs.present == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
       - name: Setup Vite+
         if: steps.expo-token.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
@@ -183,14 +188,7 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.expo-token.outputs.present == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
+              - --filter=@t3tools/monorepo
 
       - name: Setup EAS
         if: steps.expo-token.outputs.present == 'true'
@@ -289,7 +287,7 @@ jobs:
     name: Mobile preview comment
     needs: [android, ios, android-build, ios-build]
     if: always() && !cancelled() && (needs.android.result == 'success' || needs.ios.result == 'success')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     concurrency:
       group: mobile-preview-comment-${{ github.event.pull_request.number }}
       cancel-in-progress: false

@@ -637,6 +637,87 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
     }),
   );
 
+  it.effect("runs when isolatedProfile is true even with global hooks and MCP configured", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const configDirectory = fixture.path.join(fixture.profileDirectory, "config");
+      yield* fixture.fs.makeDirectory(configDirectory, { recursive: true });
+      yield* fixture.fs.writeFileString(
+        fixture.path.join(configDirectory, "hooks.json"),
+        '{"hooks":{"PreInvocation":[{"command":"do-not-run"}]}}',
+      );
+      yield* fixture.fs.writeFileString(
+        fixture.path.join(configDirectory, "mcp_config.json"),
+        '{"mcpServers":{"server":{"command":"do-not-run"}}}',
+      );
+      const isolated = yield* makeAntigravityTextGeneration({
+        profileDirectory: fixture.profileDirectory,
+        isolatedProfile: true,
+        makeRuntime: (cwd) =>
+          Effect.succeed({
+            start: () =>
+              Effect.succeed({
+                sessionId: SESSION_ID,
+                initializeResult: { protocolVersion: 1 },
+                sessionSetupResult: { sessionId: SESSION_ID },
+                modelConfigId: "model",
+              }),
+            setMode: () => Effect.succeed({}),
+            getConfigOptions: Effect.succeed([
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select" as const,
+                currentValue: modelSelection.model,
+                options: [{ value: modelSelection.model, name: "Gemini test" }],
+              },
+            ]),
+            getEvents: () => Stream.empty,
+            setModel: () => Effect.void,
+            setConfigOption: () => Effect.succeed({ configOptions: [] }),
+            prompt: () => Effect.succeed({ stopReason: "end_turn" as const }),
+            cancel: Effect.void,
+            handleSessionUpdate: () => Effect.void,
+            handleRequestPermission: () => Effect.void,
+            handleElicitation: () => Effect.void,
+            handleReadTextFile: () => Effect.void,
+            handleWriteTextFile: () => Effect.void,
+            handleCreateTerminal: () => Effect.void,
+            handleTerminalOutput: () => Effect.void,
+            handleTerminalWaitForExit: () => Effect.void,
+            handleTerminalKill: () => Effect.void,
+            handleTerminalRelease: () => Effect.void,
+            handleUnknownExtRequest: () => Effect.void,
+          }).pipe(
+            Effect.map((base) => {
+              let onUpdate: Parameters<TextRuntime["handleSessionUpdate"]>[0] = () => Effect.void;
+              return {
+                ...base,
+                handleSessionUpdate: (handler: Parameters<TextRuntime["handleSessionUpdate"]>[0]) =>
+                  Effect.sync(() => {
+                    onUpdate = handler;
+                  }),
+                prompt: () =>
+                  onUpdate({
+                    sessionId: SESSION_ID,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: '{"title":"Isolated title"}' },
+                    },
+                  }).pipe(Effect.as({ stopReason: "end_turn" as const })),
+              };
+            }),
+            Effect.tap(() => Effect.sync(() => fixture.state.workspaces.push(cwd))),
+          ),
+        withProcess: (_stop, task) => task,
+      });
+      const result = yield* isolated.generateThreadTitle(fixture.titleInput);
+      expect(result).toEqual({ title: "Isolated title" });
+      expect(fixture.state.workspaces).toHaveLength(1);
+    }),
+  );
+
   it.effect("does not launch during sign-out or before sign-in", () =>
     Effect.gen(function* () {
       const fixture = yield* makeFixture({ rejectAdmission: true });

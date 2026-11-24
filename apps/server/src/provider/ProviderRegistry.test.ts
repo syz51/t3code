@@ -2318,6 +2318,17 @@ it.layer(
         );
       });
 
+      it("preserves auth.email discovered by restart probes on cached Antigravity accounts", () => {
+        const merged = ProviderRegistry.mergeProviderSnapshot(signedIn, {
+          ...restartProbe,
+          auth: { status: "unknown", type: "oauth-personal", email: "user@example.com" },
+        });
+        assert.deepStrictEqual(merged.auth, {
+          ...signedIn.auth,
+          email: "user@example.com",
+        });
+      });
+
       it("does not invent an account after sign-out, disable, uninstall, or for other providers", () => {
         const untouched = [
           { ...restartProbe, auth: { status: "unauthenticated" } },
@@ -3820,6 +3831,19 @@ it.layer(
           status: "warning",
           checkedAt: "2026-04-14T00:01:00.000Z",
           models: [],
+          // Other local tools read usage from this file instead of asking the provider.
+          usageLimits: {
+            checkedAt: "2026-04-14T00:01:00.000Z",
+            windows: [
+              {
+                id: "seven_day",
+                kind: "weekly",
+                label: "Weekly",
+                usedPercent: 0,
+                resetsAt: "2026-04-21T00:00:00.000Z",
+              },
+            ],
+          },
         } satisfies ServerProvider;
         const changes = yield* PubSub.unbounded<ServerProvider>();
         const instance = {

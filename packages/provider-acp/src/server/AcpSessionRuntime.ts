@@ -157,6 +157,8 @@ export interface AcpSessionRuntimeOptions {
   ) => Effect.Effect<void, never>;
   readonly acpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly httpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
+  /** Use `httpMcpServers` even when `initialize` omits `mcpCapabilities.http`. */
+  readonly assumeHttpMcpSupport?: boolean;
   readonly requestLogger?: (event: AcpSessionRequestLogEvent) => Effect.Effect<void, never>;
   readonly protocolLogging?: {
     readonly logIncoming?: boolean;
@@ -2373,7 +2375,10 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       return acpServers;
     }
     const httpServers = activationOptions?.httpMcpServers ?? options.httpMcpServers ?? [];
-    if (mcpCapabilities?.http === true && httpServers.length > 0) {
+    if (
+      (mcpCapabilities?.http === true || options.assumeHttpMcpSupport === true) &&
+      httpServers.length > 0
+    ) {
       return httpServers;
     }
     return activationOptions?.mcpServers ?? options.mcpServers ?? [];

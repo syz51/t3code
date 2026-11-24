@@ -18,7 +18,7 @@ git clone -c core.longpaths=true https://github.com/pingdotgg/t3code.git
 From the repository root:
 
 ```sh
-vp i
+bun install
 vp run dev
 ```
 

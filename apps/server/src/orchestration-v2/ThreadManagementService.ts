@@ -73,6 +73,8 @@ import { cancelledBeforeStart } from "./RestartBackgroundNote.ts";
 import { contextBoundaryOrdinal } from "./contextBoundary.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ManagedProviders from "../policy/managedProviders.ts";
+import { deriveProviderInstanceConfigMap } from "../provider/ProviderInstanceRegistryHydration.ts";
 import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import { checkOutput, outputRequestProblem } from "./runOutput.ts";
 
@@ -367,9 +369,15 @@ export class ThreadManagementProviderInstanceDisabledError extends Schema.Tagged
   {
     projectId: ProjectId,
     instanceId: ProviderInstanceId,
+    /** Present only when the server knows no instance with this id. */
+    enabledInstanceIds: Schema.optional(Schema.Array(ProviderInstanceId)),
   },
 ) {
   override get message(): string {
+    if (this.enabledInstanceIds !== undefined) {
+      const enabled = this.enabledInstanceIds.join(", ") || "none";
+      return `Provider instance "${this.instanceId}" does not exist. Enabled instances for project ${this.projectId}: ${enabled}.`;
+    }
     return `Provider instance "${this.instanceId}" is disabled for project ${this.projectId}.`;
   }
 }
@@ -391,7 +399,7 @@ export class ThreadManagementBackgroundWaitError extends Schema.TaggedError<Thre
       case "failed":
         return "Failed to update the awaited background work.";
       case "unmatched":
-        return "None of these IDs is running background work on this thread, so this request registers no wait for them. If the task already finished, read its output now. Otherwise pass the task ID of a background command or Monitor you started. Subagent, Agent tool, and delegate_task IDs don't go here.";
+        return "None of these IDs is running background work on this thread, so this request registers no wait for them. If the task already finished, read its output now. Otherwise pass the task ID of running background work you started (such as a background command, Monitor, or Claude background Agent). delegate_task IDs don't go here.";
     }
   }
 }
@@ -558,6 +566,7 @@ export interface ThreadManagementServiceShape {
   readonly recoverDelegatedTask: Orchestrator.OrchestratorV2["Service"]["recoverDelegatedTask"];
   readonly cancelDelegatedTask: Orchestrator.OrchestratorV2["Service"]["cancelDelegatedTask"];
   readonly delegatedTaskResultPending: Orchestrator.OrchestratorV2["Service"]["delegatedTaskResultPending"];
+  readonly restartContinuationRetryAt: Orchestrator.OrchestratorV2["Service"]["restartContinuationRetryAt"];
   readonly streamStoredEvents: Orchestrator.OrchestratorV2["Service"]["streamStoredEvents"];
   readonly streamStoredEventsFrom: Orchestrator.OrchestratorV2["Service"]["streamStoredEventsFrom"];
   readonly streamDomainEvents: Orchestrator.OrchestratorV2["Service"]["streamDomainEvents"];
@@ -658,14 +667,41 @@ const make = Effect.gen(function* () {
             ? Effect.void
             : serverSettings.getSettings.pipe(
                 Effect.orDie,
-                Effect.flatMap((current) =>
-                  resolveProjectProviderInstanceEnabled(current, input.projectId, input.instanceId)
-                    ? Effect.void
-                    : new ThreadManagementProviderInstanceDisabledError({
-                        projectId: input.projectId,
-                        instanceId: input.instanceId,
-                      }),
-                ),
+                Effect.flatMap((current) => {
+                  if (
+                    resolveProjectProviderInstanceEnabled(
+                      current,
+                      input.projectId,
+                      input.instanceId,
+                    )
+                  ) {
+                    return Effect.void;
+                  }
+                  const configs = deriveProviderInstanceConfigMap(current);
+                  return new ThreadManagementProviderInstanceDisabledError({
+                    projectId: input.projectId,
+                    instanceId: input.instanceId,
+                    ...(input.instanceId in configs
+                      ? {}
+                      : {
+                          enabledInstanceIds: Object.entries(configs)
+                            .filter(
+                              ([id, config]) =>
+                                ManagedProviders.disallowedDriverReason(
+                                  serverSettings.managedPolicy,
+                                  config.driver,
+                                ) === undefined &&
+                                resolveProjectProviderInstanceEnabled(
+                                  current,
+                                  input.projectId,
+                                  ProviderInstanceId.make(id),
+                                ),
+                            )
+                            .map(([id]) => ProviderInstanceId.make(id))
+                            .toSorted(),
+                        }),
+                  });
+                }),
               ),
         ),
       );
@@ -1922,6 +1958,7 @@ const make = Effect.gen(function* () {
     recoverDelegatedTask: orchestrator.recoverDelegatedTask,
     cancelDelegatedTask: orchestrator.cancelDelegatedTask,
     delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
+    restartContinuationRetryAt: orchestrator.restartContinuationRetryAt,
     streamStoredEvents: orchestrator.streamStoredEvents,
     streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
     streamDomainEvents: orchestrator.streamDomainEvents,

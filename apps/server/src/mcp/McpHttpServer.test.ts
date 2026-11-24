@@ -67,9 +67,11 @@ import * as FeedbackHandlers from "./toolkits/feedback/handlers.ts";
 import { FeedbackToolkit } from "./toolkits/feedback/tools.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { PreviewToolkit } from "./toolkits/preview/tools.ts";
+import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
+import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -181,13 +183,17 @@ const recordSpans = () => {
   return { tracer, spans, order };
 };
 
-const callTool = (name: string, args: Record<string, unknown>) =>
+const callTool = (
+  name: string,
+  args: Record<string, unknown>,
+  scope: McpInvocationContext.McpInvocationScope = invocation,
+) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     return yield* server
       .callTool({ name, arguments: args })
       .pipe(
-        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
   });
@@ -299,7 +305,7 @@ it.effect("rejects a metadata-only response when the screenshot is saved", () =>
   ).pipe(Effect.provide(layerTest)),
 );
 
-const layerRecordingTools = (calls: Array<unknown>) => {
+const layerRecordingTools = (calls: Array<unknown>, forwarded?: Array<unknown>) => {
   const RecordingToolkit = Toolkit.make(
     OrchestratorToolkit.tools.delegate_task,
     OrchestratorToolkit.tools.t3_thread_list,
@@ -307,6 +313,13 @@ const layerRecordingTools = (calls: Array<unknown>) => {
     OrchestratorToolkit.tools.t3_thread_wait,
     ProjectToolkit.tools.t3_project_list,
     ProjectToolkit.tools.t3_project_update,
+    ThreadToolkit.tools.t3_thread_transfer,
+    // Like the attachment tools, it takes a thread and reaches no other environment.
+    Tool.make("local_thread_tool", {
+      parameters: Schema.Struct({ threadId: Schema.String }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
     ThreadToolkit.tools.t3_queue,
     PreviewControlsToolkit.tools.t3_preview_list,
     ProjectToolkit.tools.t3_thread_launch,
@@ -327,6 +340,8 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_thread_wait: record,
       t3_project_list: record,
       t3_project_update: record,
+      t3_thread_transfer: record,
+      local_thread_tool: record,
       t3_queue: record,
       t3_preview_list: record,
       t3_thread_launch: record,
@@ -350,6 +365,13 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         Layer.mock(ProviderRegistry.ProviderRegistry)({}),
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" }),
         NodeCrypto.layer,
+        // Stands in for the linked environment, recording what goes there.
+        forwarded === undefined
+          ? Layer.empty
+          : Layer.mock(PeerForwarding.PeerForwarding)({
+              call: (_scope, _tool, _environmentId, params) =>
+                Effect.sync(() => forwarded.push(params)).pipe(Effect.as({} as never)),
+            }),
       ),
     ),
     Layer.provideMerge(NodeServices.layer),
@@ -666,12 +688,60 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     yield* callTool("delegate_task", { task: "Inspect", target: {} });
     yield* callTool("delegate_task", { task: "Inspect", title: null, target: { model: null } });
     yield* callTool("t3_project_update", { projectId: "project-1", projectIcon: null });
+    // A result's `link` names its thread to the next call.
+    yield* callTool("t3_thread_read", {
+      threadId: `[Fix](t3-thread://v2/${environmentId}/${thread.threadId})`,
+    });
+    const elsewhere = yield* callTool("t3_thread_read", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+    });
+    // A link to a thread elsewhere sends the call to that environment, which this test has none of.
+    expect(JSON.stringify(elsewhere.content)).toContain("cannot reach linked environments");
 
-    expect(calls).toHaveLength(5);
+    // An explicit null is no choice of environment, so the link's still decides.
+    const nulled = yield* callTool("t3_thread_read", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+      environmentId: null,
+    });
+    expect(JSON.stringify(nulled.content)).toContain("cannot reach linked environments");
+    // A tool that reaches no other environment gets the link as written.
+    const unreachable = yield* callTool("local_thread_tool", {
+      threadId: `<t3-thread://v2/box/${thread.threadId}>`,
+    });
+    expect(JSON.stringify(unreachable.content)).not.toContain("environmentId");
+
+    expect(calls.pop()).toMatchObject({ threadId: `<t3-thread://v2/box/${thread.threadId}>` });
+    expect(calls).toHaveLength(6);
+    expect(calls[5]).toEqual(calls[0]);
     expect(calls[1]).toEqual(calls[0]);
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
   }).pipe(Effect.provide(layerRecordingTools(calls)));
+});
+
+it.effect("takes a link as a transfer's target only in the environment the call goes to", () => {
+  const calls: Array<unknown> = [];
+  const forwarded: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const merge = { action: "merge_back", threadId: "thread-source" };
+    const linkIn = (environment: string) => `[Fix](t3-thread://v2/${environment}/thread-target)`;
+    for (const environment of [environmentId, "box"]) {
+      yield* callTool("t3_thread_transfer", { ...merge, targetThreadId: linkIn(environment) });
+      yield* callTool("t3_thread_transfer", {
+        ...merge,
+        environmentId: "box",
+        targetThreadId: linkIn(environment),
+      });
+    }
+    expect(calls).toEqual([
+      { ...merge, targetThreadId: "thread-target" },
+      { ...merge, targetThreadId: linkIn("box") },
+    ]);
+    expect(forwarded).toEqual([
+      { ...merge, environmentId: "box", targetThreadId: linkIn(environmentId) },
+      { ...merge, environmentId: "box", targetThreadId: "thread-target" },
+    ]);
+  }).pipe(Effect.provide(layerRecordingTools(calls, forwarded)));
 });
 
 it.effect("decodes a JSON-stringified delegate target as the same object", () => {
@@ -1970,6 +2040,17 @@ it.effect(
         expect(
           noForgeTools.filter((name) => name.startsWith("pull_request_") || name.startsWith("ci_")),
         ).toEqual([]);
+        // Each side's PR rules name only tools it lists.
+        const hiddenFromChild = parentTools.filter((tool) => !childTools.includes(tool));
+        const childText = buildRuntimeInstructions({
+          harness: "Claude Code",
+          delegatedChild: true,
+        });
+        for (const tool of hiddenFromChild) expect(childText).not.toContain(tool);
+        const parentText = buildRuntimeInstructions({ harness: "Claude Code" });
+        for (const tool of parentText.match(/\b\w+_pull_requests?\b/g) ?? []) {
+          expect(parentTools).toContain(tool);
+        }
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

@@ -3560,6 +3560,11 @@ export default function ChatView(props: ChatViewProps) {
               isServerThread={isServerThread}
               activeThreadTitle={activeThread.title}
               activeThreadLinkOrigin={activeThreadShell?.linkOrigin?.label ?? null}
+              pendingBackgroundTasks={
+                isServerThread && pendingBackgroundTasks.length > 0
+                  ? pendingBackgroundTasks
+                  : undefined
+              }
               activeProject={activeProject ?? null}
               parentThreadLink={headerParentThreadLink}
               onOpenThread={onOpenRelatedThreadStable}

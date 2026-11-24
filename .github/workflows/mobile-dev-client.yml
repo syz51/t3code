@@ -4,7 +4,7 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('Dev client {0}
 # Builds the simulator and emulator development client for a commit's native
 # fingerprint and shares it through the native-client cache, the one
 # `vp run mobile:install` reads on every machine. Android builds with Gradle,
-# ccache, and pnpm state on a sticky disk; iOS builds on a macOS runner, so no
+# ccache, and the bun cache on a sticky disk; iOS builds on a macOS runner, so no
 # machine needs Xcode or an EAS build for it.
 #
 # - push to main: main's client is cached before anyone asks for it.
@@ -24,8 +24,8 @@ on:
       - patches/**
       - scripts/mobile-native-client.ts
       - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
+      - bun.lock
+      - bunfig.toml
       - .github/workflows/mobile-dev-client.yml
   pull_request:
     paths:
@@ -61,8 +61,8 @@ jobs:
   android:
     name: Android ${{ matrix.abi }}
     if: github.repository == 'pingdotgg/t3code' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'android')
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 360 # fork-scaled: 45
     strategy:
       fail-fast: false
       matrix:
@@ -162,7 +162,7 @@ jobs:
         uses: ./.github/actions/setup-ci-deps
         with:
           task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
-          install-args: --filter=@t3tools/mobile... --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/mobile... --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       - name: Setup Java
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
@@ -219,8 +219,8 @@ jobs:
   ios:
     name: iOS simulator
     if: github.repository == 'pingdotgg/t3code' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'ios')
-    runs-on: blacksmith-12vcpu-macos-27
-    timeout-minutes: 60
+    runs-on: macos-26 # fork-mapped: blacksmith-12vcpu-macos-27
+    timeout-minutes: 240 # fork-scaled: 60
     concurrency:
       group: mobile-dev-client-ios-${{ github.event_name == 'pull_request' && github.event.pull_request.number || inputs.fingerprint || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -277,7 +277,7 @@ jobs:
         uses: ./.github/actions/setup-ci-deps
         with:
           task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
-          install-args: --filter=@t3tools/mobile... --filter=@t3tools/scripts...
+          install-args: --filter=@t3tools/mobile... --filter=@t3tools/scripts... --filter=@t3tools/monorepo
 
       # Only this login can write to the cache; pull requests never get it.
       - id: login

@@ -913,7 +913,6 @@ const delegateToBox = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>)
         return result.structuredContent as {
           taskId: NodeId;
           status: string;
-          childThreadId: null;
           remoteChild: { environmentId: string; threadId: ThreadId; label: string };
           link?: string;
         };
@@ -981,7 +980,6 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
       const delegated = yield* delegateToBox(a);
       expect(delegated).toMatchObject({
         status: "running",
-        childThreadId: null,
         remoteChild: { environmentId: box.environmentId, label: "Box" },
       });
       // The box launched it in the project with the same repository.
@@ -1035,13 +1033,9 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
         .pipe(Effect.withTracer(historyTracer));
       expect(running.structuredContent).toMatchObject({
         taskId: delegated.taskId,
-        childThreadId: null,
         remoteChild: delegated.remoteChild,
         status: "running",
         workState: "working",
-        summary: null,
-        hasPendingQuestion: false,
-        pendingApproval: null,
       });
       // A running task there needs its local row, not the parent's run or transfer history.
       expect(historyReads).toEqual([]);
@@ -1537,10 +1531,9 @@ it.effect("a task whose thread there waits on its own task ends with the answer 
         result: "The review found two issues; both are fixed.",
       });
       const status = yield* a.call("task_status", { taskId: delegated.taskId });
-      expect(status.structuredContent).toMatchObject({
-        status: "completed",
-        executedModel: null,
-      });
+      expect(status.structuredContent).toMatchObject({ status: "completed" });
+      // The fork's agent results leave out null fields.
+      expect(status.structuredContent).not.toHaveProperty("executedModel");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -2781,7 +2774,13 @@ it.effect("a local task runs in this thread's project", () =>
         target: { projectId: "project:elsewhere" },
       });
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("invalid_request");
+      const refusal = JSON.stringify(result.content);
+      expect(refusal).toContain("invalid_request");
+      expect(refusal).toContain(
+        "use t3_thread_launch with its projectId and a worktree workspaceStrategy",
+      );
+      expect(refusal).toContain("target.environmentId only reaches a remote environment");
+      expect(refusal).not.toContain("pass target.environmentId");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

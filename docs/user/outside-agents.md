@@ -166,11 +166,15 @@ t3 thread list
 
 `.` means the project that contains the current folder, or a git worktree of
 its repository; a project id also works. A new thread uses the project's
-default model and permission mode, and runs in the project folder unless you
-pass `--worktree <base-branch>`. Its title is the message's first line, or
-`--title`; add `--generate-title` to have it named from the message, as threads
-started in the app are. `send` never interrupts: a busy thread gets the message
-as its next turn. Pass `-` as the message to read it from stdin.
+default model, permission mode and workspace: a project that starts new threads
+in a worktree gets a new worktree from its default branch, and any other
+project runs in its folder. Pass `--worktree <base-branch>` to choose the
+worktree's base, or `--local` to run in the project folder. An agent that
+starts a thread through the MCP tools without choosing a workspace gets the
+same default. Its title is the message's first line, or `--title`; add
+`--generate-title` to have it named from the message, as threads started in the
+app are. `send` never interrupts: a busy thread gets the message as its next
+turn. Pass `-` as the message to read it from stdin.
 
 To choose the model, pass `--provider <instance-id> --model <slug>`. Add
 `--option id=value` for each model option. For reasoning effort, Codex uses

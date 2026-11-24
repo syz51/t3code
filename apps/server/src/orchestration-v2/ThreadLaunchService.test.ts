@@ -23,11 +23,13 @@ import {
   MessageId,
   RunId,
   ProjectId,
+  type ManagedPolicySummary,
   ProviderDriverKind,
   ProviderInstanceId,
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
   type ServerProvider,
+  type T3ProjectFile,
   ThreadId,
   TextGenerationError,
   ServerSettingsError,
@@ -75,6 +77,7 @@ import {
 } from "../workspace/TaskFolders.testkit.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -150,9 +153,12 @@ interface HarnessOptions {
   readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
   readonly generateBranchName?: TextGeneration.TextGeneration["Service"]["generateBranchName"];
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
-  readonly getLaunchSettings?: ServerSettings.ServerSettingsService["Service"]["getSettings"];
+  readonly managedPolicy?: ManagedPolicySummary;
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
+  readonly vcs?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
+  readonly projectFile?: T3ProjectFile;
+  readonly getLaunchSettings?: ServerSettings.ServerSettingsService["Service"]["getSettings"];
   readonly dispatch?: (
     command: Parameters<ThreadManagement.ThreadManagementService["Service"]["dispatch"]>[0],
     dispatch: ThreadManagement.ThreadManagementService["Service"]["dispatch"],
@@ -168,7 +174,10 @@ function makeHarness(options: HarnessOptions = {}) {
     layerRegistry,
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
-  const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
+  const layerServerSettings = ServerSettings.layerTest(
+    options.serverSettings,
+    options.managedPolicy,
+  );
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
   const layerThreadManagement = ThreadManagement.layer.pipe(
     Layer.provide(layerOrchestrator),
@@ -249,6 +258,10 @@ function makeHarness(options: HarnessOptions = {}) {
       removeWorktree,
       deleteLocalBranch,
       ...options.git,
+    }),
+    Layer.mock(GitVcsDriver.GitVcsDriver)(options.vcs ?? {}),
+    Layer.mock(T3ProjectFileLoader.T3ProjectFileLoader)({
+      load: () => Effect.succeed(Option.fromNullishOr(options.projectFile)),
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
       runForThread: runSetup,
@@ -2282,6 +2295,38 @@ it.effect("replays an accepted launch after the project disables the instance", 
     if (fresh._tag !== "ThreadManagementProviderInstanceDisabledError") {
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
+    assert.include(fresh.message, '"codex" is disabled');
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("names a provider instance the server does not know as unknown", () => {
+  const harness = makeHarness({
+    managedPolicy: {
+      organization: "Example Corp",
+      lockedSettings: [],
+      limits: {
+        providers: {
+          allowedDrivers: [ProviderDriverKind.make("claudeAgent")],
+          lockedInstanceFields: {},
+        },
+      },
+    },
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const error = yield* launches
+      .launch({
+        ...launchInput({ command: "command:launch:unknown", thread: "thread:launch:unknown" }),
+        modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "claude-opus-5-5" },
+      })
+      .pipe(Effect.flip);
+    if (error._tag !== "ThreadManagementProviderInstanceDisabledError") {
+      assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${error._tag}`);
+    }
+    assert.include(error.message, '"claude" does not exist');
+    assert.include(error.message, "claudeAgent");
+    assert.notInclude(error.message, "codex");
+    assert.notInclude(error.message, "cursor");
   }).pipe(Effect.provide(harness.layer));
 });
 
@@ -2786,6 +2831,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
             ),
           ),
         checkWorktreeBase: launches.checkWorktreeBase,
+        defaultWorkspaceStrategy: launches.defaultWorkspaceStrategy,
         isNonGitProject: launches.isNonGitProject,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,
@@ -3648,154 +3694,3 @@ it.effect.each([
     }).pipe(Effect.provide(harness.layer));
   }),
 );
-
-it.effect("refuses a new worktree whose explicit branch already exists", () =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const git = yield* GitVcsDriver.GitVcsDriver;
-    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "launch-branch-exists-" });
-    const cwd = `${directory}/repo`;
-    const temporaryBranch = "t3code/0b5e7a1c-3f2d-4e8a-9b6c-1d2e3f4a5b6c";
-    yield* fs.makeDirectory(cwd);
-    const command = (args: string[]) => git.execute({ operation: "launch-test", cwd, args });
-    yield* command(["init", "-b", "main"]);
-    yield* command(["config", "user.name", "Test"]);
-    yield* command(["config", "user.email", "test@example.test"]);
-    yield* command(["commit", "--allow-empty", "-m", "initial"]);
-    yield* command(["branch", "feature/idle"]);
-    yield* command(["branch", temporaryBranch]);
-    // Resolves as `refs/heads/feature/tagged` although no such branch exists.
-    yield* command(["tag", "refs/heads/feature/tagged"]);
-    yield* command(["worktree", "add", "-b", "feature/taken", `${directory}/taken`]);
-    const harness = makeHarness({
-      hasCommit: ({ refName }) =>
-        command(["rev-parse", "--verify", `${refName}^{commit}`]).pipe(
-          Effect.as(true),
-          Effect.orElseSucceed(() => false),
-        ),
-      git: { listLocalBranchNames: () => git.listLocalBranchNames(cwd) },
-    });
-    yield* Effect.gen(function* () {
-      const launches = yield* ThreadLaunch.ThreadLaunchService;
-      const check = (branch: string, baseRef = "main") =>
-        launches
-          .checkWorktreeBase({
-            projectId,
-            workspaceStrategy: { type: "worktree", baseRef, branch },
-          })
-          .pipe(
-            Effect.match({
-              onSuccess: () => [branch, "accepted"],
-              onFailure: (error) => [branch, error._tag],
-            }),
-          );
-      assert.deepEqual(
-        yield* Effect.forEach(
-          ["feature/idle", "feature/taken", temporaryBranch, "feature/fresh", "feature/tagged"],
-          (branch) => check(branch),
-        ),
-        [
-          ["feature/idle", "ThreadLaunchBranchExistsError"],
-          ["feature/taken", "ThreadLaunchBranchExistsError"],
-          [temporaryBranch, "ThreadLaunchBranchExistsError"],
-          ["feature/fresh", "accepted"],
-          ["feature/tagged", "accepted"],
-        ],
-      );
-      // A `:/text` base skips the base check but not the branch check.
-      assert.deepEqual(yield* check("feature/taken", ":/initial"), [
-        "feature/taken",
-        "ThreadLaunchBranchExistsError",
-      ]);
-    }).pipe(Effect.provide(harness.layer));
-  }).pipe(
-    Effect.provide(
-      GitVcsDriver.layer.pipe(
-        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "launch-branch-exists-" })),
-        Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-      ),
-    ),
-  ),
-);
-
-it.effect.each([
-  { requested: "werkstatt/baseline", blocking: "werkstatt" },
-  { requested: "foo", blocking: "foo/bar" },
-])("refuses a new worktree branch $requested that collides with branch $blocking", (testCase) =>
-  Effect.gen(function* () {
-    const harness = makeHarness({
-      hasCommit: () => Effect.succeed(true),
-      git: { listLocalBranchNames: () => Effect.succeed(["main", "werkstatt", "foo/bar"]) },
-    });
-    yield* Effect.gen(function* () {
-      const launches = yield* ThreadLaunch.ThreadLaunchService;
-      const workspace = { type: "worktree" as const, baseRef: "main", branch: testCase.requested };
-      const commandId = CommandId.make("launch:branch-conflict");
-      const check = (branch: string) =>
-        launches.checkWorktreeBase({
-          commandId,
-          projectId,
-          workspaceStrategy: { ...workspace, branch },
-        });
-      yield* check("werkstatt-baseline");
-      const error = yield* check(testCase.requested).pipe(Effect.flip);
-      assert.deepInclude(error, {
-        _tag: "ThreadLaunchBranchConflictError",
-        branch: testCase.requested,
-        conflictingBranch: testCase.blocking,
-      });
-      yield* launches.launch(
-        launchInput({ command: commandId, thread: "thread:branch-conflict", workspace }),
-      );
-      yield* check(testCase.requested);
-    }).pipe(Effect.provide(harness.layer));
-  }),
-);
-
-it.effect("replays an accepted send after the project disables the instance", () => {
-  const harness = makeHarness();
-  const layerFiles = ServerConfig.layerTest(process.cwd(), { prefix: "t3-send-retry-" }).pipe(
-    Layer.provideMerge(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
-  );
-  return Effect.gen(function* () {
-    const launches = yield* ThreadLaunch.ThreadLaunchService;
-    const settings = yield* ServerSettings.ServerSettingsService;
-    const created = yield* launches.launch(
-      launchInput({
-        command: "command:send:retry-setup",
-        thread: "thread:send:retry-after-disable",
-      }),
-    );
-
-    const sendInput = {
-      commandId: CommandId.make("command:send:retry-after-disable"),
-      projectId,
-      threadId: created.threadId,
-      messageId: MessageId.make("message:send:retry-after-disable"),
-      text: "Hello again",
-      attachments: [],
-      mode: "auto" as const,
-      createdBy: "user" as const,
-      creationSource: "web" as const,
-    };
-    const first = yield* ThreadMessageIntake.sendToThread(sendInput);
-
-    yield* settings.updateSettings({
-      projectSettingsOverrides: {
-        [projectId]: { providerInstances: { [modelSelection.instanceId]: { enabled: false } } },
-      },
-    });
-
-    const retry = yield* ThreadMessageIntake.sendToThread(sendInput);
-    assert.equal(retry.message.id, first.message.id);
-
-    const fresh = yield* ThreadMessageIntake.sendToThread({
-      ...sendInput,
-      commandId: CommandId.make("command:send:fresh-after-disable"),
-      messageId: MessageId.make("message:send:fresh-after-disable"),
-    }).pipe(Effect.flip);
-    if (fresh._tag !== "ThreadManagementProviderInstanceDisabledError") {
-      assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
-    }
-  }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
-});

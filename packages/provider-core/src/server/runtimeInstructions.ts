@@ -2,6 +2,15 @@ import type { AgentFeedbackMode } from "@t3tools/contracts";
 
 import type { ProviderAdapterV2RuntimePolicy } from "./ProviderAdapter.ts";
 
+const LINK_PULL_REQUESTS =
+  "Link each PR you create, take over, or push to: link_pull_request, or link_pull_requests for several, full URL, every stack layer, as your next call. Host tools don't link for you. If linking fails, say so. Skip PRs you only read or review and PRs named only as background.";
+
+const PULL_REQUEST_TOOLS =
+  "When pull_request_* tools are listed, use them, not gh or cafe, to read, list, open, edit, review, reply on, close, or merge PRs, and ci_logs and ci_rerun for their checks. pull_request_create links for you.";
+
+const LINK_ISSUES =
+  "If available, call link_issue for each issue you take on or file, even via CLI; skip issues you only read.";
+
 /** None while agent feedback is off, so users who never opt in pay no context for it. */
 export const AGENT_FEEDBACK_INSTRUCTIONS = {
   off: "",
@@ -11,8 +20,16 @@ export const AGENT_FEEDBACK_INSTRUCTIONS = {
 
 /** Session-invariant; harnesses with a native system-prompt append can carry it once per session. */
 export const PULL_REQUEST_LINKING_INSTRUCTIONS = `<pull_request_linking>
-Link each PR you create, take over, or push to: link_pull_request, or link_pull_requests for several, full URL, every stack layer, as your next call. Host tools don't link for you. If linking fails, say so. Skip PRs you only read or review and PRs named only as background. Call watch_pull_request when asked to monitor or babysit, or when work you were asked to do, such as a merge, still waits on checks or reviews, even after an earlier unwatch. Finish any needed branch update and push first, then watch and end your turn. Otherwise act now or hand back. Delegated children never watch, even if the brief says babysit. After PR work, a child's last line is: PR <full URL>, head <SHA>, checks and reviews <state>. Links and watches persist across pushes. For PR waits, no sleep, loops, gh --watch, Monitor or ScheduleWakeup. Before handback, call unwatch_pull_request on any PR you watch. When pull_request_* tools are listed, use them, not gh or cafe, to read, list, open, edit, review, reply on, close, or merge PRs, and ci_logs and ci_rerun for their checks. pull_request_create links for you.
-If available, call link_issue for each issue you take on or file, even via CLI; skip issues you only read.
+${LINK_PULL_REQUESTS} Call watch_pull_request when asked to monitor or babysit, or when work you were asked to do, such as a merge, still waits on checks or reviews, even after an earlier unwatch. Finish any needed branch update and push first, then watch and end your turn. Otherwise act now or hand back. Delegated children never watch, even if the brief says babysit. After PR work, a child's last line is: PR <full URL>, head <SHA>, checks and reviews <state>. Links and watches persist across pushes. For PR waits, no sleep, loops, gh --watch, Monitor or ScheduleWakeup. Before handback, call unwatch_pull_request on any PR you watch. ${PULL_REQUEST_TOOLS}
+${LINK_ISSUES}
+</pull_request_linking>`;
+
+// T3 hides the PR watch tools from delegate_task children, so their text must not send them there.
+const delegatedChildPullRequestInstructions = (
+  replacesSessionBlock: boolean,
+) => `<pull_request_linking>
+${replacesSessionBlock ? "This block replaces the pull_request_linking block in your system prompt. " : ""}${LINK_PULL_REQUESTS} You are a delegated child, so you cannot watch PRs, even if the brief says babysit or to merge after checks pass. When PR work waits on checks or reviews, push, then end your turn: your parent watches and finishes. Your last line is: PR <full URL>, head <SHA>, checks and reviews <state>. For PR waits, no sleep, loops, gh --watch, Monitor or ScheduleWakeup. ${PULL_REQUEST_TOOLS}
+${LINK_ISSUES}
 </pull_request_linking>`;
 
 /** Omit model and effort when the harness manages them dynamically. */
@@ -24,6 +41,8 @@ export function buildRuntimeInstructions(runtime: {
   readonly reasoningEffort?: string | undefined;
   /** False when the session's system prompt already carries the linking instructions. */
   readonly pullRequestLinking?: boolean;
+  /** A delegate_task child. It always gets its own block, which overrides a session-carried top-level one. */
+  readonly delegatedChild?: boolean;
   /** Adds the folder list of a multi-folder thread. */
   readonly runtimePolicy?: Pick<ProviderAdapterV2RuntimePolicy, "cwd" | "workspace"> | undefined;
 }): string {
@@ -40,10 +59,13 @@ export function buildRuntimeInstructions(runtime: {
   const feedback = feedbackLine ? `\n${feedbackLine}` : "";
   const workspace =
     runtime.runtimePolicy === undefined ? "" : buildWorkspaceInstructions(runtime.runtimePolicy);
-  const linked =
-    runtime.pullRequestLinking === false
-      ? runtimeInfo
-      : `${runtimeInfo}\n\n${PULL_REQUEST_LINKING_INSTRUCTIONS}`;
+  const pullRequests =
+    runtime.delegatedChild === true
+      ? [delegatedChildPullRequestInstructions(runtime.pullRequestLinking === false)]
+      : runtime.pullRequestLinking === false
+        ? []
+        : [PULL_REQUEST_LINKING_INSTRUCTIONS];
+  const linked = [runtimeInfo, ...pullRequests].join("\n\n");
   return [linked + feedback, ...(workspace === "" ? [] : [workspace])].join("\n\n");
 }
 

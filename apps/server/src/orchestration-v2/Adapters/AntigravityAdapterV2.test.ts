@@ -3,9 +3,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  EnvironmentId,
   MessageId,
   NodeId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   RunAttemptId,
@@ -28,6 +30,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -161,6 +164,49 @@ describe("AntigravityAdapterV2 flavor", () => {
     assert.deepEqual(question?.respond({ interaction_2: "opt-dev" }), {
       outcome: { outcome: "selected", optionId: "opt-dev" },
     });
+  });
+
+  it("folds Antigravity ask_question elicitation forms into single questions with Other", () => {
+    const form = flavor.extractElicitationForm?.({
+      sessionId: "session-1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "string",
+            title: "Deploy target?",
+            oneOf: [
+              { const: "1", title: "Staging" },
+              { const: "2", title: "Production" },
+            ],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Deploy target?",
+          },
+        },
+      },
+    } as Parameters<NonNullable<typeof flavor.extractElicitationForm>>[0]);
+    assert.isDefined(form);
+    assert.strictEqual(form?.questions.length, 1);
+    assert.strictEqual(form?.questions[0]?.question, "Deploy target?");
+    assert.strictEqual(form?.questions[0]?.allowCustomAnswer, true);
+    assert.deepEqual(form?.respond({ q1: "Production" }), {
+      action: "accept",
+      content: { q1: "2" },
+    });
+    assert.deepEqual(form?.respond({ q1: "Canary" }), {
+      action: "accept",
+      content: { q1_other: "Canary" },
+    });
+  });
+
+  it("enables HTTP MCP transport with deferred tool exposure", () => {
+    assert.isTrue(flavor.mcpOverHttp);
+    assert.isTrue(flavor.deferMcpTools);
   });
 });
 
@@ -2119,6 +2165,40 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
+  it.effect("captures native brain plan.md writes as a proposed_plan turn item", () =>
+    Effect.gen(function* () {
+      const profileDirectory = "/tmp/antigravity-plan-profile";
+      const planMarkdown = "# Rollout Plan\n\n1. Ship it";
+      const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, {
+        profileDirectory,
+        initialToolCalls: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_write_plan",
+            kind: "edit",
+            title: "Write plan.md",
+            status: "completed",
+            rawInput: {
+              Path: `${profileDirectory}/antigravity-acp/brain/mock-session-1/plan.md`,
+              Content: `${planMarkdown}\n`,
+            },
+          },
+        ],
+      });
+      yield* opened.startTurn(1, false);
+      const events = yield* opened.until(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "proposed_plan",
+      );
+      const planItem = events.find(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "proposed_plan",
+      );
+      assert.isDefined(planItem);
+      if (planItem?.type === "turn_item.updated" && planItem.turnItem.type === "proposed_plan") {
+        assert.strictEqual(planItem.turnItem.markdown, planMarkdown);
+      }
+    }).pipe(Effect.provide(layerSession)),
+  );
+
   // agy 1.5.11 reads a prompt sent mid-turn as a steer: it answers the running prompt end_turn
   // and goes on under the new one. session/cancel would end its running commands and subagents.
   it.effect("steers a running prompt with the next one and leaves its work running", () =>
@@ -2950,5 +3030,339 @@ describe("AntigravityAdapterV2 session system prompt", () => {
         assert.notInclude(append, "systemPrompt");
         assert.include(sent, "<pull_request_linking>");
       }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "restarts the ACP runtime with updated skipPermissions when switching between unrestricted full-access and restricted policies",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-skip-perms-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const skipPermissionsCalls: Array<boolean | undefined> = [];
+        const instanceId = ProviderInstanceId.make("antigravity-skip-perms-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) => {
+            skipPermissionsCalls.push(input.skipPermissions);
+            return makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                },
+              },
+            }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto));
+          },
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-sp-ws-" });
+        const fullAccessPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const approvalPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const sandboxedFullAccessPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+          sandboxPolicy: { type: "readOnly" },
+        });
+        const threadId = ThreadId.make("thread-antigravity-skip-perms");
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-skip-perms"),
+          modelSelection,
+          runtimePolicy: fullAccessPolicy,
+        });
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy: fullAccessPolicy,
+        });
+        assert.deepEqual(skipPermissionsCalls, [true]);
+
+        const runTurn = (ordinal: number, policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy) =>
+          Effect.gen(function* () {
+            yield* session.startTurn(
+              makeTurnInput({
+                threadId,
+                providerThread,
+                instanceId,
+                modelSelection,
+                runtimePolicy: policy,
+                now: yield* DateTime.now,
+                ordinal,
+                messageText: `turn ${ordinal}`,
+              }),
+            );
+            const terminal = yield* Stream.fromQueue(events).pipe(
+              Stream.filter((event) => event.type === "turn.terminal"),
+              Stream.runHead,
+            );
+            assert.isTrue(Option.isSome(terminal));
+            if (Option.isSome(terminal)) {
+              assert.equal(terminal.value.status, "completed");
+            }
+          });
+
+        // Staying in unrestricted full-access reuses the existing runtime.
+        yield* runTurn(1, fullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true]);
+
+        // Switching to approval-required respawns without --dangerously-skip-permissions.
+        yield* runTurn(2, approvalPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false]);
+
+        // Switching back to unrestricted full-access respawns with --dangerously-skip-permissions.
+        yield* runTurn(3, fullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false, true]);
+
+        // Adding a read-only sandbox respawns without --dangerously-skip-permissions.
+        yield* runTurn(4, sandboxedFullAccessPolicy);
+        assert.deepEqual(skipPermissionsCalls, [true, false, true, false]);
+
+        const methods = (yield* fileSystem.readFileString(requestLog))
+          .trim()
+          .split("\n")
+          .map((line) => (JSON.parse(line) as { method?: string }).method);
+        assert.equal(methods.filter((method) => method === "session/resume").length, 3);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "sends t3-tool-exposure: deferred on HTTP MCP servers for session/new and session/resume even without mcpCapabilities.http",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-defer-mcp-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const instanceId = ProviderInstanceId.make("antigravity-defer-mcp-test");
+        const threadId = ThreadId.make("thread-antigravity-defer-mcp");
+        const endpoint = "http://127.0.0.1:41999/mcp";
+        const mcpSession = {
+          environmentId: EnvironmentId.make("env-antigravity-defer-mcp"),
+          threadId,
+          providerSessionId: "provider-session-antigravity-defer-mcp",
+          providerInstanceId: instanceId,
+          endpoint,
+          browserToolsAvailable: false,
+        };
+        yield* mcpSessions.set({ ...mcpSession, authorizationHeader: "Bearer opened-token" });
+
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_SESSION_LIFECYCLE: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                },
+              },
+            }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-defer-cwd-" });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-defer-mcp"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* mcpSessions.set({ ...mcpSession, authorizationHeader: "Bearer rotated-token" });
+        yield* session.resumeThread({
+          providerThread: {
+            ...providerThread,
+            nativeThreadRef: {
+              driver: ProviderDriverKind.make("antigravity"),
+              nativeId: "mock-session-2",
+              strength: "strong",
+            },
+          },
+        });
+
+        const requests = (yield* fileSystem.readFileString(requestLog))
+          .trim()
+          .split("\n")
+          .map(
+            (line) => JSON.parse(line) as { method?: string; params?: { mcpServers?: unknown } },
+          );
+        const expectedHttpServer = (authorization: string) => [
+          {
+            type: "http",
+            name: "t3-code",
+            url: endpoint,
+            headers: [
+              { name: "Authorization", value: authorization },
+              { name: "t3-tool-exposure", value: "deferred" },
+            ],
+          },
+        ];
+        assert.deepEqual(
+          requests.find((request) => request.method === "session/new")?.params?.mcpServers,
+          expectedHttpServer("Bearer opened-token"),
+        );
+        assert.deepEqual(
+          requests.find((request) => request.method === "session/resume")?.params?.mcpServers,
+          expectedHttpServer("Bearer rotated-token"),
+        );
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "injects Antigravity-tailored orchestration instructions covering native invoke_subagent",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        const capturedPrompts: Array<string> = [];
+        const instanceId = ProviderInstanceId.make("antigravity-instructions-test");
+        const threadId = ThreadId.make("thread-antigravity-instructions");
+        yield* mcpSessions.set({
+          environmentId: EnvironmentId.make("env-antigravity-instructions"),
+          threadId,
+          providerSessionId: "provider-session-antigravity-instructions",
+          providerInstanceId: instanceId,
+          endpoint: "http://127.0.0.1:41998/mcp",
+          authorizationHeader: "Bearer test-token",
+          browserToolsAvailable: false,
+        });
+
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1" },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                prompt: (request) =>
+                  Effect.sync(() => {
+                    const text = request.prompt
+                      .filter(
+                        (block): block is { type: "text"; text: string } => block.type === "text",
+                      )
+                      .map((block) => block.text)
+                      .join("\n");
+                    capturedPrompts.push(text);
+                    return { stopReason: "end_turn" as const };
+                  }),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-ag-inst-cwd-" });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-instructions"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* session.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now,
+            ordinal: 1,
+            modelSelection,
+          }),
+        );
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+
+        assert.equal(capturedPrompts.length, 1);
+        const promptText = capturedPrompts[0]!;
+        assert.include(promptText, "## T3 Code orchestration");
+        assert.include(promptText, "`invoke_subagent`");
+        assert.include(promptText, "asynchronously in the background");
+        assert.notInclude(promptText, "`run_in_background:false`");
+        assert.notInclude(promptText, "never a background `Agent`");
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

@@ -148,15 +148,27 @@ describe("notificationTurnItem", () => {
     task("c", "Update docs", "running"),
   ];
 
-  it("opens the child thread of a single delegated task", () => {
+  it("opens the child thread of a single delegated task without reading as task-complete", () => {
     const item = notificationTurnItem(userMessage, delivery(["a"]), tasks);
     assert.deepInclude(item, {
       type: "notification",
-      summary: 'Delegated task "Review src/math.ts" finished',
+      summary: 'Delegated task "Review src/math.ts" turn ended',
       source: {
         kind: "delegated_task",
         taskIds: [NodeId.make("a")],
         childThreadId: ThreadId.make("thread:a"),
+      },
+    });
+  });
+
+  it("summarizes multiple ended delegated child turns without claiming the tasks completed", () => {
+    const item = notificationTurnItem(userMessage, delivery(["a", "b"]), tasks);
+    assert.deepInclude(item, {
+      type: "notification",
+      summary: "2 of 3 delegated task turns ended: Review src/math.ts, Write tests",
+      source: {
+        kind: "delegated_task",
+        taskIds: [NodeId.make("a"), NodeId.make("b")],
       },
     });
   });

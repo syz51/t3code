@@ -15,7 +15,6 @@ import {
   type DirectoryRecord,
 } from "@electron/asar";
 
-import { fromYaml } from "@t3tools/shared/schemaYaml";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/relayAuth";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -69,22 +68,12 @@ const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
 
-const WorkspaceConfig = Schema.Struct({
-  catalog: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
-});
-type WorkspaceConfig = typeof WorkspaceConfig.Type;
-
 const StageWorkspaceConfig = Schema.Struct({
   supportedArchitectures: Schema.Struct({
     os: Schema.Array(Schema.String),
     cpu: Schema.Array(Schema.String),
     libc: Schema.optional(Schema.Array(Schema.String)),
   }),
-  // pnpm 11 reads build approvals only from pnpm-workspace.yaml; omission fails staged lifecycle installs.
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
   patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   packageExtensions: Schema.optional(
@@ -98,11 +87,10 @@ const StageWorkspaceConfig = Schema.Struct({
       }),
     ),
   ),
-  nodeLinker: Schema.optional(Schema.Literals(["hoisted"])),
 });
 type StageWorkspaceConfig = typeof StageWorkspaceConfig.Type;
 
-// TypeScript is a typings-only peer; pnpm auto-installation would ship a compiler.
+// TypeScript is a typings-only peer; auto-installing it would ship a compiler.
 const STAGE_PACKAGE_EXTENSIONS = {
   "electron-webauthn": { peerDependenciesMeta: { typescript: { optional: true } } },
   "@electron-webauthn/macos": { peerDependenciesMeta: { typescript: { optional: true } } },
@@ -115,16 +103,6 @@ const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknow
 const decodeReleasePackageManifest = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
-const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
-const encodeStageWorkspaceConfig = Schema.encodeEffect(fromYaml(StageWorkspaceConfig));
-
-export const readWorkspaceConfig = Effect.fn("readWorkspaceConfig")(function* () {
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const repoRoot = yield* RepoRoot;
-  const workspaceYaml = yield* fs.readFileString(path.join(repoRoot, "pnpm-workspace.yaml"));
-  return yield* decodeWorkspaceConfig(workspaceYaml);
-});
 
 interface DesktopBuildIconAssets {
   readonly macIconPng: string;
@@ -266,6 +244,17 @@ export class UnsupportedHostBuildPlatformError extends Schema.TaggedError<Unsupp
 ) {
   override get message(): string {
     return `Unsupported host platform '${this.hostPlatform}'.`;
+  }
+}
+
+export class ForkBuildMissingConnectConfigError extends Schema.TaggedError<ForkBuildMissingConnectConfigError>()(
+  "ForkBuildMissingConnectConfigError",
+  {
+    version: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Fork build ${this.version} has no T3CODE_CLERK_PUBLISHABLE_KEY, so T3 Connect would not work. Run \`cp .env.example .env\` first.`;
   }
 }
 
@@ -982,7 +971,6 @@ interface StagePackageJson {
   };
 }
 
-export const STAGE_INSTALL_ARGS = ["install", "--prod"] as const;
 export const DESKTOP_ELECTRON_LANGUAGES = ["en-US"] as const;
 export const DESKTOP_FILE_EXCLUSIONS = [
   // Cursor walks from argv[1] to platform assets; helpers and native addons need real paths outside ASAR.
@@ -1522,7 +1510,7 @@ export function resolveKeyringNativeArtifacts(
   }));
 }
 
-/** electron-builder omits pnpm-nested platform packages; stage keyring's binary beside its loader, which checks there first. */
+/** electron-builder omits nested platform packages; stage keyring's binary beside its loader, which checks there first. */
 const stageKeyringNativeBinaries = Effect.fn("stageKeyringNativeBinaries")(function* (
   stageAppDir: string,
   platform: typeof BuildPlatform.Type,
@@ -1553,7 +1541,7 @@ const stageKeyringNativeBinaries = Effect.fn("stageKeyringNativeBinaries")(funct
   }
 });
 
-// Stage pnpm-nested Clerk binaries beside index.js so the loader finds them and electron-builder unpacks them.
+// Stage nested Clerk binaries beside index.js so the loader finds them and electron-builder unpacks them.
 const stageClerkPasskeyNativeBinaries = Effect.fn("stageClerkPasskeyNativeBinaries")(function* (
   stageAppDir: string,
   platform: typeof BuildPlatform.Type,
@@ -1584,17 +1572,16 @@ const stageClerkPasskeyNativeBinaries = Effect.fn("stageClerkPasskeyNativeBinari
   }
 });
 
-export function createStageWorkspaceConfig(input: {
+function createStageWorkspaceConfig(input: {
   readonly platform: typeof BuildPlatform.Type;
   readonly arch: typeof BuildArch.Type;
-  readonly allowBuilds?: Record<string, boolean>;
   readonly patchedDependencies?: Record<string, string>;
   readonly overrides?: Record<string, string>;
 }): StageWorkspaceConfig {
-  const { platform, arch, allowBuilds, patchedDependencies, overrides } = input;
+  const { platform, arch, patchedDependencies, overrides } = input;
   const hostOs = platform === "mac" ? "darwin" : platform === "win" ? "win32" : "linux";
   const hostCpu = arch === "universal" ? ["arm64", "x64"] : [arch];
-  // Linux AppImages require glibc native optional dependencies; tell pnpm explicitly.
+  // Linux AppImages require glibc native optional dependencies; tell the installer explicitly.
   const supportedArchitectures =
     platform === "linux"
       ? {
@@ -1609,12 +1596,46 @@ export function createStageWorkspaceConfig(input: {
 
   return {
     supportedArchitectures,
-    ...(allowBuilds && Object.keys(allowBuilds).length > 0 ? { allowBuilds } : {}),
     ...(patchedDependencies && Object.keys(patchedDependencies).length > 0
       ? { patchedDependencies }
       : {}),
     ...(overrides && Object.keys(overrides).length > 0 ? { overrides } : {}),
     packageExtensions: STAGE_PACKAGE_EXTENSIONS,
+  };
+}
+
+export function createStageBunInstall(input: {
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+  readonly trustedDependencies: ReadonlyArray<string>;
+  readonly patchedDependencies: Record<string, string>;
+  readonly overrides: Record<string, string>;
+  readonly bunfigPath: string;
+}) {
+  const { supportedArchitectures, patchedDependencies, overrides, packageExtensions } =
+    createStageWorkspaceConfig(input);
+  const { os, cpu, libc = [] } = supportedArchitectures;
+  return {
+    packageJson: {
+      ...(overrides ? { overrides } : {}),
+      ...(patchedDependencies ? { patchedDependencies } : {}),
+      trustedDependencies: input.trustedDependencies,
+      packageExtensions,
+    },
+    // electron-builder and server.asar need physical packages, not links into bun's store.
+    // The stage is outside the repo, so it names the repo's bunfig.toml for minimumReleaseAge.
+    // bun fails to resolve `--config <path>`; only `--config=<path>` works.
+    args: [
+      "install",
+      "--production",
+      `--config=${input.bunfigPath}`,
+      "--linker",
+      "hoisted",
+      ...os.flatMap((value) => ["--os", value]),
+      "--cpu",
+      (cpu.length === 1 && cpu[0]) || "*",
+      ...libc.flatMap((value) => ["--libc", value]),
+    ],
   };
 }
 
@@ -1726,6 +1747,10 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     });
   }
   const version = mergeOptions(input.buildVersion, env.version, undefined);
+  // A fork build replaces Nightly, so without the public T3 Connect config it strands every relay environment.
+  if (version?.includes("-fork.") && !loadRepoEnv({ repoRoot }).T3CODE_CLERK_PUBLISHABLE_KEY) {
+    return yield* new ForkBuildMissingConnectConfigError({ version });
+  }
   const releaseDir = resolveBooleanFlag(input.mockUpdates, env.mockUpdates)
     ? "release-mock"
     : "release";
@@ -2123,7 +2148,7 @@ const findStorePackageDirectory = Effect.fn("findStorePackageDirectory")(functio
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const storeDir = path.join(repoRoot, "node_modules/.pnpm");
+  const storeDir = path.join(repoRoot, "node_modules/.bun");
   const exists = (candidate: string) =>
     fs.exists(candidate).pipe(Effect.orElseSucceed(() => false));
   if (!(yield* exists(storeDir))) return null;
@@ -2786,7 +2811,7 @@ export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefi
   return `http://localhost:${mockUpdateServerPort ?? 3000}`;
 }
 
-// electron-builder reads user-agent syntax (pnpm/version), not packageManager syntax (pnpm@version).
+// electron-builder reads user-agent syntax (bun/version), not packageManager syntax (bun@version).
 export function resolvePackageManagerUserAgent(packageManager: string): string {
   const trimmed = packageManager.trim();
   const versionSeparator = trimmed.lastIndexOf("@");
@@ -3145,7 +3170,7 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
   readonly appVersion: string;
   readonly runtimeExternalDependencies: Record<string, string>;
   readonly fffNodeVersion: string;
-  readonly allowBuilds: Record<string, boolean>;
+  readonly trustedDependencies: ReadonlyArray<string>;
   readonly patchedDependencies: Record<string, string>;
   readonly overrides: Record<string, string>;
   readonly asarPath: string;
@@ -3166,46 +3191,39 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
     input.patchedDependencies,
     sidecarDependencies,
   );
+  const sidecarInstall = createStageBunInstall({
+    platform: "win",
+    arch: input.arch,
+    trustedDependencies: input.trustedDependencies,
+    patchedDependencies: sidecarPatchedDependencies,
+    overrides: input.overrides,
+    bunfigPath: path.join(input.repoRoot, "bunfig.toml"),
+  });
   const sidecarPackageJson = {
     name: "t3code-server",
     version: input.appVersion,
     private: true,
     packageManager: rootPackageJson.packageManager,
     dependencies: sidecarDependencies,
+    ...sidecarInstall.packageJson,
   };
   const sidecarPackageJsonString = yield* encodeJsonString(sidecarPackageJson);
   yield* fs.writeFileString(
     path.join(serverStageDir, "package.json"),
     `${sidecarPackageJsonString}\n`,
   );
-  const sidecarWorkspaceConfig = {
-    ...createStageWorkspaceConfig({
-      platform: "win",
-      arch: input.arch,
-      allowBuilds: input.allowBuilds,
-      patchedDependencies: sidecarPatchedDependencies,
-      overrides: input.overrides,
-    }),
-    // server.asar cannot carry pnpm symlinks or junctions; install physical hoisted dependencies.
-    nodeLinker: "hoisted" as const,
-  };
-  const sidecarWorkspaceConfigString = yield* encodeStageWorkspaceConfig(sidecarWorkspaceConfig);
-  yield* fs.writeFileString(
-    path.join(serverStageDir, "pnpm-workspace.yaml"),
-    sidecarWorkspaceConfigString,
-  );
   if (Object.keys(sidecarPatchedDependencies).length > 0) {
     yield* fs.copy(path.join(input.repoRoot, "patches"), path.join(serverStageDir, "patches"));
   }
 
   yield* Effect.log("[desktop-artifact] Installing server sidecar runtime externals...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installCommand = yield* resolveSpawnCommand("bun", sidecarInstall.args);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: serverStageDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod (server sidecar)", verbose: input.verbose },
+    { label: `bun ${sidecarInstall.args.join(" ")} (server sidecar)`, verbose: input.verbose },
   );
 
   yield* Effect.log("[desktop-artifact] Packing server.asar...");
@@ -3677,11 +3695,10 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       }),
     });
   }
-  const workspaceConfig = yield* readWorkspaceConfig();
-  const workspaceCatalog = workspaceConfig.catalog ?? {};
-  const workspaceOverrides = workspaceConfig.overrides ?? {};
-  const workspacePatchedDependencies = workspaceConfig.patchedDependencies ?? {};
-  const workspaceAllowBuilds = workspaceConfig.allowBuilds ?? {};
+  const workspaceCatalog = rootPackageJson.workspaces.catalog;
+  const workspaceOverrides = rootPackageJson.overrides;
+  const workspacePatchedDependencies = rootPackageJson.patchedDependencies;
+  const workspaceTrustedDependencies = rootPackageJson.trustedDependencies;
 
   const platformConfig = PLATFORM_CONFIG[options.platform];
   if (!platformConfig) {
@@ -3704,7 +3721,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     catch: (cause) =>
       new DesktopBuildDependencyResolutionError({
         kind: "workspace-overrides",
-        manifestPath: "pnpm-workspace.yaml",
+        manifestPath: "package.json",
         cause,
       }),
   });
@@ -3957,6 +3974,14 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     options.platform === "win"
       ? path.join(stageAppDir, WINDOWS_SERVER_RESOURCE_SOURCE_DIR, WINDOWS_SERVER_ASAR_RESOURCE)
       : undefined;
+  const stageInstall = createStageBunInstall({
+    platform: options.platform,
+    arch: options.arch,
+    trustedDependencies: workspaceTrustedDependencies,
+    patchedDependencies: stagePatchedDependencies,
+    overrides: resolvedOverrides,
+    bunfigPath: path.join(repoRoot, "bunfig.toml"),
+  });
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
     version: appVersion,
@@ -3992,35 +4017,24 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
     devDependencies: {
       electron: electronVersion,
     },
+    ...stageInstall.packageJson,
   };
 
   const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
   yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
-  const stageWorkspaceConfig = createStageWorkspaceConfig({
-    platform: options.platform,
-    arch: options.arch,
-    allowBuilds: workspaceAllowBuilds,
-    patchedDependencies: stagePatchedDependencies,
-    overrides: resolvedOverrides,
-  });
-  const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
-  yield* fs.writeFileString(
-    path.join(stageAppDir, "pnpm-workspace.yaml"),
-    stageWorkspaceConfigString,
-  );
 
   if (Object.keys(stagePatchedDependencies).length > 0) {
     yield* fs.copy(path.join(repoRoot, "patches"), path.join(stageAppDir, "patches"));
   }
 
   yield* Effect.log("[desktop-artifact] Installing staged production dependencies...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installCommand = yield* resolveSpawnCommand("bun", stageInstall.args);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: stageAppDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod", verbose: options.verbose },
+    { label: `bun ${stageInstall.args.join(" ")}`, verbose: options.verbose },
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
   yield* stageKeyringNativeBinaries(stageAppDir, options.platform, options.arch);
@@ -4034,7 +4048,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
       appVersion,
       runtimeExternalDependencies: resolvedServerRuntimeExternalDependencies,
       fffNodeVersion: serverPackageJson.dependencies["@ff-labs/fff-node"],
-      allowBuilds: workspaceAllowBuilds,
+      trustedDependencies: workspaceTrustedDependencies,
       patchedDependencies: workspacePatchedDependencies,
       overrides: resolvedOverrides,
       asarPath: windowsServerAsarPath,

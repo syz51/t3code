@@ -36,6 +36,12 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
   const text = liveText ?? row.message.text;
   const messageText =
     text || (row.message.streaming || row.suppressEmptyResponse ? "" : gt("(empty response)"));
+  const item = row.projectedItem?.item;
+  // Views without the thread folder link no files, so they get no agent folder either.
+  const workingDirectory =
+    ctx.markdownCwd !== undefined && item?.type === "assistant_message"
+      ? item.workingDirectory
+      : undefined;
 
   return (
     <>
@@ -53,6 +59,7 @@ export function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind
               text={messageText}
               renderInsights
               cwd={ctx.markdownCwd}
+              workingDirectory={workingDirectory}
               agentDirectories={() =>
                 ctx.threadRef && row.projectedItem
                   ? agentWorkingDirectories(readThreadTurnItems(ctx.threadRef), row.projectedItem)

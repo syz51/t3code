@@ -22,7 +22,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name != github.repository &&
       github.event.label.name == '🚀 Mobile Continuous Deployment'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
     concurrency:
       group: mobile-eas-preview-fork-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -117,6 +117,13 @@ jobs:
 
       # No caches: pull_request_target saves them under main's scope, where
       # trusted workflows with other secrets would restore what PR code wrote.
+      - name: Setup Bun
+        if: steps.expo-token.outputs.present == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+          no-cache: true
+
       - name: Setup Vite+
         if: steps.expo-token.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
@@ -126,14 +133,7 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/mobile...
-
-      - name: Expose pnpm
-        if: steps.expo-token.outputs.present == 'true'
-        run: |
-          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
-          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
-          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
-          "$vp_pnpm_bin/pnpm" --version
+              - --filter=@t3tools/monorepo
 
       - name: Setup EAS
         if: steps.expo-token.outputs.present == 'true'
@@ -240,8 +240,8 @@ jobs:
     name: Android preview client
     needs: preview
     if: needs.preview.outputs.build == 'true'
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 360 # fork-scaled: 60
     permissions:
       contents: read
       pull-requests: write
@@ -304,8 +304,8 @@ jobs:
     name: iOS preview client
     needs: preview
     if: needs.preview.outputs.ios_build == 'true'
-    runs-on: blacksmith-12vcpu-macos-27
-    timeout-minutes: 60
+    runs-on: macos-26 # fork-mapped: blacksmith-12vcpu-macos-27
+    timeout-minutes: 240 # fork-scaled: 60
     permissions:
       contents: read
       pull-requests: write
@@ -366,7 +366,7 @@ jobs:
     name: Mobile preview comment
     needs: [preview, android-build, ios-build]
     if: always() && !cancelled() && needs.preview.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     concurrency:
       group: mobile-preview-comment-${{ github.event.pull_request.number }}
       cancel-in-progress: false

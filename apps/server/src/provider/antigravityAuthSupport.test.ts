@@ -1,6 +1,7 @@
 import * as Sink from "effect/Sink";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -76,7 +77,9 @@ describe("Antigravity process environment", () => {
       BROWSER: "open-real-browser",
       browser: "another-real-browser",
       PYTHONUNBUFFERED: "0",
-      ELECTRON_RUN_AS_NODE: "0",
+      ELECTRON_RUN_AS_NODE: "1",
+      electron_run_as_node: "0",
+      T3_ANTIGRAVITY_AUTH_URL: "https://stale.invalid",
       CHROME_CRASHPAD_PIPE_NAME: "\\\\.\\pipe\\crashpad_50144_ZUJNJELFHHXPBIRT",
       chrome_crashpad_pipe_name: "\\\\.\\pipe\\crashpad_stale_alias",
       CUSTOM_SETTING: "keep-this",
@@ -105,10 +108,26 @@ describe("Antigravity process environment", () => {
         AGY_CLI_DISABLE_AUTO_UPDATE: "1",
         BROWSER: profile.browserCommand,
         PYTHONUNBUFFERED: "1",
-        ELECTRON_RUN_AS_NODE: "1",
         TMPDIR: profile.tempDirectory,
       },
     });
+    expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+    expect(
+      buildAntigravityAcpSpawnInput({
+        installation: { executablePath: "/usr/bin/agy" },
+        profile,
+        cwd: "/project",
+        baseEnv,
+        skipPermissions: true,
+      }).args,
+    ).toEqual([
+      "acp",
+      "--gemini-dir",
+      profile.geminiHome,
+      "--app-data-dir",
+      "antigravity-acp",
+      "--dangerously-skip-permissions",
+    ]);
   });
 
   it("passes only the configured method's credential and keeps the GCP pair out of the environment", () => {
@@ -187,39 +206,101 @@ describe("Antigravity process environment", () => {
   it.effect("keeps accounts separate even when instance IDs differ only by case", () =>
     Effect.gen(function* () {
       const first = yield* resolveAntigravityInstanceDirectories(
-        "/userdata",
+        "/Users/developer/.t3/userdata",
         ProviderInstanceId.make("antigravity"),
       );
       const second = yield* resolveAntigravityInstanceDirectories(
-        "/userdata",
+        "/Users/developer/.t3/userdata",
         ProviderInstanceId.make("Antigravity"),
       );
+      const otherState = yield* resolveAntigravityInstanceDirectories(
+        "/Users/developer/.t3-fork/userdata",
+        ProviderInstanceId.make("antigravity"),
+      );
       expect(first.profile).toBe(
-        "/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32",
+        "/Users/developer/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32",
       );
       expect(first.profile.toLowerCase()).not.toBe(second.profile.toLowerCase());
       expect(first.runtimeTemp.toLowerCase()).not.toBe(second.runtimeTemp.toLowerCase());
-    }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix))),
+      expect(first.runtimeTemp).not.toBe(otherState.runtimeTemp);
+      expect(first.isolatedProfiles.toLowerCase()).not.toBe(second.isolatedProfiles.toLowerCase());
+      expect(first.isolatedProfiles).toBe(
+        "/Users/developer/.t3/userdata/antigravity-tmp/ac0a3dfd6ddd",
+      );
+    }).pipe(
+      Effect.provideService(HostProcess.UserId, 501),
+      Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix)),
+    ),
   );
 
-  it.effect("keeps the unpacked Windows runtime under MAX_PATH for long user names", () =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      // Deepest member of the official agy_acp_server_1.1.1 windows-x86_64 bundle.
-      const deepestMember =
-        "google3\\cloud\\developer_experience\\antigravity_extensions\\acp_server\\_private__agy_acp_server_bin.lazy_imports_info.json";
-      const directories = yield* resolveAntigravityInstanceDirectories(
-        "C:\\Users\\a-twenty-char-person\\.t3\\userdata",
-        ProviderInstanceId.make("antigravity"),
-      );
-      const extracted = (tempDirectory: string) =>
-        path.join(tempDirectory, "run-AbC123", "_MEI000012ab2", deepestMember);
-      // MAX_PATH is 260 including the terminating NUL.
-      expect(extracted(directories.runtimeTemp).length).toBeLessThan(260);
-      expect(
-        extracted(path.join(directories.profile, "antigravity-acp", "tmp")).length,
-      ).toBeGreaterThanOrEqual(260);
-    }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerWin32))),
+  it.effect(
+    "keeps POSIX runtime temp dot-free and within 40 chars per run for SUN_LEN safety",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        for (const uid of [501, 1000, 4_294_967_295, undefined] as const) {
+          const directories = yield* resolveAntigravityInstanceDirectories(
+            "/Users/a-long-username/.t3/userdata",
+            ProviderInstanceId.make("antigravity"),
+          ).pipe(Effect.provideService(HostProcess.UserId, uid));
+          const runDir = path.join(directories.runtimeTemp, "run-AbC123");
+          expect(runDir.split("/").some((segment) => segment.startsWith("."))).toBe(false);
+          expect(runDir.length).toBeLessThanOrEqual(40);
+          expect(directories.runtimeTemp.startsWith("/tmp/")).toBe(true);
+          expect(
+            directories.isolatedProfiles.startsWith("/Users/a-long-username/.t3/userdata/"),
+          ).toBe(true);
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerPosix))),
+  );
+
+  it.effect(
+    "keeps the unpacked Windows runtime dot-free and under MAX_PATH for long user names",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        // Deepest member of the official agy_acp_server_1.1.1 windows-x86_64 bundle.
+        const deepestMember =
+          "google3\\cloud\\developer_experience\\antigravity_extensions\\acp_server\\_private__agy_acp_server_bin.lazy_imports_info.json";
+        const directories = yield* resolveAntigravityInstanceDirectories(
+          "C:\\Users\\a-twenty-char-person\\.t3\\userdata",
+          ProviderInstanceId.make("antigravity"),
+        ).pipe(
+          Effect.provideService(HostProcess.Environment, {
+            LOCALAPPDATA: "C:\\Users\\a-twenty-char-person\\AppData\\Local",
+            TEMP: "C:\\Users\\a-twenty-char-person\\.t3\\userdata\\antigravity-tmp\\legacy\\run-1",
+          }),
+        );
+        const extracted = (tempDirectory: string) =>
+          path.join(tempDirectory, "run-AbC123", "_MEI000012ab2", deepestMember);
+        // MAX_PATH is 260 including the terminating NUL.
+        expect(
+          directories.runtimeTemp.split(/[\\/]+/).some((segment) => segment.startsWith(".")),
+        ).toBe(false);
+        expect(directories.runtimeTemp).toContain("AppData\\Local\\Temp\\t3a\\");
+        expect(extracted(directories.runtimeTemp).length).toBeLessThan(260);
+        expect(
+          extracted(path.join(directories.profile, "antigravity-acp", "tmp")).length,
+        ).toBeGreaterThanOrEqual(260);
+        expect(directories.isolatedProfiles).toBe(
+          "C:\\Users\\a-twenty-char-person\\.t3\\userdata\\antigravity-tmp\\ac0a3dfd6ddd",
+        );
+
+        // Even if LOCALAPPDATA and TEMP contain dot segments, fall back to a dot-free drive root Temp.
+        const dotFallback = yield* resolveAntigravityInstanceDirectories(
+          "C:\\Users\\.dotuser\\.t3\\userdata",
+          ProviderInstanceId.make("antigravity"),
+        ).pipe(
+          Effect.provideService(HostProcess.Environment, {
+            LOCALAPPDATA: "C:\\Users\\.dotuser\\AppData\\Local",
+            TEMP: "C:\\Users\\.dotuser\\AppData\\Local\\Temp",
+          }),
+        );
+        expect(
+          dotFallback.runtimeTemp.split(/[\\/]+/).some((segment) => segment.startsWith(".")),
+        ).toBe(false);
+        expect(dotFallback.runtimeTemp.startsWith("C:\\Temp\\t3a\\")).toBe(true);
+      }).pipe(Effect.provide(Layer.mergeAll(NodeCrypto.layer, NodePath.layerWin32))),
   );
 });
 
@@ -637,6 +718,49 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
     }),
   );
 
+  caTest(
+    "enforces 0o700 permissions on shared /tmp runtime temp parents and rejects symlinked targets",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const sharedParent = yield* fs.makeTempDirectoryScoped({
+          directory: "/tmp",
+          prefix: "t3-ag-priv-",
+        });
+        yield* fs.chmod(sharedParent, 0o755);
+        const tempDirectory = path.join(sharedParent, "abcd1234");
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          tempDirectory,
+        });
+        expect(profile.tempDirectory).toBe(tempDirectory);
+        expect((yield* fs.stat(sharedParent)).mode & 0o777).toBe(0o700);
+        expect((yield* fs.stat(tempDirectory)).mode & 0o777).toBe(0o700);
+
+        const symlinkTarget = path.join(temporaryDirectory, "redirected");
+        yield* fs.makeDirectory(symlinkTarget, { recursive: true });
+        const symlinkParent = `${sharedParent}-link`;
+        yield* fs.symlink(symlinkTarget, symlinkParent);
+        yield* Effect.addFinalizer(() =>
+          fs.remove(symlinkParent, { force: true }).pipe(Effect.ignore),
+        );
+
+        const rejected = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile-2"),
+          tempDirectory: path.join(symlinkParent, "abcd1234"),
+        }).pipe(Effect.result);
+        expect(Result.isFailure(rejected)).toBe(true);
+        if (Result.isFailure(rejected)) {
+          expect(rejected.failure).toMatchObject({
+            _tag: "AcpTransportError",
+            detail: "The Antigravity runtime temp directory is not private.",
+          });
+        }
+      }),
+  );
+
   it.effect.skipIf(!symlinksSupported)(
     "links only the user's existing global skill directories without touching real content",
     () =>
@@ -892,16 +1016,219 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
-      for (const platform of ["linux", "win32"] as const) {
-        const profileDirectory = path.join(temporaryDirectory, platform);
-        const result = yield* prepareAntigravityProfile({
-          profileDirectory,
-          platform,
-          runtimeExecutablePath: platform === "win32" ? "C:/bad;path/node.exe" : "/bad:path/node",
-        }).pipe(Effect.result);
+      const cases = [
+        {
+          platform: "linux" as const,
+          profileDirectory: path.join(temporaryDirectory, "linux-colon"),
+          runtimeExecutablePath: "/bad:path/node",
+        },
+        {
+          platform: "linux" as const,
+          profileDirectory: path.join(temporaryDirectory, "linux-equals"),
+          runtimeExecutablePath: "/bad=path/node",
+        },
+        {
+          platform: "win32" as const,
+          profileDirectory: path.join(temporaryDirectory, "win32-exe-semi"),
+          runtimeExecutablePath: "C:/bad;path/node.exe",
+        },
+        {
+          platform: "win32" as const,
+          profileDirectory: path.join(temporaryDirectory, "win32;dir", "profile"),
+          runtimeExecutablePath: "C:/good/node.exe",
+        },
+      ];
+      for (const testCase of cases) {
+        const result = yield* prepareAntigravityProfile(testCase).pipe(Effect.result);
         expect(Result.isFailure(result)).toBe(true);
-        expect(yield* fs.exists(profileDirectory)).toBe(false);
+        expect(yield* fs.exists(testCase.profileDirectory)).toBe(false);
       }
     }),
+  );
+
+  caTest(
+    "omits ELECTRON_RUN_AS_NODE from ACP spawns while preflighting a POSIX helper that requires it",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const fakeElectron = path.join(temporaryDirectory, "fake-electron");
+        yield* fs.writeFileString(
+          fakeElectron,
+          `#!/bin/sh\n[ "\${ELECTRON_RUN_AS_NODE:-}" = "1" ] || exit 42\nexec '${process.execPath.replaceAll("'", `'"'"'`)}' "$@"\n`,
+        );
+        yield* fs.chmod(fakeElectron, 0o755);
+
+        const baseEnv = { ELECTRON_RUN_AS_NODE: "1" };
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          userHome: path.join(temporaryDirectory, "home"),
+          runtimeExecutablePath: fakeElectron,
+          platform: "linux",
+          baseEnv,
+        });
+        expect(profile.browserCommand).toContain("'/usr/bin/env' 'ELECTRON_RUN_AS_NODE=1'");
+        expect(profile.browserCommand).not.toContain(":");
+
+        const spawn = buildAntigravityAcpSpawnInput({
+          installation: { executablePath: "/usr/bin/agy" },
+          profile,
+          cwd: temporaryDirectory,
+          baseEnv,
+        });
+        expect(spawn.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+        expect(spawn.env?.BROWSER).toBe(profile.browserCommand);
+      }),
+  );
+
+  it.effect(
+    "writes a Windows PowerShell browser helper with ELECTRON_RUN_AS_NODE=1 and omits it from ACP spawns",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const spawnedCommands: Array<ChildProcess.StandardCommand> = [];
+        const helper = preflightHelper(Effect.void);
+        const inspectingSpawner = ChildProcessSpawner.make((command) => {
+          if (command._tag === "StandardCommand") {
+            spawnedCommands.push(command);
+          }
+          return helper.spawner.spawn(command);
+        });
+        const baseEnv = {
+          ELECTRON_RUN_AS_NODE: "1",
+        };
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: path.join(temporaryDirectory, "profile"),
+          userHome: path.join(temporaryDirectory, "home"),
+          runtimeExecutablePath: "C:\\Users\\O\u2019Connor\\T3 Code\\T3 Code.exe",
+          platform: "win32",
+          baseEnv,
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, inspectingSpawner),
+        );
+
+        expect(spawnedCommands).toHaveLength(1);
+        expect(spawnedCommands[0]?.command).toBe(
+          "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        );
+        expect(spawnedCommands[0]?.args).toEqual([
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          expect.stringMatching(/browser-helper\.ps1$/),
+          "https://example.invalid/t3-antigravity-browser-preflight",
+        ]);
+        expect(spawnedCommands[0]?.options.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect(profile.browserCommand).not.toContain(";");
+        expect(profile.browserCommand).toContain(
+          "'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'",
+        );
+        expect(profile.browserCommand).toContain("'-File'");
+        expect(profile.browserCommand).toContain("browser-helper.ps1");
+        expect(profile.browserCommand).toContain("'%s'");
+
+        const scriptPath = path.join(profile.acpDirectory, "browser-helper.ps1");
+        const scriptBytes = yield* fs.readFile(scriptPath);
+        expect(Array.from(scriptBytes.slice(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+        const script = yield* fs.readFileString(scriptPath);
+        expect(script).toContain("$env:ELECTRON_RUN_AS_NODE = '1'");
+        expect(script).toContain("$env:T3_ANTIGRAVITY_AUTH_URL = $Url");
+        expect(script).toContain("'C:\\Users\\O\u2019\u2019Connor\\T3 Code\\T3 Code.exe'");
+        expect(script).not.toContain('"');
+
+        // Verify the embedded JS helper captures T3_ANTIGRAVITY_AUTH_URL when invoked without argv[1].
+        const helperMatch = /'-e' '((?:''|[^'])+)'/.exec(script);
+        expect(helperMatch).not.toBeNull();
+        const helperCode = helperMatch![1]!.replaceAll("''", "'");
+        const nodeResult = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const child = yield* spawner.spawn(
+              ChildProcess.make(process.execPath, ["-e", helperCode], {
+                env: { T3_ANTIGRAVITY_AUTH_URL: authorizationUrl },
+                extendEnv: false,
+                shell: false,
+              }),
+            );
+            const stderr = yield* Stream.mkString(Stream.decodeText(child.stderr));
+            const exitCode = yield* child.exitCode;
+            return { stderr, exitCode: Number(exitCode) };
+          }),
+        );
+        expect(nodeResult).toEqual({
+          exitCode: 0,
+          stderr: `${ANTIGRAVITY_AUTH_BROWSER_MARKER}${encodeUnknownJson(authorizationUrl)}\n`,
+        });
+
+        const spawn = buildAntigravityAcpSpawnInput({
+          installation: { executablePath: "C:\\release\\agy.exe" },
+          profile,
+          cwd: temporaryDirectory,
+          baseEnv,
+        });
+        expect(spawn.env?.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+        expect(spawn.env?.BROWSER).toBe(profile.browserCommand);
+      }),
+  );
+
+  it.effect(
+    "copies only auth credentials into an isolated helper profile without hooks, MCP, or user links",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(root, "home");
+        const sourceProfile = path.join(root, "source-profile");
+        const isolatedProfile = path.join(root, "isolated-profile");
+        yield* fs.makeDirectory(path.join(userHome, ".gemini", "skills"), { recursive: true });
+        yield* fs.writeFileString(path.join(userHome, ".gemini", "GEMINI.md"), "user rules");
+        yield* fs.makeDirectory(path.join(sourceProfile, "config"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "config", "hooks.json"),
+          '{"hooks":{"PreInvocation":[{"command":"echo nope"}]}}',
+        );
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "config", "mcp_config.json"),
+          '{"mcpServers":{"bad":{"command":"echo nope"}}}',
+        );
+        yield* fs.makeDirectory(path.join(sourceProfile, "antigravity-acp"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "antigravity-acp", "antigravity-oauth-token"),
+          '{"token":{"access_token":"tok"}}',
+        );
+        yield* fs.writeFileString(
+          path.join(sourceProfile, "antigravity-acp", "installation_id"),
+          "install-123",
+        );
+
+        const helper = preflightHelper(Effect.void);
+        const profile = yield* prepareAntigravityProfile({
+          profileDirectory: isolatedProfile,
+          isolatedSourceProfileDirectory: sourceProfile,
+          userHome,
+          runtimeExecutablePath: "/fake/node",
+          platform: "linux",
+          baseEnv: {},
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, helper.spawner));
+
+        expect(
+          yield* fs.readFileString(path.join(profile.acpDirectory, "antigravity-oauth-token")),
+        ).toBe('{"token":{"access_token":"tok"}}');
+        expect(yield* fs.readFileString(path.join(profile.acpDirectory, "installation_id"))).toBe(
+          "install-123",
+        );
+        expect(yield* fs.exists(path.join(profile.geminiHome, "config"))).toBe(false);
+        expect(yield* fs.exists(path.join(profile.geminiHome, "GEMINI.md"))).toBe(false);
+        expect(yield* fs.exists(path.join(profile.geminiHome, "skills"))).toBe(false);
+      }),
   );
 });

@@ -502,13 +502,18 @@ export const make = Effect.gen(function* () {
     }),
     createChangeRequest: Effect.fn("ForgejoSourceControlProvider.createChangeRequest")(
       function* (input) {
-        const repo = yield* cli.resolveRepository(input);
+        const targetRepository = input.target?.repository;
+        const repo = yield* cli.resolveRepository({
+          ...input,
+          ...(targetRepository !== undefined ? { repository: targetRepository } : {}),
+        });
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         const owner = source?.owner ?? source?.repository?.split("/")[0];
         const head = SourceControlProvider.sourceBranch(input);
         yield* cli.api({
           ...input,
-          path: `${repositoryPath(input.target?.repository ?? repo.repository)}/pulls`,
+          ...(targetRepository !== undefined ? { repository: targetRepository } : {}),
+          path: `${repositoryPath(repo.repository)}/pulls`,
           method: "POST",
           body: {
             base: input.target?.refName ?? input.baseRefName,

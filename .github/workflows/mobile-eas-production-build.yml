@@ -37,8 +37,8 @@ jobs:
   android:
     name: Build
     if: ${{ !cancelled() && inputs.platform == 'android' }}
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 360 # fork-scaled: 60
     permissions:
       contents: read
     outputs:
@@ -111,8 +111,8 @@ jobs:
   ios:
     name: Build
     if: ${{ !cancelled() && inputs.platform == 'ios' }}
-    runs-on: blacksmith-12vcpu-macos-27
-    timeout-minutes: 60
+    runs-on: macos-26 # fork-mapped: blacksmith-12vcpu-macos-27
+    timeout-minutes: 240 # fork-scaled: 60
     permissions:
       contents: read
     outputs:
@@ -168,7 +168,7 @@ jobs:
     name: Record build
     needs: [android, ios]
     if: ${{ !cancelled() && (needs.android.outputs.submitted == 'true' || needs.ios.outputs.submitted == 'true') }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: write # pushes the build record tag

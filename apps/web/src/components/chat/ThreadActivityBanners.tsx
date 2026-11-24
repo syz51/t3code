@@ -286,6 +286,11 @@ export function backgroundWorkNowItem(
             className="tabular-nums"
           />
         )}
+        {only?.task.childThreadId ? (
+          <InlineButton onClick={() => onOpenThread(only.task.childThreadId!)}>
+            <T context="verb, opens a child thread">Open</T>
+          </InlineButton>
+        ) : null}
         <BackgroundWorkDetails
           environmentId={input.environmentId}
           threadId={input.threadId}

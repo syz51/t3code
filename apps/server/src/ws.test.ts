@@ -176,6 +176,7 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 
 import * as EventStore from "./orchestration-v2/EventStore.ts";
+import * as ShellThreadReads from "./orchestration-v2/ShellThreadReads.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -379,6 +380,7 @@ const resumeSkipsUnknownTypes = (scope: "thread" | "shell") =>
           }).pipe(Effect.flatMap(consume));
     });
     const items = yield* subscription.pipe(
+      Effect.provide(ShellThreadReads.layer),
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
         getShellSnapshot: () => Effect.die("shell resume must not load a full snapshot"),
@@ -535,6 +537,11 @@ it.effect("shell groups read distinct threads once and keep each event's own seq
             Stream.runCollect,
           ),
         ),
+      );
+    // Each call builds its own shared shell reads, like one server run.
+    const withServices = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           listActiveSubagentThreadIds: () => Effect.succeed([]),
           getShellSnapshot: (options?: { readonly threadIds?: ReadonlyArray<string> }) =>
@@ -597,24 +604,33 @@ it.effect("shell groups read distinct threads once and keep each event's own seq
       ["thread.removed", missing, "thread:missing"],
     ];
 
-    assert.deepEqual(yield* collectSummary(after), expectedGroup);
+    assert.deepEqual(yield* withServices(collectSummary(after)), expectedGroup);
     assert.deepEqual(shellReads, [["thread:archived", "thread:active", "thread:missing"]]);
 
     shellReads.length = 0;
-    assert.deepEqual(yield* collectSummary(active), [
+    assert.deepEqual(yield* withServices(collectSummary(active)), [
       ["thread.removed", missing, "thread:missing"],
     ]);
     assert.deepEqual(shellReads, [["scalar:thread:missing"]]);
 
     shellReads.length = 0;
     batchFails = true;
-    assert.deepEqual(yield* collectSummary(after), expectedGroup);
+    assert.deepEqual(yield* withServices(collectSummary(after)), expectedGroup);
     assert.deepEqual(shellReads, [
       ["thread:archived", "thread:active", "thread:missing"],
       ["scalar:thread:archived"],
       ["scalar:thread:active"],
       ["scalar:thread:missing"],
     ]);
+
+    shellReads.length = 0;
+    batchFails = false;
+    // Two subscribers of one server replay the same events and share the read.
+    assert.deepEqual(
+      yield* withServices(Effect.all([collectSummary(after), collectSummary(after)])),
+      [expectedGroup, expectedGroup],
+    );
+    assert.deepEqual(shellReads, [["thread:archived", "thread:active", "thread:missing"]]);
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
@@ -757,6 +773,7 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
       subscribeOrchestrationV2Shell(input).pipe(
         Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
         Effect.map(([item]) => (item?.kind === "snapshot" ? item.snapshot : null)),
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           listActiveShellIndex: () =>
             Effect.succeed(
@@ -899,6 +916,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ServerSelfUpdate.ServerSelfUpdate)({}),
   Layer.mock(NpmRelease.NpmRelease)({}),
   Layer.mock(SessionStore.SessionStore)({ cookieName: "config-test", legacyCookieName: undefined }),
+  Layer.mock(ShellThreadReads.ShellThreadReads)({}),
   Layer.mock(SourceControlDiscovery.SourceControlDiscovery)({}),
   Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({}),
   Layer.mock(SourceControlSignIn.SourceControlSignIn)({}),
@@ -2140,6 +2158,7 @@ it.effect.each([
         return items;
       });
       const exit = yield* subscription.pipe(
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
@@ -2211,6 +2230,7 @@ it.effect.each(["thread", "shell"] as const)(
         return stream;
       }).pipe(
         Effect.provideService(Statement.CurrentTransformer, gateReplayRead),
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
@@ -2331,6 +2351,7 @@ it.effect.each([
         );
       });
       const exit = yield* subscription.pipe(
+        Effect.provide(ShellThreadReads.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),

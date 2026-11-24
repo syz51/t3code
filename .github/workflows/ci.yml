@@ -22,7 +22,7 @@ jobs:
   # open: if the diff cannot be resolved, everything runs.
   changes:
     name: Changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       typecheck: ${{ steps.detect.outputs.typecheck }}
@@ -43,7 +43,7 @@ jobs:
         with:
           fetch-depth: 2
           sparse-checkout: |
-            /pnpm-workspace.yaml
+            /package.json
             /.github/scripts/ci-changes.cjs
             /.github/actions/ci-changes/
             /*/package.json
@@ -64,8 +64,8 @@ jobs:
       contents: read
       id-token: write
     name: Lint
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -95,7 +95,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
@@ -126,8 +126,8 @@ jobs:
     name: Build and Typecheck
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -152,10 +152,8 @@ jobs:
             /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
           (
             set +e
-            sudo apt-get update -o Acquire::Languages=none \
-              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
-              sudo apt-get install -y libsecret-1-dev pkg-config xvfb
+            # fork-apt: upstream runs apt-get here with no time limit. See docs/operations/fork.md.
+            .github/scripts/fork-apt-install.sh libsecret-1-dev pkg-config xvfb
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
@@ -170,7 +168,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         id: electron
@@ -191,7 +189,7 @@ jobs:
       - name: Finish installing browser secret helper build libraries
         id: apt
         if: ${{ !cancelled() && needs.changes.outputs.build != 'false' }}
-        timeout-minutes: 5
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
@@ -218,7 +216,7 @@ jobs:
       - name: Open the seeded thread in the built desktop app
         id: desktop_launch
         if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.desktop_launch != 'false' }}
-        timeout-minutes: 4
+        timeout-minutes: 8 # fork-scaled: 4
         run: |
           electron=$(node -p "require('./apps/desktop/node_modules/electron')")
           xvfb-run -a node scripts/smoke-desktop-app.ts --executable "$electron" --app apps/desktop \
@@ -264,12 +262,12 @@ jobs:
 
       - name: Boot the built web client
         if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
-        timeout-minutes: 3
+        timeout-minutes: 6 # fork-scaled: 3
         run: node apps/web/scripts/verify-built-boot.ts
 
       - name: Typecheck
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        timeout-minutes: 5
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/typecheck-status"; do sleep 1; done
           cat "$RUNNER_TEMP/typecheck.log"
@@ -288,8 +286,8 @@ jobs:
     name: Test
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -312,10 +310,8 @@ jobs:
             /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
           (
             set +e
-            sudo apt-get update -o Acquire::Languages=none \
-              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
-              sudo apt-get install -y libsecret-1-dev pkg-config
+            # fork-apt: upstream runs apt-get here with no time limit. See docs/operations/fork.md.
+            .github/scripts/fork-apt-install.sh libsecret-1-dev pkg-config
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
@@ -330,7 +326,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.bun/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
@@ -342,7 +338,7 @@ jobs:
         run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/workflow-credentials.test.cjs
 
       - name: Finish installing browser secret helper build libraries
-        timeout-minutes: 5
+        timeout-minutes: 10 # fork-scaled: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
@@ -378,8 +374,8 @@ jobs:
     name: Test Web ${{ matrix.shard }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20 # fork-scaled: 10
     strategy:
       fail-fast: false
       matrix:
@@ -440,7 +436,7 @@ jobs:
       contents: read
       id-token: write
     name: Test Server ${{ matrix.shard }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-4vcpu-ubuntu-2404
     # Shards take 2-5 minutes. When the shared task cache throttles reads, each
     # failed fetch stalls vp for 15-90s, which pushed shards past 10 minutes.
     timeout-minutes: 20
@@ -508,8 +504,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node_modules/.vitest-cache
-          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
-          restore-keys: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('bun.lock') }}-${{ github.sha }}
+          restore-keys: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('bun.lock') }}-
 
       - name: Test
         if: steps.changes.outputs.test_server != 'false'
@@ -528,7 +524,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node_modules/.vitest-cache
-          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('bun.lock') }}-${{ github.sha }}
 
       # integration/transferBudgetV2.integration.test.ts writes the report; exactly one shard
       # produces these files. Gating the upload on their presence keeps a
@@ -570,7 +566,7 @@ jobs:
     name: Rust
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -604,8 +600,8 @@ jobs:
     name: Mobile Native Static Analysis
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
-    runs-on: blacksmith-6vcpu-macos-27
-    timeout-minutes: 10
+    runs-on: macos-26 # fork-mapped: blacksmith-6vcpu-macos-27
+    timeout-minutes: 20 # fork-scaled: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -623,6 +619,7 @@ jobs:
           run-install: |
             args:
               - --filter=@t3tools/scripts...
+              - --filter=@t3tools/monorepo
 
       - name: Install mobile native static analysis tools
         run: brew bundle install --file apps/mobile/Brewfile
@@ -637,8 +634,8 @@ jobs:
     name: Release Smoke
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30 # fork-scaled: 15
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -677,7 +674,7 @@ jobs:
         mobile_native_static_analysis,
         release_smoke,
       ]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04 # fork-mapped: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Require every job to pass

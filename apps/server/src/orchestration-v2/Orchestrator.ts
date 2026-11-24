@@ -41,6 +41,7 @@ import {
   type OrchestrationV2ServerCommand,
   type ThreadPullRequestLink,
   type ThreadPullRequestWatch,
+  type ThreadPullRequestWatchEndReason,
   type PullRequestWatchUntil,
   type OrchestrationV2AppThread,
   type OrchestrationV2ContextHandoff,
@@ -147,6 +148,8 @@ import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
   continuationStartRetryDelayMs,
+  failedOnRateLimit,
+  rateLimitRetryDelayMs,
   delegatedTaskAwaitsWork,
   delegatedTaskResultRun,
   delegatedTaskRuns,
@@ -429,6 +432,8 @@ export interface OrchestratorV2Shape {
     taskId?: NodeId,
   ) => Effect.Effect<boolean, OrchestratorProjectionError>;
   readonly restartContinuationPending: (run: OrchestrationV2Run) => Effect.Effect<boolean>;
+  /** When a pending restart continuation of this run will start, if one waits. */
+  readonly restartContinuationRetryAt: (run: OrchestrationV2Run) => Effect.Effect<string | null>;
   /** Declined continuations emit no thread event; this still wakes waiters. */
   readonly awaitRestartContinuation: (run: OrchestrationV2Run) => Effect.Effect<void>;
   readonly dispatch: (
@@ -895,11 +900,22 @@ function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): 
 function withPullRequestWatch(
   link: ThreadPullRequestLink,
   watch: ThreadPullRequestWatch | undefined,
+  end?: { readonly reason: ThreadPullRequestWatchEndReason; readonly at: DateTime.Utc },
 ): ThreadPullRequestLink {
   const { watch: previous, endedWatch, ...rest } = link;
   if (watch !== undefined) return { ...rest, watch };
   const ended = previous ?? endedWatch;
-  return ended === undefined ? rest : { ...rest, endedWatch: ended };
+  return {
+    ...rest,
+    ...(ended !== undefined && { endedWatch: ended }),
+    ...(previous !== undefined &&
+      end !== undefined && {
+        watchRecord: {
+          ...link.watchRecord,
+          ended: { reason: end.reason, at: DateTime.formatIso(end.at) },
+        },
+      }),
+  };
 }
 
 function syncedPullRequestWatch(
@@ -955,6 +971,7 @@ function legacyPullRequestLink(
         repositoryWebUrl: existing.repositoryWebUrl,
       }),
       ...(existing?.endedWatch && { endedWatch: existing.endedWatch }),
+      ...(existing?.watchRecord && { watchRecord: existing.watchRecord }),
     },
     existing?.watch,
   );
@@ -972,8 +989,14 @@ function delegatedCompletionWakeDetail(
       const task = tasks.find((candidate) => candidate.id === taskId);
       // A follow-up gets a fresh task id; the child thread links it to the task delegate_task returned.
       const thread = task?.childThreadId == null ? "" : ` in child thread ${task.childThreadId}`;
+      const outcome =
+        task === undefined
+          ? " turn ended"
+          : task.status === "completed"
+            ? " [turn ended]"
+            : ` [${task.status}]`;
       const reason = task?.interruptReason == null ? "" : ` (${task.interruptReason})`;
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${thread}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}${reason}`;
+      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${thread}${outcome}${reason}`;
       if (task?.result != null) {
         const detail = `${label}:\n${task.result}`;
         const bytes = Buffer.byteLength(detail);
@@ -3448,18 +3471,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
 
   // Under load a resumed provider can time out before taking the prompt; the restart still owes the turn.
+  // An open delegated task's run that hit a short rate limit is tried again in the same thread.
   const retryContinuationStart = Effect.fn("Orchestrator.retryContinuationStart")(function* (
     threadId: ThreadId,
-    runId: RunId,
+    failed: OrchestrationV2Run,
   ) {
-    const projection = yield* projectionStore.getThreadRecords(
-      threadId,
-      ["runs", "providerTurns", "turnItems"],
-      { turnItemTypes: ["error"], turnItemRunIds: [runId] },
-    );
-    const run = projection.runs.find((candidate) => candidate.id === runId);
+    const retriesRateLimit = yield* delegatedTaskOpen(threadId, failed);
+    if (failed.restartContinuationOfRunId === undefined && !retriesRateLimit) return;
+    const { runs, providerTurns } = yield* projectionStore.getThreadRecords(threadId, [
+      "runs",
+      "providerTurns",
+    ]);
+    const run = runs.find((candidate) => candidate.id === failed.id);
     if (run === undefined) return;
-    const delayMs = continuationStartRetryDelayMs(run, projection);
+    const chainRunIds: Array<RunId> = [];
+    for (
+      let current: OrchestrationV2Run | undefined = run;
+      current !== undefined && !chainRunIds.includes(current.id);
+      current = runs.find((candidate) => candidate.id === current?.restartContinuationOfRunId)
+    )
+      chainRunIds.push(current.id);
+    const { turnItems } = yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+      turnItemTypes: ["error"],
+      turnItemRunIds: chainRunIds,
+    });
+    const now = yield* DateTime.now;
+    const delayMs =
+      continuationStartRetryDelayMs(run, { runs, providerTurns, turnItems }) ??
+      (retriesRateLimit
+        ? rateLimitRetryDelayMs(run, { runs, turnItems }, DateTime.toEpochMillis(now))
+        : undefined);
     if (delayMs === undefined) return;
     const commandId = CommandId.make(`command:restart-continuation-retry:${run.id}`);
     // A start retry is not a crash: carry the crash budget forward unchanged.
@@ -3485,7 +3526,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             sourceRunId: run.id,
             ...(processLossCount === undefined ? {} : { processLossCount }),
           },
-          availableAt: DateTime.add(yield* DateTime.now, { milliseconds: delayMs }),
+          availableAt: DateTime.add(now, { milliseconds: delayMs }),
         },
       ],
     );
@@ -5050,7 +5091,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             archivedAt: now,
             titleRegeneration: null,
             guestShare: null,
-            pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
+            pullRequests: thread.pullRequests?.map((link) =>
+              withPullRequestWatch(link, undefined, { reason: "archived", at: now }),
+            ),
             updatedAt: now,
           };
         case "thread.unarchive":
@@ -5067,7 +5110,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             limitRecovery: thread.limitRecovery
               ? { ...thread.limitRecovery, autoResume: false, snooze: false }
               : thread.limitRecovery,
-            pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
+            pullRequests: thread.pullRequests?.map((link) =>
+              withPullRequestWatch(link, undefined, { reason: "settled", at: now }),
+            ),
             unsettledAt: null,
             pinnedAt: null,
             pinOrderKey: null,
@@ -5342,7 +5387,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ? links.map((link) =>
                   link === existing
                     ? {
-                        ...withPullRequestWatch(link, undefined),
+                        ...withPullRequestWatch(link, undefined, { reason: "unlinked", at: now }),
                         source: "stack-dismissed" as const,
                       }
                     : link,
@@ -5443,6 +5488,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     snapshot: null,
                     stack: null,
                     ...(dismissed?.endedWatch && { endedWatch: dismissed.endedWatch }),
+                    ...(dismissed?.watchRecord && { watchRecord: dismissed.watchRecord }),
                   },
                 ]
               : linked;
@@ -5501,17 +5547,40 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     },
                     command.until,
                   );
-          if (watch === existing.watch && links === linked) return thread;
+          const skip =
+            command.type === "thread.pull-request-watch.sync" &&
+            existing.watch?.startedAt === command.startedAt
+              ? command.skip
+              : undefined;
+          if (watch === existing.watch && links === linked && skip === undefined) return thread;
           const final =
             command.type === "thread.pull-request-watch.sync" && watch === undefined
               ? command.endedWatch
               : undefined;
+          const endReason =
+            command.type === "thread.pull-request.watch" ? "unwatched" : command.endReason;
+          const next = withPullRequestWatch(
+            final ? { ...existing, watch: final } : existing,
+            watch,
+            endReason === undefined ? undefined : { reason: endReason, at: now },
+          );
+          const last = next.watchRecord?.skipped;
+          const open = last?.resumedAt === undefined ? last : undefined;
+          // A new cause keeps the time the unread stretch began.
+          const skipped =
+            skip === undefined
+              ? undefined
+              : skip !== null
+                ? { reason: skip, at: open?.at ?? startedAt }
+                : open && { ...open, resumedAt: startedAt };
           return {
             ...thread,
             pullRequests: links.map((link) =>
-              link === existing
-                ? withPullRequestWatch(final ? { ...link, watch: final } : link, watch)
-                : link,
+              link !== existing
+                ? link
+                : skipped === undefined
+                  ? next
+                  : { ...next, watchRecord: { ...next.watchRecord, skipped } },
             ),
             updatedAt: command.type === "thread.pull-request.watch" ? now : thread.updatedAt,
           };
@@ -7418,7 +7487,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         !source ||
         !(
           isRestartContinuationSource(source, projection.providerTurns) ||
-          continuationFailedBeforePrompt(source, projection.providerTurns)
+          continuationFailedBeforePrompt(source, projection.providerTurns) ||
+          failedOnRateLimit(
+            source,
+            projection.turnItems,
+            DateTime.toEpochMillis(yield* DateTime.now),
+          )
         ) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
@@ -13606,8 +13680,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // A resumed queue can have a lower ordinal than a pending continuation source.
       // Stop must reach those sources even when interrupting the resumed run succeeds.
       if (
-        (run.status === "cancelled" ||
-          (run.status === "failed" && run.restartContinuationOfRunId !== undefined)) &&
+        (run.status === "cancelled" || run.status === "failed") &&
         (yield* awaitsRestartContinuation(run).pipe(mapDispatchError(input.command)))
       ) {
         yield* markStoppedRun({ ...input, thread, run });
@@ -13644,7 +13717,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: input.now,
         payload: {
           ...thread,
-          pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
+          pullRequests: pullRequests.map((link) =>
+            withPullRequestWatch(link, undefined, { reason: "stopped", at: input.now }),
+          ),
         },
       });
     }
@@ -15019,6 +15094,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : undefined;
     },
   );
+
+  // A settled task no longer owns later turns in its thread.
+  const delegatedTaskOpen = Effect.fn("Orchestrator.delegatedTaskOpen")(function* (
+    childThreadId: ThreadId,
+    run: OrchestrationV2Run,
+  ) {
+    const { lineage, forkedFrom } = yield* projectionStore.getThread(childThreadId);
+    if (
+      lineage.relationshipToParent !== "subagent" ||
+      lineage.parentThreadId === null ||
+      forkedFrom?.type !== "node"
+    )
+      return false;
+    const taskId = run.delegatedTaskId ?? forkedFrom.nodeId;
+    const { subagents } = yield* projectionStore.getThreadRecords(
+      lineage.parentThreadId,
+      ["subagents"],
+      { subagentIds: [taskId] },
+    );
+    return subagents.some(
+      (task) =>
+        task.id === taskId &&
+        task.origin === "app_owned" &&
+        task.result === null &&
+        isOrchestrationV2WorkActive(task.status),
+    );
+  });
 
   const awaitsRestartContinuation = (run: OrchestrationV2Run) =>
     effectOutbox
@@ -16914,8 +17016,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         !(yield* awaitsCheckpointCapture(run))
       ) {
         // Before the parent hears of the failure: a pending continuation keeps the task open.
-        if (run.status === "failed" && run.restartContinuationOfRunId !== undefined) {
-          yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run.id)).pipe(
+        if (run.status === "failed") {
+          yield* threadDispatch.withLock(threadId, retryContinuationStart(threadId, run)).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("Failed to schedule a restart continuation retry", {
                 threadId,
@@ -17384,6 +17486,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     restartContinuationPending: Effect.fn("OrchestratorV2.restartContinuationPending")(
       function (run) {
         return awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false));
+      },
+    ),
+    restartContinuationRetryAt: Effect.fn("OrchestratorV2.restartContinuationRetryAt")(
+      function (run) {
+        return effectOutbox.get(`effect:restart-continuation:${run.id}`).pipe(
+          Effect.map((effect) =>
+            Option.isSome(effect) && effect.value.status === "pending"
+              ? effect.value.availableAt
+              : null,
+          ),
+          Effect.orElseSucceed(() => null),
+        );
       },
     ),
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {

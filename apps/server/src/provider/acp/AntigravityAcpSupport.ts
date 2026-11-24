@@ -35,6 +35,7 @@ import { normalizeAntigravitySessionUpdate } from "./AntigravityProtocol.ts";
 
 export interface AntigravityAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
+  | "assumeHttpMcpSupport"
   | "authMethodId"
   | "authenticateEagerly"
   | "cancelBehavior"
@@ -123,6 +124,8 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       authenticateEagerly: true,
+      // agy acp supports HTTP MCP servers without advertising mcpCapabilities.http.
+      assumeHttpMcpSupport: true,
       resumeMethod: "resume",
       cancelBehavior: "wait-for-prompt",
       clientInfo: antigravityClientInfo(input.runtimeVersion),
@@ -164,6 +167,20 @@ export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
     case "approval-required":
       return "default";
   }
+}
+
+/**
+ * Unrestricted `full-access` passes `--dangerously-skip-permissions` so child `invoke_subagent`
+ * calls do not stall 60s on unforwarded ACP prompts; all other policies stay gated by T3.
+ */
+export function antigravityUsesSkipPermissions(
+  policy: Pick<AcpRuntimePolicy, "runtimeMode" | "approvalPolicy" | "sandboxPolicy">,
+): boolean {
+  if (policy.runtimeMode !== "full-access") return false;
+  if (policy.approvalPolicy != null && policy.approvalPolicy !== "never") return false;
+  if (policy.sandboxPolicy == null) return true;
+  const sandboxType = unknownRecord(policy.sandboxPolicy)?.type;
+  return sandboxType === "dangerFullAccess" || sandboxType === "externalSandbox";
 }
 
 /**

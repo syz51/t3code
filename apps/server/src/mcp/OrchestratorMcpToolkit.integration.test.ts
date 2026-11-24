@@ -11,7 +11,7 @@ import {
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -80,7 +80,7 @@ const delegatedResult = "Delegated API boundary inspected.";
 const cancellationPrompt = "Remain active until the parent cancels this delegated task.";
 const queuedFollowupPrompt = "Complete the queued follow-up and return the final result.";
 const queuedFollowupResult = "Queued delegated follow-up completed.";
-const decodeThreadRead = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
+const decodeThreadRead = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadToolResult);
 const longFollowupResult = "Long delegated follow-up line. ".repeat(1_500);
 
 const decodeDelegateTaskResult = Schema.decodeUnknownEffect(OrchestratorMcpDelegateTaskResult);
@@ -360,9 +360,15 @@ describe("orchestrator MCP toolkit", () => {
               Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
               Effect.provideService(McpSchema.McpServerClient, client),
             );
+        // A linked environment's caller gets every field; an agent's result leaves some out.
+        const invokeWhole = (name: string, args: Record<string, unknown>) =>
+          invoke(name, args, {
+            ...invocation,
+            client: { sessionId: "peer", label: "Peer", access: "full-access", linked: true },
+          });
 
         const delegationStartSequence = yield* orchestrator.getThreadEventSequence(parentThreadId);
-        const delegatedCall = yield* invoke("delegate_task", {
+        const delegatedCall = yield* invokeWhole("delegate_task", {
           task: delegatedPrompt,
           target: {
             providerInstanceId: codexInstanceId,
@@ -396,7 +402,7 @@ describe("orchestrator MCP toolkit", () => {
               }),
             ),
           );
-        const delegatedStatusCall = yield* invoke("task_status", {
+        const delegatedStatusCall = yield* invokeWhole("task_status", {
           taskId: delegatedStart.taskId,
         });
         const delegated = yield* decodeDelegateTaskResult(
@@ -493,7 +499,7 @@ describe("orchestrator MCP toolkit", () => {
           ),
         ).toBe(true);
 
-        const pendingStatusCall = yield* invoke("task_status", {
+        const pendingStatusCall = yield* invokeWhole("task_status", {
           taskId: delegated.taskId,
         });
         const pendingStatus = yield* decodeDelegateTaskResult(
@@ -605,7 +611,7 @@ describe("orchestrator MCP toolkit", () => {
           finishedParent.subagents.find((task) => task.id === followupTasks[1]!.id)
             ?.completionDelivery?.state,
         ).toBe("claimed");
-        const finalStatusCall = yield* invoke("task_status", {
+        const finalStatusCall = yield* invokeWhole("task_status", {
           taskId: delegated.taskId,
         });
         const finalStatus = yield* decodeDelegateTaskResult(finalStatusCall.structuredContent).pipe(

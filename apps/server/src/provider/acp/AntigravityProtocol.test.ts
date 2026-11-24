@@ -4,6 +4,8 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as AcpWireSchema from "effect-acp/schema-v1";
 
 import {
+  extractAntigravityElicitationForm,
+  extractAntigravityProposedPlanMarkdown,
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
   antigravitySubagentOutput,
@@ -270,6 +272,186 @@ describe("Antigravity permissions and questions", () => {
     expect(
       makeAntigravityUserInputResponse(request, { interaction_9960062f: label + "..." }),
     ).toEqual({ outcome: { outcome: "selected", optionId: "stable-choice" } });
+  });
+});
+
+describe("Antigravity elicitation ask_question forms", () => {
+  const elicitation = (properties: Record<string, unknown>, required?: ReadonlyArray<string>) =>
+    ({
+      sessionId: "session-1",
+      toolCallId: "call_1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        properties,
+        ...(required === undefined ? {} : { required }),
+      },
+    }) as EffectAcpSchema.CreateElicitationRequest;
+
+  const colorField = {
+    type: "string",
+    title: "Pick a color?",
+    oneOf: [
+      { const: "1", title: "Red" },
+      { const: "2", title: "Blue" },
+    ],
+  };
+  const colorOther = {
+    type: "string",
+    title: "Other",
+    description: "Optional free-form answer to: Pick a color?",
+  };
+  const fruitField = {
+    type: "array",
+    title: "Pick fruits?",
+    items: {
+      anyOf: [
+        { const: "1", title: "Apple" },
+        { const: "2", title: "Banana" },
+        { const: "3", title: "Cherry" },
+      ],
+    },
+  };
+  const fruitOther = {
+    type: "string",
+    title: "Other",
+    description: "Optional free-form answer to: Pick fruits?",
+  };
+  const attachment = '\n\nAttached image "shot.png": "/tmp/shot.png"';
+
+  it("folds a single-select ask_question and its _other companion into one question", () => {
+    const form = extractAntigravityElicitationForm(
+      elicitation({ q1: colorField, q1_other: colorOther }),
+    );
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question",
+        question: "Pick a color?",
+        options: [
+          { label: "Red", description: "Red" },
+          { label: "Blue", description: "Blue" },
+        ],
+        allowCustomAnswer: true,
+      },
+    ]);
+    expect(form?.respond({ q1: "Blue" })).toEqual({
+      action: "accept",
+      content: { q1: "2" },
+    });
+    expect(form?.respond({ q1: "Purple" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Purple" },
+    });
+    expect(form?.respond({ q1: `Blue${attachment}` })).toEqual({
+      action: "accept",
+      content: { q1: "2", q1_other: `Blue${attachment}` },
+    });
+  });
+
+  it("folds multi-question batches including multi-select questions", () => {
+    const form = extractAntigravityElicitationForm(
+      elicitation({
+        q1: colorField,
+        q1_other: colorOther,
+        q2: fruitField,
+        q2_other: fruitOther,
+      }),
+    );
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question 1",
+        question: "Pick a color?",
+        options: [
+          { label: "Red", description: "Red" },
+          { label: "Blue", description: "Blue" },
+        ],
+        allowCustomAnswer: true,
+      },
+      {
+        id: "q2",
+        header: "Question 2",
+        question: "Pick fruits?",
+        options: [
+          { label: "Apple", description: "Apple" },
+          { label: "Banana", description: "Banana" },
+          { label: "Cherry", description: "Cherry" },
+        ],
+        multiSelect: true,
+        allowCustomAnswer: true,
+      },
+    ]);
+    expect(form?.respond({ q1: "Red", q2: ["Apple", "Cherry"] })).toEqual({
+      action: "accept",
+      content: { q1: "1", q2: ["1", "3"] },
+    });
+    expect(form?.respond({ q1: "Green", q2: "Mango" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Green", q2_other: "Mango" },
+    });
+    expect(
+      form?.respond({
+        q1: "Red",
+        q2: ["Banana", 'Attached file "list.txt": "/tmp/list.txt"'],
+      }),
+    ).toEqual({
+      action: "accept",
+      content: { q1: "1", q2: ["2"], q2_other: 'Attached file "list.txt": "/tmp/list.txt"' },
+    });
+  });
+
+  it("keeps explicit const values when option labels collide and cancels invalid answers", () => {
+    const form = extractAntigravityElicitationForm(
+      elicitation({
+        q1: {
+          ...colorField,
+          oneOf: [
+            { const: "1", title: "Same" },
+            { const: "2", title: "Same" },
+          ],
+        },
+        q1_other: colorOther,
+      }),
+    );
+    expect(form?.questions[0]?.options).toEqual([
+      { label: "Same", description: "Same", value: "1" },
+      { label: "Same", description: "Same", value: "2" },
+    ]);
+    expect(form?.respond({ q1: "2" })).toEqual({ action: "accept", content: { q1: "2" } });
+    expect(form?.respond({})).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: "   " })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: ["1"] })).toEqual({ action: "cancel" });
+  });
+
+  it.each([
+    ["unrelated property", { q1: colorField, q1_other: colorOther, extra: { type: "string" } }],
+    ["orphan companion", { q1_other: colorOther }],
+    ["text-only form", { q1: { type: "string", title: "Notes" } }],
+    [
+      "duplicate const values",
+      {
+        q1: {
+          ...colorField,
+          oneOf: [
+            { const: "1", title: "Red" },
+            { const: "1", title: "Blue" },
+          ],
+        },
+        q1_other: colorOther,
+      },
+    ],
+  ])("falls back to generic elicitation parsing for %s", (_, properties) => {
+    expect(extractAntigravityElicitationForm(elicitation(properties))).toBeUndefined();
+  });
+
+  it("falls back when a paired field is marked required", () => {
+    expect(
+      extractAntigravityElicitationForm(
+        elicitation({ q1: colorField, q1_other: colorOther }, ["q1"]),
+      ),
+    ).toBeUndefined();
   });
 });
 
@@ -765,5 +947,190 @@ describe("Antigravity served reads", () => {
       }).toolCall,
     );
     expect(foreignCall.data.rawInput).toEqual({ message: "Hello", toolSummary: "Send greeting" });
+  });
+});
+
+describe("extractAntigravityProposedPlanMarkdown", () => {
+  const profileDirectory = "/var/folders/t3/providers/antigravity/abc";
+  const planPath = `${profileDirectory}/antigravity-acp/brain/34f507d0-69bc-4de3-a555-e83241af3748/plan.md`;
+
+  it("extracts completed brain plan.md writes and diff blocks", () => {
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_plan",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: `/private${planPath}`,
+              Content: "# Plan\n\n1. Ship it\n",
+            },
+          },
+        },
+        profileDirectory,
+      ),
+    ).toBe("# Plan\n\n1. Ship it");
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_plan_diff",
+          status: "completed",
+          data: {
+            content: [{ type: "diff", path: planPath, newText: "  # Diff Plan  " }],
+          },
+        },
+        profileDirectory,
+      ),
+    ).toBe("# Diff Plan");
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_impl_plan",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: `${profileDirectory}/antigravity-acp/brain/34f507d0-69bc-4de3-a555-e83241af3748/implementation_plan.md`,
+              Content: "# Implementation Plan\n\n- Step 1\n",
+            },
+          },
+        },
+        profileDirectory,
+      ),
+    ).toBe("# Implementation Plan\n\n- Step 1");
+  });
+
+  it("ignores in-progress writes, repo plan.md files, and path traversal", () => {
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_pending",
+          status: "inProgress",
+          data: { rawInput: { Path: planPath, Content: "# Draft" } },
+        },
+        profileDirectory,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_repo_plan",
+          status: "completed",
+          data: { rawInput: { Path: "/repo/plan.md", Content: "# Repo file" } },
+        },
+        profileDirectory,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_traversal",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: `${profileDirectory}/antigravity-acp/brain/../plan.md`,
+              Content: "# Nope",
+            },
+          },
+        },
+        profileDirectory,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_append",
+          status: "completed",
+          data: { rawInput: { Path: planPath, Content: "## Extra", Append: true } },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_partial_diff",
+          status: "completed",
+          data: {
+            content: [{ type: "diff", path: planPath, oldText: "old", newText: "new snippet" }],
+          },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_truncated",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: planPath,
+              Content: "[Earlier output truncated]\n\n...tail only",
+            },
+          },
+        },
+        profileDirectory,
+        () => undefined,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("prefers the full file on disk over truncated or partial tool updates and normalizes /private/tmp", () => {
+    const tmpProfile = "/tmp/t3-plan-profile";
+    const canonicalPlan = `/private${tmpProfile}/antigravity-acp/brain/sess-1/plan.md`;
+    expect(
+      extractAntigravityProposedPlanMarkdown(
+        {
+          toolCallId: "call_long_edit",
+          status: "completed",
+          data: {
+            rawInput: {
+              Path: canonicalPlan,
+              Content: "[Earlier output truncated]\n\n...tail",
+              Append: true,
+            },
+          },
+        },
+        tmpProfile,
+        (filePath) => (filePath === canonicalPlan ? "  # Complete Plan From Disk  \n" : undefined),
+      ),
+    ).toBe("# Complete Plan From Disk");
+  });
+
+  it("folds ask_question schemas whose optional fields are explicitly null", () => {
+    const form = extractAntigravityElicitationForm({
+      sessionId: "session-1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        required: null,
+        properties: {
+          q1: {
+            type: "string",
+            title: "Pick one?",
+            description: null,
+            oneOf: [{ const: "1", title: "Yes", description: null }],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: null,
+            oneOf: null,
+          },
+        },
+      },
+    } as unknown as Parameters<typeof extractAntigravityElicitationForm>[0]);
+    expect(form?.questions).toHaveLength(1);
+    expect(form?.questions[0]?.allowCustomAnswer).toBe(true);
   });
 });

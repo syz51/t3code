@@ -21,6 +21,16 @@ describe("checksState", () => {
       checksState([run("in_progress"), run("completed", "action_required")]),
       "failing",
     );
+    assert.deepStrictEqual(
+      [
+        run("in_progress", "success"),
+        run("queued", "failure"),
+        run("failing"),
+        run("completed"),
+      ].map((check) => check.status),
+      ["success", "failure", "failure", "failure"],
+    );
+    assert.strictEqual(checksState([run("in_progress", "success")]), "passing");
   });
 });
 

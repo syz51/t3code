@@ -55,12 +55,14 @@ import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import * as ShellThreadReads from "./ShellThreadReads.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as PeerMcpClient from "../peer/PeerMcpClient.ts";
 import * as WorkflowRuntime from "../workflows/WorkflowRuntime.ts";
 import * as ThreadIssueService from "./ThreadIssueService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -315,6 +317,7 @@ const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
       layerCommandReceiptStoreProvided,
       layerEventSink,
       IdAllocator.layer,
+      T3ProjectFileLoader.layer,
     ).pipe(Layer.provideMerge(layerProjectService)),
   ),
 );
@@ -424,6 +427,7 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerMcpSignInProvided,
   layerThreadManagementProvided,
+  ShellThreadReads.layer.pipe(Layer.provide(layerThreadManagementProvided)),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,

@@ -28,7 +28,7 @@ import {
   BundleNotSelfContainedError,
   BuildCommandFailedError,
   parseWslRuntimeArchiveMembers,
-  readWorkspaceConfig,
+  createStageBunInstall,
   createBuildConfig,
   DESKTOP_FILE_EXCLUSIONS,
   InvalidMacPasskeyRpDomainError,
@@ -79,8 +79,6 @@ const encodeModuleUrl = Schema.encodeEffect(Schema.fromJsonString(Schema.String)
 const decodePackageVersion = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
 );
-
-// Keeps pnpm from auto-installing TypeScript, a types-only peer, into the app.
 
 const makeLinuxCliArchiveFixture = Effect.fn("test.makeLinuxCliArchiveFixture")(function* (input: {
   readonly root: string;
@@ -554,6 +552,30 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
+  it("passes the target platform to the staged bun install", () => {
+    const stage = (platform: "mac" | "linux", arch: "arm64" | "universal") =>
+      createStageBunInstall({
+        platform,
+        arch,
+        trustedDependencies: ["node-pty"],
+        patchedDependencies: {},
+        overrides: {},
+        bunfigPath: "/repo/bunfig.toml",
+      }).args;
+    const prefix = ["install", "--production", "--config=/repo/bunfig.toml", "--linker", "hoisted"];
+    assert.deepStrictEqual(stage("mac", "arm64"), [...prefix, "--os", "darwin", "--cpu", "arm64"]);
+    assert.deepStrictEqual(stage("mac", "universal"), [...prefix, "--os", "darwin", "--cpu", "*"]);
+    assert.deepStrictEqual(stage("linux", "arm64"), [
+      ...prefix,
+      "--os",
+      "linux",
+      "--cpu",
+      "arm64",
+      "--libc",
+      "glibc",
+    ]);
+  });
+
   it.effect("names the Electron window class in the Linux desktop entry", () =>
     Effect.gen(function* () {
       const linux = yield* createBuildConfig(
@@ -616,25 +638,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
             assert.isNotEmpty(mac.extendInfo[key]);
           }
         }
-      }
-    }),
-  );
-
-  // pnpm writes "set this to true or false" placeholders into allowBuilds when a
-  // tarball changes. pnpm ignores them, but the release build decode rejects them.
-  it.effect("decodes the repo allowBuilds and every file: tarball it names exists", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const { allowBuilds = {} } = yield* readWorkspaceConfig();
-      const repoRoot = path.join(import.meta.dirname, "..");
-      for (const key of Object.keys(allowBuilds)) {
-        const tarball = key.split("@file:")[1]?.replace(/\(patch_hash=[a-f0-9]+\)$/, "");
-        if (tarball === undefined) continue;
-        assert.isTrue(
-          yield* fs.exists(path.join(repoRoot, tarball)),
-          `allowBuilds names a missing tarball: ${key}`,
-        );
       }
     }),
   );

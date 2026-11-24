@@ -72,6 +72,8 @@ import {
   ThreadPullRequestSnapshot,
   ThreadPullRequestStack,
   ThreadPullRequestWatch,
+  ThreadPullRequestWatchEndReason,
+  ThreadPullRequestWatchSkipReason,
   PullRequestWatchUntil,
 } from "./threadPullRequest.ts";
 import {
@@ -1933,6 +1935,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     textOmitted: DedupedBodyMarker,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
+    /** The folder the agent worked in when it moved away from the thread folder; links resolve against it. */
+    workingDirectory: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2834,6 +2838,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     text: Schema.String,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
+    /** The folder the agent worked in when it moved away from the thread folder; links resolve against it. */
+    workingDirectory: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -3896,6 +3902,10 @@ const OrchestrationV2InternalCommand = Schema.Union([
     checksPendingBefore: Schema.optional(Schema.Boolean),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),
+    /** With `watch: null`, why the watch ended. */
+    endReason: Schema.optional(ThreadPullRequestWatchEndReason),
+    /** The failure that left this sweep unread, or null once the host is read again. */
+    skip: Schema.optional(Schema.NullOr(ThreadPullRequestWatchSkipReason)),
     /** More watches of this thread recorded together, which `wake` also reports on. */
     others: Schema.optional(
       Schema.Array(
@@ -3905,6 +3915,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
           watch: Schema.NullOr(ThreadPullRequestWatch),
           checksPendingBefore: Schema.optional(Schema.Boolean),
           endedWatch: Schema.optional(ThreadPullRequestWatch),
+          endReason: Schema.optional(ThreadPullRequestWatchEndReason),
+          skip: Schema.optional(Schema.NullOr(ThreadPullRequestWatchSkipReason)),
           includesRemarks: Schema.optional(Schema.Boolean),
         }),
       ),

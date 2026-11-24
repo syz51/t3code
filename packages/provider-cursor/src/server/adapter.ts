@@ -2939,6 +2939,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             agentFeedback: mcpServers === undefined ? "off" : (turnInput.agentFeedback ?? "off"),
             harness: "Cursor",
             model: turnInput.modelSelection.model,
+            delegatedChild: turnInput.appThread.lineage.relationshipToParent === "subagent",
             runtimePolicy: turnInput.runtimePolicy,
           });
           // Resend only on a new/compacted/rewound conversation or when the instructions change.

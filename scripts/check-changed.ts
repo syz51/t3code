@@ -7,7 +7,7 @@
 // A dependency change also gets the unused-patch install check below. CI still
 // runs the full test suites and the jobs listed in the summary.
 //
-//   vp run check:changed                  compare against the closest merge base with any remote main
+//   vp run check:changed                  compare against the closest merge base with any remote main or fork
 //   vp run check:changed <ref>            compare against the merge base with <ref>
 //   vp run check:changed --concurrency 1  run the steps one at a time
 //
@@ -197,10 +197,17 @@ export const comparisonBase = Effect.fn("checkChanged.comparisonBase")(function*
 ) {
   const candidates = Option.isSome(explicitRef)
     ? [{ ref: explicitRef.value, rev: explicitRef.value }]
-    : (yield* gitLines(root, ["remote"])).map((name) => ({
-        ref: name + "/main",
-        rev: "refs/remotes/" + name + "/main",
-      }));
+    : // A remote's `fork` branch is this fork's patch base. Mains come first, so a tie reports main.
+      yield* gitLines(root, ["remote"]).pipe(
+        Effect.map((names) =>
+          ["main", "fork"].flatMap((branch) =>
+            names.map((name) => ({
+              ref: name + "/" + branch,
+              rev: "refs/remotes/" + name + "/" + branch,
+            })),
+          ),
+        ),
+      );
   let closest: { ref: string; base: string; ahead: number } | undefined;
   for (const { ref, rev } of candidates) {
     const base = yield* git(root, ["merge-base", "HEAD", rev]).pipe(
@@ -212,7 +219,7 @@ export const comparisonBase = Effect.fn("checkChanged.comparisonBase")(function*
     if (!closest || ahead < closest.ahead) closest = { ref, base, ahead };
   }
   if (!closest) {
-    const tried = candidates.map(({ ref }) => ref).join(", ") || "a remote main";
+    const tried = candidates.map(({ ref }) => ref).join(", ") || "a remote main or fork";
     return yield* Effect.fail(
       "check:changed: no merge base with " + tried + ". Run git fetch or pass a ref.",
     );
@@ -322,8 +329,7 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
       ...(yield* changedFiles),
       ...(yield* untrackedFiles),
       ...ignored,
-      "node_modules/.modules.yaml",
-      "node_modules/.pnpm/lock.yaml",
+      "bun.lock",
     ]) {
       hash.update(`\0${file}\0`);
       // Untracked nested repositories are listed as directories.
@@ -424,13 +430,11 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
     knipPasses.push(["exec", "knip", ...args]);
   }
 
-  // A version bump can leave a patch unused, causing pnpm to reject the install
-  // with ERR_PNPM_UNUSED_PATCH. Check it here as Release Smoke does in CI.
+  // A version bump can leave a patch unused; bun only warns that it "no longer applies".
   const runPatchCheck = files.some(
     (file) =>
-      file === "pnpm-workspace.yaml" ||
-      file === "pnpm-lock.yaml" ||
-      file === ".pnpmfile.cjs" ||
+      file === "bun.lock" ||
+      file === "bunfig.toml" ||
       file.startsWith("patches/") ||
       file.startsWith("apps/mobile/deps/") ||
       file.startsWith("apps/web/deps/") ||
@@ -471,7 +475,6 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
         yield* fs.copy(inRoot(relative), dest);
       });
       yield* copy("package.json");
-      yield* copy("pnpm-workspace.yaml");
       for (const pkg of packages) yield* copy(`${pkg.dir}/package.json`);
       const modulesDir = "apps/mobile/modules";
       if (yield* fs.exists(inRoot(modulesDir))) {
@@ -480,16 +483,16 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
           if (yield* fs.exists(inRoot(manifest))) yield* copy(manifest);
         }
       }
-      for (const extra of ["apps/mobile/deps", "apps/web/deps", "patches", ".pnpmfile.cjs"]) {
+      for (const extra of ["apps/mobile/deps", "apps/web/deps", "patches", "bunfig.toml"]) {
         if (yield* fs.exists(inRoot(extra))) yield* copy(extra);
       }
       const result = yield* vp(["install", "--lockfile-only", "--ignore-scripts"], temp);
-      if (result.ok || !result.output.includes("ERR_PNPM_UNUSED_PATCH")) return result;
+      if (!result.output.includes("no longer applies")) return result;
       return {
         ok: false,
         output:
           `${result.output}\nUnused dependency patches: remove each patch named above from ` +
-          "patchedDependencies in pnpm-workspace.yaml and from patches/, " +
+          "patchedDependencies in package.json and from patches/, " +
           "update it to the version the install resolves, " +
           "or pin the dependency that pulls it in to the patched version.",
       };

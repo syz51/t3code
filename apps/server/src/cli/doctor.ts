@@ -176,7 +176,7 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
           Clock.monotonicTimeNanos.pipe(
             Effect.flatMap((now) =>
               Console.log(
-                `Done in ${formatElapsed(now - startedAt)}: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed.`,
+                `Done in ${formatElapsed(now - startedAt)}: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed, ${result.compactedTurnItemCount} settled turn items trimmed.`,
               ),
             ),
           ),

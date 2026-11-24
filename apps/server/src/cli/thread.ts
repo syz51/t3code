@@ -1,7 +1,7 @@
 import {
   OrchestratorMcpFailure,
   OrchestratorMcpThreadListResult,
-  OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadReadToolResult,
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitResult,
   ProjectId,
@@ -12,7 +12,7 @@ import {
   type OrchestratorMcpThreadListItem,
   type OrchestratorMcpThreadRun,
   type OrchestratorMcpThreadStatus,
-  type OrchestratorMcpThreadTimelineItem,
+  type OrchestratorMcpThreadReadToolItem,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Console from "effect/Console";
@@ -424,9 +424,9 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
   threadId: ThreadId,
   view: "messages" | "activity",
 ) {
-  const items: Array<OrchestratorMcpThreadTimelineItem> = [];
+  const items: Array<OrchestratorMcpThreadReadToolItem> = [];
   let afterPosition: number | null = -1;
-  let page: OrchestratorMcpThreadReadResult;
+  let page: OrchestratorMcpThreadReadToolResult;
   do {
     page = yield* tools.call(
       "t3_thread_read",
@@ -436,14 +436,15 @@ const readTimeline = Effect.fn("cli.thread.readTimeline")(function* (
         limit: READ_PAGE_LIMIT,
         maxCharsPerItem: READ_ITEM_MAX_CHARS,
         runLimit: 1,
+        include: ["runs"],
         afterPosition,
       },
-      OrchestratorMcpThreadReadResult,
+      OrchestratorMcpThreadReadToolResult,
     );
     items.push(...page.items);
     afterPosition = page.nextPosition;
   } while (page.hasMore && afterPosition !== null);
-  return { thread: page.thread, items };
+  return { items };
 });
 
 /**
@@ -458,10 +459,11 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
 ) {
   let { thread } = yield* tools.call(
     "t3_thread_read",
-    { threadId, limit: 1, runLimit: 1 },
-    OrchestratorMcpThreadReadResult,
+    { threadId, limit: 1, runLimit: 1, include: ["thread"] },
+    OrchestratorMcpThreadReadToolResult,
   );
-  let messages: Array<OrchestratorMcpThreadTimelineItem> = [];
+  if (thread === undefined) return yield* Effect.die("t3_thread_read left out the thread record.");
+  let messages: Array<OrchestratorMcpThreadReadToolItem> = [];
   // The newest window has no upper bound, so items added since the first
   // read are still shown.
   let before: number | undefined;
@@ -470,9 +472,9 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
   do {
     const end = before;
     start = Math.max(0, start - span);
-    const window: Array<OrchestratorMcpThreadTimelineItem> = [];
+    const window: Array<OrchestratorMcpThreadReadToolItem> = [];
     let afterPosition = start - 1;
-    let page: OrchestratorMcpThreadReadResult;
+    let page: OrchestratorMcpThreadReadToolResult;
     do {
       page = yield* tools.call(
         "t3_thread_read",
@@ -482,9 +484,10 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
           limit: READ_PAGE_LIMIT,
           maxCharsPerItem: READ_ITEM_MAX_CHARS,
           runLimit: 1,
+          include: ["thread", "runs"],
           afterPosition,
         },
-        OrchestratorMcpThreadReadResult,
+        OrchestratorMcpThreadReadToolResult,
       );
       window.push(
         ...page.items.filter(
@@ -509,7 +512,7 @@ export const readLatestMessages = Effect.fn("cli.thread.readLatestMessages")(fun
 const readFullText = Effect.fn("cli.thread.readFullText")(function* (
   tools: ThreadTools,
   threadId: ThreadId,
-  item: OrchestratorMcpThreadTimelineItem,
+  item: OrchestratorMcpThreadReadToolItem,
 ) {
   let text = item.text ?? "";
   let nextTextOffset = item.textTruncated ? (item.nextTextOffset ?? null) : null;
@@ -523,7 +526,7 @@ const readFullText = Effect.fn("cli.thread.readFullText")(function* (
         runLimit: 1,
         maxCharsPerItem: READ_ITEM_MAX_CHARS,
       },
-      OrchestratorMcpThreadReadResult,
+      OrchestratorMcpThreadReadToolResult,
     );
     const chunk = page.items.find((candidate) => candidate.itemId === item.itemId);
     if (chunk === undefined) break;
@@ -596,10 +599,10 @@ const runsAfter = Effect.fn("cli.thread.runsAfter")(function* (
   threadId: ThreadId,
   runId: RunId,
 ) {
-  const { recentRuns } = yield* tools.call(
+  const { recentRuns = [] } = yield* tools.call(
     "t3_thread_read",
-    { threadId, limit: 1, runLimit: 50 },
-    OrchestratorMcpThreadReadResult,
+    { threadId, limit: 1, runLimit: 50, include: ["runs"] },
+    OrchestratorMcpThreadReadToolResult,
   );
   const own = recentRuns.find((run) => run.runId === runId);
   if (own === undefined) return { later: [], sent: true };
@@ -650,10 +653,10 @@ export const waitForRun = Effect.fn("cli.thread.waitForRun")(function* (
       // behind, blocks it until someone answers.
       const { thread } = yield* tools.call(
         "t3_thread_read",
-        { threadId, limit: 1, runLimit: 1 },
-        OrchestratorMcpThreadReadResult,
+        { threadId, limit: 1, runLimit: 1, include: ["thread"] },
+        OrchestratorMcpThreadReadToolResult,
       );
-      if (thread.pendingRequestCount > 0) {
+      if (thread !== undefined && thread.pendingRequestCount > 0) {
         // The count is thread-wide: if this run ended since the slice, the
         // request belongs to a later run.
         const recheck = yield* waitSlice(1);
@@ -702,11 +705,13 @@ export const waitForRun = Effect.fn("cli.thread.waitForRun")(function* (
     workOutlivedRun = true;
     const { thread } = yield* tools.call(
       "t3_thread_read",
-      { threadId, limit: 1, runLimit: 1 },
-      OrchestratorMcpThreadReadResult,
+      { threadId, limit: 1, runLimit: 1, include: ["thread"] },
+      OrchestratorMcpThreadReadToolResult,
     );
     // Earlier runs have ended, so the request is on a run this one's work woke.
-    if (thread.pendingRequestCount > 0) return { type: "needs_input" } satisfies WaitOutcome;
+    if (thread !== undefined && thread.pendingRequestCount > 0) {
+      return { type: "needs_input" } satisfies WaitOutcome;
+    }
   }
 });
 
@@ -771,21 +776,27 @@ export const titleFromMessage = (message: string) => {
   return `${firstLine.slice(0, end).trimEnd()}…`;
 };
 
+/** No flag sends no strategy, so the server applies the project's new-thread default. */
 const launchWorkspaceStrategy = (input: {
   readonly worktree: Option.Option<string>;
   readonly branch: Option.Option<string>;
+  readonly local: boolean;
 }) =>
   Option.match(input.worktree, {
     onNone: () =>
       Option.isSome(input.branch)
         ? Effect.fail(new ThreadUsageError({ detail: "--branch needs --worktree <base-ref>." }))
-        : Effect.void,
+        : Effect.succeed(input.local ? { type: "root" as const } : undefined),
     onSome: (baseRef) =>
-      Effect.succeed({
-        type: "worktree" as const,
-        baseRef,
-        ...Option.match(input.branch, { onNone: () => ({}), onSome: (branch) => ({ branch }) }),
-      }),
+      input.local
+        ? Effect.fail(
+            new ThreadUsageError({ detail: "--local and --worktree choose different workspaces." }),
+          )
+        : Effect.succeed({
+            type: "worktree" as const,
+            baseRef,
+            ...Option.match(input.branch, { onNone: () => ({}), onSome: (branch) => ({ branch }) }),
+          }),
   });
 
 /**
@@ -940,9 +951,15 @@ const threadStartCommand = Command.make("start", {
   ),
   worktree: Flag.String("worktree").pipe(
     Flag.withDescription(
-      "Run in a new git worktree based on this branch, tag, or commit, instead of the project folder.",
+      "Run in a new git worktree based on this branch, tag, or commit. Without --worktree or --local, the project's new-thread setting decides: the project folder, or a new worktree from the default branch.",
     ),
     Flag.optional,
+  ),
+  local: Flag.Boolean("local").pipe(
+    Flag.withDescription(
+      "Run in the project folder, even when the project starts new threads in a worktree.",
+    ),
+    Flag.withDefault(false),
   ),
   branch: Flag.String("branch").pipe(
     Flag.withDescription("Branch name for the new worktree."),
@@ -1068,7 +1085,7 @@ const threadShowCommand = Command.make("show", {
                     : item.createdBy === "system"
                       ? "system"
                       : "user",
-                runId: item.runId,
+                runId: item.runId ?? null,
                 text,
               })),
             ),

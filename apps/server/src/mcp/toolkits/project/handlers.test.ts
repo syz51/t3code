@@ -50,6 +50,8 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
 
+const CALLER_THREAD_ID = ThreadId.make("thread:caller");
+
 const clientLaunchHarness = (input: {
   readonly runtimeModeCeiling: RuntimeMode;
   readonly defaultRuntimeMode?: RuntimeMode;
@@ -63,7 +65,10 @@ const clientLaunchHarness = (input: {
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
+  readonly defaultWorkspaceStrategy?: ThreadLaunch.ThreadLaunchService["Service"]["defaultWorkspaceStrategy"];
   readonly hostedAppUrl?: string;
+  /** The launch comes from an agent's thread in the project, not from an outside client. */
+  readonly fromThread?: true;
   /** The orchestrator refuses the new thread's mode, as under a managed ceiling. */
   readonly refusedByCeiling?: true;
 }) => {
@@ -106,22 +111,51 @@ const clientLaunchHarness = (input: {
             },
           }),
     }),
-    Layer.succeed(McpInvocationContext.McpInvocationContext, {
-      environmentId: EnvironmentId.make("environment"),
-      requestNamespace: "client:session-1",
-      thread: undefined,
-      client: {
-        sessionId: "session-1",
-        label: "Claude Code",
-        access: input.runtimeModeCeiling,
-        hostedAppUrl: input.hostedAppUrl,
-      },
-      issuedAt: 0,
-      capabilities: new Set(["orchestration" as const]),
-    }),
+    Layer.succeed(
+      McpInvocationContext.McpInvocationContext,
+      input.fromThread
+        ? {
+            environmentId: EnvironmentId.make("environment"),
+            requestNamespace: "thread:caller",
+            thread: {
+              threadId: CALLER_THREAD_ID,
+              providerSessionId: "caller-session",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              subagent: false,
+            },
+            client: undefined,
+            issuedAt: 0,
+            capabilities: new Set(["orchestration" as const]),
+          }
+        : {
+            environmentId: EnvironmentId.make("environment"),
+            requestNamespace: "client:session-1",
+            thread: undefined,
+            client: {
+              sessionId: "session-1",
+              label: "Claude Code",
+              access: input.runtimeModeCeiling,
+              hostedAppUrl: input.hostedAppUrl,
+            },
+            issuedAt: 0,
+            capabilities: new Set(["orchestration" as const]),
+          },
+    ),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       // A thread exists once a launch started it.
       getThreadShell: (threadId) => {
+        if (threadId === CALLER_THREAD_ID)
+          return Effect.succeed({
+            id: CALLER_THREAD_ID,
+            projectId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            activeRunId: "run:caller",
+            archivedAt: null,
+            deletedAt: null,
+          } as unknown as OrchestrationV2ThreadShell);
         const launch = input.launched.find((candidate) => candidate.threadId === threadId);
         return Effect.succeed(
           launch === undefined
@@ -137,6 +171,8 @@ const clientLaunchHarness = (input: {
     }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       checkWorktreeBase: input.checkWorktreeBase ?? (() => Effect.void),
+      defaultWorkspaceStrategy:
+        input.defaultWorkspaceStrategy ?? (() => Effect.succeed({ type: "root" })),
       launch: (launch) => {
         input.launched.push(launch);
         if (input.refusedByCeiling) {
@@ -699,6 +735,51 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
 
     expect((yield* launchFrom("main")).at(-1)?.result).toMatchObject({ projectId });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect("an agent's launch without a workspace strategy follows the project's default", () =>
+  Effect.gen(function* () {
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+    const projectDefault = { type: "worktree", baseRef: "origin/main", startFromOrigin: true };
+    const checked: Array<unknown> = [];
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "auto",
+      launched,
+      fromThread: true,
+      defaultWorkspaceStrategy: () => Effect.succeed({ ...projectDefault, type: "worktree" }),
+      checkWorktreeBase: ({ workspaceStrategy }) =>
+        Effect.sync(() => {
+          checked.push(workspaceStrategy);
+        }),
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const launch = (input: object) =>
+      toolkit
+        .handle("t3_thread_launch", { title: "Fix", projectId, ...input })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    yield* launch({});
+    yield* launch({ workspaceStrategy: { type: "root" } });
+    yield* launch({
+      delegatedFrom: { environmentId: "environment-far", threadId: "thread-far", title: "Far" },
+    });
+    // A retry sends the default again, as a caller's own strategy is, so an unfinished preparation keeps it.
+    yield* launch({ clientRequestId: "fix-default" });
+    yield* launch({ clientRequestId: "fix-default" });
+
+    expect(launched.map((entry) => entry.workspaceStrategy)).toEqual([
+      projectDefault,
+      { type: "root" },
+      { type: "root" },
+      projectDefault,
+      projectDefault,
+    ]);
+    expect(checked).toEqual([projectDefault, projectDefault]);
   }),
 );
 

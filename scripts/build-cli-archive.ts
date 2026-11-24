@@ -16,16 +16,14 @@ import { Command, Flag } from "effect/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { fromYaml } from "@t3tools/shared/schemaYaml";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import rootPackageJson from "../package.json" with { type: "json" };
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
 
 import {
+  createStageBunInstall,
   createStagePatchedDependencies,
-  createStageWorkspaceConfig,
   resolveFffNativeDependencies,
-  STAGE_INSTALL_ARGS,
 } from "./build-desktop-artifact.ts";
 import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
 import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-packages.ts";
@@ -38,26 +36,7 @@ const BuildArch = Schema.Literals(["arm64", "x64"]);
 type BuildPlatform = typeof BuildPlatform.Type;
 type BuildArch = typeof BuildArch.Type;
 
-const WorkspaceConfig = Schema.Struct({
-  catalog: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
-});
-const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
 const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
-const StageWorkspaceConfig = Schema.Struct({
-  supportedArchitectures: Schema.Struct({
-    os: Schema.Array(Schema.String),
-    cpu: Schema.Array(Schema.String),
-    libc: Schema.optional(Schema.Array(Schema.String)),
-  }),
-  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
-  patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  nodeLinker: Schema.optional(Schema.Literals(["hoisted"])),
-});
-const encodeStageWorkspaceConfig = Schema.encodeEffect(fromYaml(StageWorkspaceConfig));
 
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("..", import.meta.url))),
@@ -131,7 +110,7 @@ const requireInput = Effect.fn("requireInput")(function* (inputPath: string, hin
   }
 });
 
-/** Installed runtimes cannot rely on pnpm's store layout surviving archival. */
+/** Installed runtimes cannot rely on bun's store layout surviving archival. */
 const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (input: {
   readonly repoRoot: string;
   readonly stageDir: string;
@@ -141,10 +120,7 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const workspace = yield* decodeWorkspaceConfig(
-    yield* fs.readFileString(path.join(input.repoRoot, "pnpm-workspace.yaml")),
-  );
-  const catalog = workspace.catalog ?? {};
+  const catalog = rootPackageJson.workspaces.catalog;
   const serverDependencies = resolveCatalogDependencies(
     serverPackageJson.dependencies,
     catalog,
@@ -162,9 +138,17 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
     ...resolveFffNativeDependencies(input.platform, input.arch, fffNodeVersion),
   };
   const patchedDependencies = createStagePatchedDependencies(
-    workspace.patchedDependencies ?? {},
+    rootPackageJson.patchedDependencies,
     dependencies,
   );
+  const stageInstall = createStageBunInstall({
+    platform: input.platform,
+    arch: input.arch,
+    trustedDependencies: rootPackageJson.trustedDependencies,
+    patchedDependencies,
+    overrides: resolveCatalogDependencies(rootPackageJson.overrides, catalog, "apps/server"),
+    bunfigPath: path.join(input.repoRoot, "bunfig.toml"),
+  });
 
   yield* fs.writeFileString(
     path.join(input.stageDir, "package.json"),
@@ -174,26 +158,14 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
       private: true,
       packageManager: rootPackageJson.packageManager,
       dependencies,
+      ...stageInstall.packageJson,
     })}\n`,
-  );
-  yield* fs.writeFileString(
-    path.join(input.stageDir, "pnpm-workspace.yaml"),
-    yield* encodeStageWorkspaceConfig({
-      ...createStageWorkspaceConfig({
-        platform: input.platform,
-        arch: input.arch,
-        ...(workspace.allowBuilds ? { allowBuilds: workspace.allowBuilds } : {}),
-        patchedDependencies,
-        overrides: resolveCatalogDependencies(workspace.overrides ?? {}, catalog, "apps/server"),
-      }),
-      nodeLinker: "hoisted",
-    }),
   );
   if (Object.keys(patchedDependencies).length > 0) {
     yield* fs.copy(path.join(input.repoRoot, "patches"), path.join(input.stageDir, "patches"));
   }
 
-  const install = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const install = yield* resolveSpawnCommand("bun", stageInstall.args);
   yield* runCommand(
     ChildProcess.make(install.command, install.args, {
       cwd: input.stageDir,
@@ -201,7 +173,7 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
       stdout: "inherit",
       stderr: "inherit",
     }),
-    "vp install --prod (cli archive runtime externals)",
+    `bun ${stageInstall.args.join(" ")} (cli archive runtime externals)`,
   );
 
   const platformKey = cliArchivePlatformKey(input.platform, input.arch);
@@ -213,12 +185,8 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
   );
   for (const entry of [
     "package.json",
-    "pnpm-workspace.yaml",
-    "pnpm-lock.yaml",
+    "bun.lock",
     "patches",
-    "node_modules/.pnpm",
-    "node_modules/.modules.yaml",
-    "node_modules/.pnpm-workspace-state-v1.json",
     "node_modules/.bin",
     ...foreignPrebuilds.map((entry) => `node_modules/node-pty/prebuilds/${entry}`),
   ]) {
@@ -692,7 +660,7 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
       "tar (zip)",
     );
   } else {
-    // npm rejects Linux hardlink entries; macOS pnpm clones and bsdtar lacks this flag.
+    // npm rejects Linux hardlink entries; macOS bun clones and bsdtar lacks this flag.
     yield* runCommand(
       ChildProcess.make("tar", [
         ...(input.platform === "linux" ? ["--hard-dereference"] : []),

@@ -1994,6 +1994,65 @@ describe("external usage settings", () => {
       "Desktop · hub · claude-tg@example.com: The provider refused the hub request (HTTP 429).",
     ]);
   });
+
+  it("suppresses a native provider probe failure when another instance already shows the same account", () => {
+    const checkedAt = "2026-09-03T11:00:00.000Z";
+    const antigravity = ProviderDriverKind.make("antigravity");
+    const live = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravity"),
+      displayName: "Antigravity",
+      auth: { status: "authenticated", type: "oauth-personal", email: "user@example.com" },
+      usageLimits: { checkedAt, windows: [{ ...window, id: "gemini-5h", usedPercent: 4 }] },
+    });
+    const expiredSameAccount = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravityTextGen"),
+      displayName: "Antigravity (Titles)",
+      auth: { status: "unknown", type: "oauth-personal", email: "user@example.com" },
+      usageLimits: {
+        checkedAt,
+        windows: [],
+        unavailable: {
+          reason: "probeFailed",
+          message: "Antigravity's saved sign-in has expired.",
+        },
+      },
+    });
+    const expiredOtherAccount = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravityWork"),
+      displayName: "Antigravity (Work)",
+      auth: { status: "unknown", type: "oauth-personal", email: "work@example.com" },
+      usageLimits: {
+        checkedAt,
+        windows: [],
+        unavailable: {
+          reason: "probeFailed",
+          message: "Antigravity's saved sign-in has expired.",
+        },
+      },
+    });
+    const presentations = new Map([
+      [
+        EnvironmentId.make("air"),
+        {
+          entry: { target: { label: "Air" } },
+          serverConfig: { providers: [live, expiredSameAccount] },
+        },
+      ],
+      [
+        EnvironmentId.make("pro"),
+        {
+          entry: { target: { label: "Pro" } },
+          serverConfig: { providers: [expiredSameAccount, expiredOtherAccount] },
+        },
+      ],
+    ]);
+    expect(collectLimitNotices(presentations)).toEqual([
+      "Pro · Antigravity (Work): Antigravity's saved sign-in has expired.",
+    ]);
+  });
 });
 
 describe("ChatGPT sharing presentation", () => {

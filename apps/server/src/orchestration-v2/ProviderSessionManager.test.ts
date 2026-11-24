@@ -484,6 +484,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
       readonly initialProviderItemIdentityVersion?: 2;
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+    readonly hasUndeliveredWake?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
@@ -599,6 +600,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
+          ...(options.hasUndeliveredWake === undefined
+            ? {}
+            : { hasUndeliveredWake: options.hasUndeliveredWake }),
           ...(options.hasPendingBackgroundWorkForThread === undefined
             ? {}
             : {
@@ -653,6 +657,7 @@ function layerTest(input: {
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs?: number;
   readonly maxIdlePinMs?: number;
+  readonly maxIdleSessions?: number;
   readonly failEventStream?: boolean;
   readonly normalizeThreadLoadModelSelection?: (selection: ModelSelection) => ModelSelection;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
@@ -674,6 +679,7 @@ function layerTest(input: {
     readonly paused: Deferred.Deferred<void>;
   };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+  readonly hasUndeliveredWake?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
@@ -720,6 +726,9 @@ function layerTest(input: {
       ...(input.hasPendingBackgroundWork === undefined
         ? {}
         : { hasPendingBackgroundWork: input.hasPendingBackgroundWork }),
+      ...(input.hasUndeliveredWake === undefined
+        ? {}
+        : { hasUndeliveredWake: input.hasUndeliveredWake }),
       ...(input.hasPendingBackgroundWorkForThread === undefined
         ? {}
         : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
@@ -772,6 +781,8 @@ function layerTest(input: {
     McpProviderSessions.layer,
     ProviderSessionManager.layerWithOptions({
       ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
+      // The default follows this host's memory, which tests must not depend on.
+      maxIdleSessions: input.maxIdleSessions ?? Number.POSITIVE_INFINITY,
       ...(input.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: input.maxIdlePinMs }),
     }).pipe(
       Layer.provide(
@@ -1199,6 +1210,83 @@ it.effect("ProviderSessionManagerV2 closes every live session for a provider ins
       ),
     );
   }),
+);
+
+it.effect.each([undefined, "hasPendingBackgroundWork", "hasUndeliveredWake"] as const)(
+  "ProviderSessionManagerV2 releases the least recently active idle sessions over the budget (held by: %s)",
+  (holdingProbe) =>
+    Effect.gen(function* () {
+      const hasPendingBackgroundWork = holdingProbe !== undefined;
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadIds = ["a", "b", "c"].map((name) =>
+          ThreadId.make(`thread-provider-session-manager-idle-budget-${name}`),
+        );
+        yield* eventSink.write({
+          events: yield* Effect.forEach(threadIds, (threadId) =>
+            makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          ),
+        });
+        const open = Effect.fnUntraced(function* (threadId: ThreadId) {
+          const providerSessionId = yield* idAllocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+          });
+          yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+          return providerSessionId;
+        });
+        const stopped = (threadId: ThreadId) =>
+          hasPendingBackgroundWork
+            ? Effect.void
+            : eventSink.stream({ threadId, eventType: "provider-session.updated" }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "provider-session.updated" &&
+                    stored.event.payload.status === "stopped",
+                ),
+                Stream.runHead,
+              );
+        const first = yield* open(threadIds[0]!);
+        yield* TestClock.adjust("1 second");
+        const second = yield* open(threadIds[1]!);
+        // The grace protects a session between its open and its first turn.
+        yield* TestClock.adjust("30 seconds");
+        assert.deepEqual(yield* Effect.forEach([first, second], (id) => manager.isLive(id)), [
+          true,
+          true,
+        ]);
+        // No open or turn end follows; the trim runs again once the grace is over.
+        yield* TestClock.adjust("2 minutes");
+        yield* stopped(threadIds[0]!);
+        assert.deepEqual(yield* Effect.forEach([first, second], (id) => manager.isLive(id)), [
+          hasPendingBackgroundWork,
+          true,
+        ]);
+        const third = yield* open(threadIds[2]!);
+        yield* stopped(threadIds[1]!);
+        yield* TestClock.adjust("1 millis");
+        assert.deepEqual(
+          yield* Effect.forEach([first, second, third], (id) => manager.isLive(id)),
+          hasPendingBackgroundWork ? [true, true, true] : [false, false, true],
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, hasPendingBackgroundWork ? 0 : 2);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60 * 60_000,
+            maxIdleSessions: 1,
+            ...(holdingProbe === undefined ? {} : { [holdingProbe]: Effect.succeed(true) }),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 opens provider sessions inside the installation gate", () =>

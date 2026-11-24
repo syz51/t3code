@@ -53,9 +53,10 @@ const isAcpRequestError = Schema.is(AcpErrors.AcpRequestError);
 const isAcpTransportError = Schema.is(AcpErrors.AcpTransportError);
 
 // Python splits BROWSER on path separators before parsing quotes. Exit 0 on EPIPE to prevent browser fallback after cancellation.
+// Keep this source free of colons, semicolons, and double quotes (PowerShell 5.1 strips unescaped double quotes for native commands).
 const browserHelperSource =
-  `process.stderr.on("error",()=>process.exit(0)).write(` +
-  `"${ANTIGRAVITY_AUTH_BROWSER_MARKER}"+JSON.stringify(process.argv[1])+"\\n",` +
+  `process.stderr.on('error',()=>process.exit(0)).write(` +
+  `'${ANTIGRAVITY_AUTH_BROWSER_MARKER}'+JSON.stringify(process.argv[1]??process.env.T3_ANTIGRAVITY_AUTH_URL)+'\\n',` +
   `()=>process.exit(0))`;
 const browserPreflightUrl = "https://example.invalid/t3-antigravity-browser-preflight";
 
@@ -76,7 +77,9 @@ const removedEnvironmentKeys = new Set([
   "AGY_CLI_DISABLE_AUTO_UPDATE",
   "BROWSER",
   "PYTHONUNBUFFERED",
+  // Inherited ELECTRON_RUN_AS_NODE would make Electron apps launched by agent shells exit as Node.
   "ELECTRON_RUN_AS_NODE",
+  "T3_ANTIGRAVITY_AUTH_URL",
   // An inherited pipe whose owner exited makes Electron-as-Node print Crashpad errors to stderr.
   "CHROME_CRASHPAD_PIPE_NAME",
 ]);
@@ -178,8 +181,58 @@ export function isAntigravitySignInRequiredError(error: unknown): boolean {
 
 export interface AntigravityInstanceDirectories {
   readonly profile: string;
-  /** Keep beside the profile: 120-character archive members under its longer name would exceed Windows' 260-character limit. */
+  /** Short, dot-free temp root exported as TMPDIR/TEMP/TMP so unpack globs and POSIX SUN_LEN stay healthy. */
   readonly runtimeTemp: string;
+  /** Private dir inside stateDir for OAuth-bearing isolated text-generation profiles (also sweeps legacy runtimeTemp). */
+  readonly isolatedProfiles: string;
+}
+
+function hasDotDirectorySegment(directory: string): boolean {
+  return directory.split(/[\\/]+/).some((segment) => segment.startsWith("."));
+}
+
+function lookupCaseInsensitiveEnv(env: NodeJS.ProcessEnv, targetKey: string): string | undefined {
+  const upper = targetKey.toUpperCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === upper && value && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function isWindowsDrivePath(value: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+function resolveWindowsRuntimeTempParent(
+  path: Path.Path,
+  stateDir: string,
+  env: NodeJS.ProcessEnv,
+): string {
+  const localAppData = lookupCaseInsensitiveEnv(env, "LOCALAPPDATA");
+  const candidates: Array<string> = [];
+  if (localAppData && isWindowsDrivePath(localAppData)) {
+    candidates.push(path.join(localAppData, "Temp"));
+  }
+  for (const key of ["TEMP", "TMP"] as const) {
+    const value = lookupCaseInsensitiveEnv(env, key);
+    if (value && isWindowsDrivePath(value)) {
+      candidates.push(value);
+    }
+  }
+  const userProfileMatch = /^([a-zA-Z]:\\Users\\[^\\/]+)(?:[\\/]|$)/i.exec(stateDir);
+  if (userProfileMatch?.[1]) {
+    candidates.push(path.join(userProfileMatch[1], "AppData", "Local", "Temp"));
+  }
+  for (const candidate of candidates) {
+    const normalized = path.normalize(candidate);
+    if (!hasDotDirectorySegment(normalized)) {
+      return path.join(normalized, "t3a");
+    }
+  }
+  const root = path.parse(stateDir).root || "C:\\";
+  return path.join(root, "Temp", "t3a");
 }
 
 /** Hashes the instance ID so case-only differences stay separate on case-insensitive filesystems. */
@@ -189,14 +242,67 @@ export const resolveAntigravityInstanceDirectories = Effect.fn(
   const digest = yield* Digest.Digest;
   const path = yield* Path.Path;
   const key = Hex.encode(yield* digest.digest(Digest.sha256, new TextEncoder().encode(instanceId)));
+  const tempKey = Hex.encode(
+    yield* digest.digest(
+      Digest.sha256,
+      new TextEncoder().encode(`${path.normalize(stateDir)}\0${instanceId}`),
+    ),
+  ).slice(0, 8);
+  const isolatedProfiles = path.join(stateDir, "antigravity-tmp", key.slice(0, 12));
+  if (path.sep === "\\") {
+    const env = yield* HostProcess.Environment;
+    const parent = resolveWindowsRuntimeTempParent(path, stateDir, env);
+    return {
+      profile: path.join(stateDir, "providers", "antigravity", key),
+      runtimeTemp: path.join(parent, tempKey),
+      isolatedProfiles,
+    } satisfies AntigravityInstanceDirectories;
+  }
+  const uid = yield* HostProcess.UserId;
+  const posixParent = uid === undefined ? "/tmp/t3a" : `/tmp/t3-${uid}`;
   return {
     profile: path.join(stateDir, "providers", "antigravity", key),
-    runtimeTemp: path.join(stateDir, "antigravity-tmp", key.slice(0, 12)),
+    runtimeTemp: path.join(posixParent, tempKey),
+    isolatedProfiles,
   } satisfies AntigravityInstanceDirectories;
 });
 
 function quoteBrowserArgument(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function quotePowerShellLiteral(value: string): string {
+  // PowerShell also recognises typographic apostrophes as single-quote delimiters.
+  return `'${value.replace(/['\u2018-\u201b]/g, "$&$&")}'`;
+}
+
+function resolveWindowsRoot(baseEnv: NodeJS.ProcessEnv): string {
+  let windir: string | undefined;
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (!value || value.trim().length === 0) continue;
+    const upper = key.toUpperCase();
+    if (upper === "SYSTEMROOT") return value.replace(/[\\/]+$/, "");
+    if (upper === "WINDIR") windir = value.replace(/[\\/]+$/, "");
+  }
+  return windir ?? String.raw`C:\Windows`;
+}
+
+function resolveWindowsPowerShellExecutable(baseEnv: NodeJS.ProcessEnv): string {
+  return `${resolveWindowsRoot(baseEnv)}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+}
+
+function renderWindowsBrowserHelperScript(executablePath: string): string {
+  return (
+    "\uFEFF" +
+    [
+      "param([string]$Url)",
+      "$env:ELECTRON_RUN_AS_NODE = '1'",
+      "$env:T3_ANTIGRAVITY_AUTH_URL = $Url",
+      `& ${quotePowerShellLiteral(executablePath)} '-e' ${quotePowerShellLiteral(browserHelperSource)}`,
+      "exit $LASTEXITCODE",
+      "",
+    ].join("\r\n")
+  );
 }
 
 function antigravityEnvironment(
@@ -237,7 +343,6 @@ function antigravityEnvironment(
     AGY_CLI_DISABLE_AUTO_UPDATE: "1",
     BROWSER: profile.browserCommand,
     PYTHONUNBUFFERED: "1",
-    ELECTRON_RUN_AS_NODE: "1",
     ...(profile.platform === "win32"
       ? { TEMP: tempDirectory, TMP: tempDirectory }
       : { TMPDIR: tempDirectory }),
@@ -390,6 +495,51 @@ const copyAntigravityUserConfigFiles = Effect.fn("copyAntigravityUserConfigFiles
   },
 );
 
+const ensurePrivatePosixDirectory = Effect.fn("ensurePrivatePosixDirectory")(function* (
+  directory: string,
+  expectedUid: number | undefined,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs
+    .makeDirectory(directory, { recursive: true, mode: 0o700 })
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory could not be created."),
+      ),
+    );
+  const isSymlink = yield* fs.readLink(directory).pipe(
+    Effect.as(true),
+    Effect.orElseSucceed(() => false),
+  );
+  const info = yield* fs
+    .stat(directory)
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory could not be verified."),
+      ),
+    );
+  if (
+    isSymlink ||
+    info.type !== "Directory" ||
+    (expectedUid !== undefined && Option.isSome(info.uid) && info.uid.value !== expectedUid)
+  ) {
+    return yield* authSupportError("The Antigravity runtime temp directory is not private.");
+  }
+  yield* fs
+    .chmod(directory, 0o700)
+    .pipe(
+      Effect.mapError(() =>
+        authSupportError("The Antigravity profile directory permissions could not be set."),
+      ),
+    );
+});
+
+const antigravityIsolatedAuthFiles = [
+  "antigravity-oauth-token",
+  "acp_token.json",
+  "installation_id",
+] as const;
+
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
   readonly baseEnv?: NodeJS.ProcessEnv;
@@ -398,19 +548,19 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly auth?: AntigravityAuthConfig;
   readonly userHome?: string;
   readonly tempDirectory?: string;
+  /** Copy only credentials from this profile and skip user config/hooks/MCP links. */
+  readonly isolatedSourceProfileDirectory?: string;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const platform = input.platform ?? (yield* HostProcess.Platform);
+  const hostPlatform = yield* HostProcess.Platform;
+  const platform = input.platform ?? hostPlatform;
+  const baseEnv = input.baseEnv ?? process.env;
   const userHome =
     input.userHome ??
-    resolveAntigravityUserHome(
-      platform,
-      input.baseEnv ?? process.env,
-      yield* HostProcess.HomeDirectory,
-    );
+    resolveAntigravityUserHome(platform, baseEnv, yield* HostProcess.HomeDirectory);
   const runtimeExecutablePath =
     input.runtimeExecutablePath ??
     (yield* resolveNodeExecutable("Antigravity sign-in", input.baseEnv).pipe(
@@ -422,31 +572,63 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
           }),
       ),
     ));
+  const geminiHome = path.resolve(input.profileDirectory);
+  const acpDirectory = path.join(geminiHome, "antigravity-acp");
+  const tempDirectory = input.tempDirectory ?? path.join(acpDirectory, "tmp");
+  const browserHelperScriptPath = path.join(acpDirectory, "browser-helper.ps1");
   const helperExecutable =
     platform === "win32" ? runtimeExecutablePath.replaceAll("\\", "/") : runtimeExecutablePath;
-  const browserArguments = [helperExecutable, "-e", browserHelperSource, "--", "%s"];
+  const windowsPowerShellExecutable = resolveWindowsPowerShellExecutable(baseEnv).replaceAll(
+    "\\",
+    "/",
+  );
+  const browserArguments =
+    platform === "win32"
+      ? [
+          windowsPowerShellExecutable,
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          browserHelperScriptPath.replaceAll("\\", "/"),
+          "%s",
+        ]
+      : [
+          "/usr/bin/env",
+          "ELECTRON_RUN_AS_NODE=1",
+          helperExecutable,
+          "-e",
+          browserHelperSource,
+          "--",
+          "%s",
+        ];
   const browserCommand = browserArguments.map(quoteBrowserArgument).join(" ");
+  const browserDelimiter = platform === "win32" ? ";" : ":";
   if (
-    browserCommand.includes(platform === "win32" ? ";" : ":") ||
+    browserCommand.includes(browserDelimiter) ||
+    helperExecutable.includes(browserDelimiter) ||
+    (platform !== "win32" && helperExecutable.includes("=")) ||
     helperExecutable.includes("\r") ||
     helperExecutable.includes("\n") ||
     helperExecutable.includes("\0") ||
-    helperExecutable.includes("%s")
+    helperExecutable.includes("%s") ||
+    browserCommand.includes("\r") ||
+    browserCommand.includes("\n") ||
+    browserCommand.includes("\0") ||
+    (platform === "win32" && browserHelperScriptPath.includes("%s"))
   ) {
     return yield* authSupportError(
       "The T3 runtime path cannot be used to suppress Antigravity browser launches.",
     );
   }
 
-  const geminiHome = path.resolve(input.profileDirectory);
-  const acpDirectory = path.join(geminiHome, "antigravity-acp");
-  const tempDirectory = input.tempDirectory ?? path.join(acpDirectory, "tmp");
   let caBundlePath: string | undefined;
   if (platform === "linux") {
     // Bundled Python may look for certificates at paths absent on this distribution.
     // Relative paths would resolve differently when the agent runs in the project directory.
     for (const candidate of [
-      (input.baseEnv ?? process.env).NIX_SSL_CERT_FILE,
+      baseEnv.NIX_SSL_CERT_FILE,
       "/etc/ssl/certs/ca-bundle.crt",
       "/etc/ssl/certs/ca-certificates.crt",
       "/etc/pki/tls/certs/ca-bundle.crt",
@@ -471,15 +653,68 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     browserCommand,
     ...(caBundlePath === undefined ? {} : { caBundlePath }),
   };
-  const environment = antigravityEnvironment(profile, input.baseEnv ?? process.env, auth);
+  const environment = antigravityEnvironment(profile, baseEnv, auth);
+  const windowsBrowserHelperScript =
+    platform === "win32" ? renderWindowsBrowserHelperScript(runtimeExecutablePath) : undefined;
   yield* Effect.gen(function* () {
-    const child = yield* spawner.spawn(
-      ChildProcess.make(helperExecutable, ["-e", browserHelperSource, "--", browserPreflightUrl], {
-        env: environment,
-        extendEnv: false,
-        shell: false,
-      }),
-    );
+    const preflightCommand =
+      platform === "win32" && hostPlatform === "win32"
+        ? yield* Effect.gen(function* () {
+            const preflightDir = yield* fs.makeTempDirectoryScoped({
+              prefix: "t3-antigravity-preflight-",
+            });
+            const preflightScriptPath = path.join(preflightDir, "browser-helper.ps1");
+            yield* fs.writeFileString(preflightScriptPath, windowsBrowserHelperScript!);
+            return ChildProcess.make(
+              windowsPowerShellExecutable,
+              [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                preflightScriptPath.replaceAll("\\", "/"),
+                browserPreflightUrl,
+              ],
+              {
+                env: {
+                  SystemRoot: resolveWindowsRoot(baseEnv),
+                  ...environment,
+                  TEMP: preflightDir,
+                  TMP: preflightDir,
+                },
+                extendEnv: false,
+                shell: false,
+              },
+            );
+          })
+        : platform === "win32"
+          ? ChildProcess.make(
+              helperExecutable,
+              ["-e", browserHelperSource, "--", browserPreflightUrl],
+              {
+                env: { ...environment, ELECTRON_RUN_AS_NODE: "1" },
+                extendEnv: false,
+                shell: false,
+              },
+            )
+          : ChildProcess.make(
+              "/usr/bin/env",
+              [
+                "ELECTRON_RUN_AS_NODE=1",
+                helperExecutable,
+                "-e",
+                browserHelperSource,
+                "--",
+                browserPreflightUrl,
+              ],
+              {
+                env: environment,
+                extendEnv: false,
+                shell: false,
+              },
+            );
+    const child = yield* spawner.spawn(preflightCommand);
     const [stdout, stderr, exitCode] = yield* Effect.all(
       [
         collectUint8StreamText({ stream: child.stdout, maxBytes: 4_096 }),
@@ -511,7 +746,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     ),
   );
 
-  for (const directory of [geminiHome, acpDirectory, tempDirectory]) {
+  for (const directory of [geminiHome, acpDirectory]) {
     yield* fs
       .makeDirectory(directory, { recursive: true, mode: 0o700 })
       .pipe(
@@ -529,6 +764,23 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         );
     }
   }
+  if (platform === "win32") {
+    yield* fs
+      .makeDirectory(tempDirectory, { recursive: true, mode: 0o700 })
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity profile directory could not be created."),
+        ),
+      );
+  } else {
+    const currentUid = yield* HostProcess.UserId;
+    const tempParent = path.dirname(tempDirectory);
+    const tempGrandparent = path.dirname(tempParent);
+    if (tempGrandparent === "/tmp" || tempGrandparent === "/private/tmp") {
+      yield* ensurePrivatePosixDirectory(tempParent, currentUid);
+    }
+    yield* ensurePrivatePosixDirectory(tempDirectory, currentUid);
+  }
   yield* fs
     .writeFileString(path.join(acpDirectory, "settings.json"), antigravityProfileSettings(auth))
     .pipe(
@@ -536,6 +788,43 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         authSupportError("The Antigravity profile settings could not be written."),
       ),
     );
+  if (windowsBrowserHelperScript !== undefined) {
+    yield* fs
+      .writeFileString(browserHelperScriptPath, windowsBrowserHelperScript)
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity browser helper could not be written."),
+        ),
+      );
+  }
+  if (input.isolatedSourceProfileDirectory !== undefined) {
+    const sourceAcpDirectory = path.join(
+      path.resolve(input.isolatedSourceProfileDirectory),
+      "antigravity-acp",
+    );
+    for (const fileName of antigravityIsolatedAuthFiles) {
+      const sourcePath = path.join(sourceAcpDirectory, fileName);
+      const data = yield* fs.readFile(sourcePath).pipe(
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+        Effect.mapError(() =>
+          authSupportError("The Antigravity helper profile credentials could not be read."),
+        ),
+      );
+      if (data === undefined) continue;
+      const targetPath = path.join(acpDirectory, fileName);
+      yield* fs
+        .writeFile(targetPath, data)
+        .pipe(
+          Effect.mapError(() =>
+            authSupportError("The Antigravity helper profile credentials could not be copied."),
+          ),
+        );
+      if (platform !== "win32") {
+        yield* fs.chmod(targetPath, 0o600).pipe(Effect.ignore);
+      }
+    }
+    return profile;
+  }
   yield* linkAntigravityUserConfig({ profileDirectory: geminiHome, userHome, platform });
   if (platform === "win32") {
     yield* copyAntigravityUserConfigFiles({ profileDirectory: geminiHome, userHome });
@@ -550,6 +839,7 @@ export function buildAntigravityAcpSpawnInput(input: {
   readonly baseEnv?: NodeJS.ProcessEnv;
   readonly auth?: AntigravityAuthConfig;
   readonly runtimeTempDirectory?: string;
+  readonly skipPermissions?: boolean;
 }): AcpSessionRuntime.AcpSpawnInput {
   return {
     command: input.installation.executablePath,
@@ -560,6 +850,7 @@ export function buildAntigravityAcpSpawnInput(input: {
       "--app-data-dir",
       // The CLI joins this beneath gemini-dir, including when the value is absolute.
       "antigravity-acp",
+      ...(input.skipPermissions === true ? ["--dangerously-skip-permissions"] : []),
     ],
     cwd: input.cwd,
     env: antigravityEnvironment(

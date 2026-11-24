@@ -150,6 +150,16 @@ describe("isAutoSettlementCandidate", () => {
         NOW_MS,
       ),
     ).toBe(true);
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({
+          pendingBackgroundTasks: [
+            { taskId: "deploy", kind: "command", description: "deploy", awaited: true },
+          ],
+        }),
+        NOW_MS,
+      ),
+    ).toBe(false);
     // A pull request watch whose checks finished holds nothing, yet still keeps the thread.
     expect(
       ThreadSettlementService.isAutoSettlementCandidate(
@@ -158,6 +168,12 @@ describe("isAutoSettlementCandidate", () => {
             { taskId: "pull-request-watch:github.com/acme/app#1", kind: "monitor" },
           ],
         }),
+        NOW_MS,
+      ),
+    ).toBe(false);
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({ activityRunStatus: "running" }),
         NOW_MS,
       ),
     ).toBe(false);
@@ -461,6 +477,36 @@ describe("resolveAutoSettlementAt", () => {
         },
       }),
     ).toEqual(at(-45 * 60 * 1_000));
+    // A watch still on a finished pull request owes the thread its merge or close wake.
+    const startedAt = DateTime.formatIso(at(-90 * 60 * 1_000));
+    const finished = link(2, at(-90 * 60 * 1_000), at(-40 * 60 * 1_000));
+    for (const state of ["merged", "closed"] as const) {
+      expect(
+        ThreadSettlementService.resolveAutoSettlementAt({
+          ...input,
+          thread: {
+            ...input.thread,
+            pullRequests: [
+              {
+                ...finished,
+                snapshot: { ...finished.snapshot, state, closedAt: finished.snapshot.mergedAt },
+                watch: {
+                  startedAt,
+                  headSha: "abc1234def",
+                  failedChecks: [],
+                  passed: true,
+                  passedChecks: ["test"],
+                  remarksThrough: startedAt,
+                  remarkIds: [],
+                  conflicting: false,
+                  wakes: 0,
+                },
+              },
+            ],
+          },
+        }),
+      ).toBeNull();
+    }
   });
 });
 

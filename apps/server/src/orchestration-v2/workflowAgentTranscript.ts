@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import { OrchestrationWorkflowFileError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
@@ -49,6 +50,34 @@ function parseWorkflowAgentTranscriptLines(contents: string): ReadonlyArray<unkn
     return [entry];
   });
 }
+
+/**
+ * The directories that hold a transcript of this subagent. No provider event names the Claude
+ * project directory of a session, so every project is checked; only a hit is worth a read.
+ */
+export const findSubagentTranscriptDirs = Effect.fn("orchestration.findSubagentTranscriptDirs")(
+  function* (input: {
+    readonly projectsDir: string;
+    readonly nativeThreadId: string;
+    readonly agentId: string;
+  }) {
+    if (!AGENT_ID_PATTERN.test(input.agentId)) return [];
+    const fileSystem = yield* FileSystem.FileSystem;
+    const projects = yield* fileSystem
+      .readDirectory(input.projectsDir)
+      .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+    return yield* Effect.filter(
+      projects.map((project) =>
+        NodePath.join(input.projectsDir, project, input.nativeThreadId, "subagents"),
+      ),
+      (transcriptDir) =>
+        fileSystem
+          .exists(NodePath.join(transcriptDir, `agent-${input.agentId}.jsonl`))
+          .pipe(Effect.orElseSucceed(() => false)),
+      { concurrency: 32 },
+    );
+  },
+);
 
 /** Reads the complete lines written since `cursor`, and the cursor after them. */
 export const readWorkflowAgentTranscript = Effect.fn("orchestration.readWorkflowAgentTranscript")(

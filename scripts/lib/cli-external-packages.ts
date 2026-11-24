@@ -78,7 +78,7 @@ export function findInlinedExternalPackages(source: string): {
     const regionPath = region[1] ?? "";
     for (const candidate of regionPath.matchAll(packagePattern)) {
       const name = candidate[1];
-      if (name === undefined || name === ".pnpm") continue;
+      if (name === undefined || name === ".pnpm" || name === ".bun") continue;
       inlinedPackages.add(name);
       if (isExternalCliDependency(name)) inlined.add(name);
     }

@@ -1,6 +1,7 @@
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
 import type { T3McpToolSummaryAction } from "@t3tools/shared/t3McpToolPresentation";
+import { threadIdOfToolInput } from "@t3tools/shared/threadLinks";
 
 export interface T3ToolSummaryCall {
   readonly input: unknown;
@@ -118,12 +119,14 @@ export function summarizeT3ToolCalls(
   const projectIds = selected.map(
     (call) => id(call.output?.id) ?? id(call.output?.projectId) ?? id(call.input?.projectId),
   );
-  const threadIds = selected.map(
-    (call) =>
+  const threadIds = selected.map((call) => {
+    const named = id(call.input?.threadId);
+    return (
       id(call.output?.threadId) ??
       id(asRecord(call.output?.thread)?.threadId) ??
-      id(call.input?.threadId),
-  );
+      (named === undefined ? undefined : threadIdOfToolInput(named))
+    );
+  });
   let label: string;
   switch (action) {
     case "delegate": {

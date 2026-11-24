@@ -264,6 +264,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
             : Duration.zero,
       },
     );
+    const resetCredits = yield* ClaudeResetCredits.makeClaudeResetCreditsReader(configDir).pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+    const invalidateUsageCaches = Effect.andThen(
+      Cache.invalidateAll(capabilitiesProbeCache),
+      resetCredits.invalidate,
+    );
     const capabilitiesCacheKey = yield* makeClaudeCapabilitiesCacheKey(
       effectiveConfig,
       stateDir,
@@ -284,12 +293,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
               stateDir,
               catalog,
               scopedLimitNames,
-              (version) =>
-                ClaudeResetCredits.readClaudeResetCredits(configDir, version).pipe(
-                  Effect.provideService(HttpClient.HttpClient, httpClient),
-                  Effect.provideService(FileSystem.FileSystem, fileSystem),
-                  Effect.provideService(Path.Path, path),
-                ),
+              resetCredits.read,
             ),
           ),
           Effect.tap((provider) =>
@@ -319,7 +323,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.map(stampIdentity),
         ),
       checkProvider,
-      invalidateUsageCache: Cache.invalidateAll(capabilitiesProbeCache),
+      invalidateUsageCache: invalidateUsageCaches,
       enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
         resolveMaintenance().pipe(
           Effect.flatMap((maintenanceCapabilities) =>
@@ -399,9 +403,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         ResetCreditCoordinator.refreshAfterRedemption({
           outcome,
           getSnapshot: snapshot.getSnapshot,
-          refresh: Cache.invalidateAll(capabilitiesProbeCache).pipe(
-            Effect.andThen(snapshot.refresh),
-          ),
+          refresh: invalidateUsageCaches.pipe(Effect.andThen(snapshot.refresh)),
         }).pipe(
           Effect.filterOrFail(
             (confirmed) => confirmed,

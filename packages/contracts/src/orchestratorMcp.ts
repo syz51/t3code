@@ -179,7 +179,17 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   isolation: Schema.optional(
     Schema.Literals(["shared", "worktree"]).annotate({
       description:
-        "'shared' (default): parent checkout. 'worktree': new prepared checkout from the parent commit, for a separate checkout or PR per child. Uncommitted edits stay out.",
+        "'shared' (default): parent checkout. 'worktree': new checkout at your commit or `baseRef`. Uncommitted edits stay out.",
+    }),
+  ),
+  baseRef: Schema.optional(
+    TrimmedNonEmptyString.annotate({
+      description: "Branch, tag or commit.",
+    }),
+  ),
+  startFromOrigin: Schema.optional(
+    Schema.Boolean.annotate({
+      description: "Start from the fetched remote `baseRef`, or the default branch.",
     }),
   ),
   mode: Schema.optional(
@@ -231,6 +241,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
   interruptReason: Schema.optional(Schema.String),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
+  retryAt: Schema.optional(IsoDateTime).annotate({
+    description:
+      "While `status` is `waiting`: when T3 Code tries the failed run again, such as after a provider rate limit.",
+  }),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
   latestTerminalStatus: Schema.NullOr(OrchestratorMcpTerminalDelegatedTaskStatus),
@@ -244,7 +258,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:
-      "A question blocks the child and ends a wait. Answer via `t3_pending_request` on `childThreadId`, or the user does.",
+      "A question blocks the child and ends a wait. Answer via `t3_pending_request` with `link` as `threadId`, or the user does.",
   }),
   pendingApproval: Schema.NullOr(
     Schema.Struct({ requestId: RuntimeRequestId, kind: ProviderRequestKind, runId: RunId }),
@@ -257,6 +271,36 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   next: Schema.optional(OrchestratorMcpRunningTaskNext),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
+
+/**
+ * What the tools send. The MCP transport leaves out null and false fields and
+ * the ids no tool takes as input (`compactResults.ts`); a linked environment
+ * still gets every field, which its older version may require.
+ */
+export const OrchestratorMcpDelegateTaskToolResult = OrchestratorMcpDelegateTaskResult.mapFields(
+  (fields) => ({
+    ...fields,
+    childThreadId: Schema.optional(fields.childThreadId),
+    childRunId: Schema.optional(fields.childRunId),
+    childNodeId: Schema.optional(fields.childNodeId),
+    hasPendingChildRuns: Schema.optional(fields.hasPendingChildRuns),
+    latestTerminalRunId: Schema.optional(fields.latestTerminalRunId),
+    latestTerminalStatus: Schema.optional(fields.latestTerminalStatus),
+    latestTerminalSummary: Schema.optional(fields.latestTerminalSummary),
+    latestTerminalResultContextTransferId: Schema.optional(
+      fields.latestTerminalResultContextTransferId,
+    ),
+    providerInstanceId: Schema.optional(fields.providerInstanceId),
+    model: Schema.optional(fields.model),
+    summary: Schema.optional(fields.summary),
+    resultContextTransferId: Schema.optional(fields.resultContextTransferId),
+    hasPendingQuestion: Schema.optional(fields.hasPendingQuestion),
+    pendingApproval: Schema.optional(fields.pendingApproval),
+    waitTimedOut: Schema.optional(fields.waitTimedOut),
+  }),
+);
+export type OrchestratorMcpDelegateTaskToolResult =
+  typeof OrchestratorMcpDelegateTaskToolResult.Type;
 
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,
@@ -457,6 +501,9 @@ export const OrchestratorMcpThreadReadInput = Schema.Struct({
   maxCharsPerItem: Schema.optional(clampedPositiveInt(20_000)).annotate({
     description: "Max 20000.",
   }),
+  include: Schema.optional(Schema.Array(Schema.Literals(["thread", "runs"]))).annotate({
+    description: "Adds the `thread` record, or `recentRuns` and each item's `runId`.",
+  }),
 });
 export type OrchestratorMcpThreadReadInput = typeof OrchestratorMcpThreadReadInput.Type;
 
@@ -551,6 +598,36 @@ export const OrchestratorMcpThreadReadResult = Schema.Struct({
   earlierPosition: Schema.optional(Schema.NullOr(NonNegativeInt)),
 });
 export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadResult.Type;
+
+export const OrchestratorMcpThreadReadToolItem = OrchestratorMcpThreadTimelineItem.mapFields(
+  (fields) => ({
+    ...fields,
+    visibility: Schema.optional(fields.visibility),
+    sourceThreadId: Schema.optional(fields.sourceThreadId),
+    itemId: Schema.optional(fields.itemId),
+    runId: Schema.optional(fields.runId),
+    messageId: Schema.optional(fields.messageId),
+    createdBy: Schema.optional(fields.createdBy),
+    creationSource: Schema.optional(fields.creationSource),
+    title: Schema.optional(fields.title),
+    text: Schema.optional(fields.text),
+    textTruncated: Schema.optional(fields.textTruncated),
+  }),
+);
+export type OrchestratorMcpThreadReadToolItem = typeof OrchestratorMcpThreadReadToolItem.Type;
+
+/** As `OrchestratorMcpDelegateTaskToolResult`: `thread` and `recentRuns` come only through `include`. */
+export const OrchestratorMcpThreadReadToolResult = Schema.Struct({
+  link: Schema.optional(Schema.String),
+  status: Schema.optional(OrchestratorMcpThreadStatus),
+  thread: Schema.optional(OrchestratorMcpThreadDetail),
+  recentRuns: Schema.optional(Schema.Array(OrchestratorMcpThreadRun)),
+  items: Schema.Array(OrchestratorMcpThreadReadToolItem),
+  nextPosition: Schema.NullOr(NonNegativeInt),
+  hasMore: Schema.Boolean,
+  earlierPosition: Schema.optional(Schema.NullOr(NonNegativeInt)),
+});
+export type OrchestratorMcpThreadReadToolResult = typeof OrchestratorMcpThreadReadToolResult.Type;
 
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,

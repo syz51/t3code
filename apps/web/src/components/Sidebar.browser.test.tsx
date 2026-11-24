@@ -9,6 +9,7 @@ import {
   EnvironmentId,
   type LocalApi,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
@@ -572,5 +573,117 @@ describe("sidebar settled pagination", () => {
     const loadedRows = screen.container.querySelectorAll("[data-thread-item]").length;
     await act(() => moreButton.click());
     expect(screen.container.querySelectorAll("[data-thread-item]")).toHaveLength(loadedRows);
+  });
+
+  it("shows waiting status naming the delegated child or background wait, and clears when work finishes", async () => {
+    const activeProject = project("active");
+    const waitingChildThread = makeThreadFixture({
+      environmentId: activeProject.environmentId,
+      projectId: activeProject.id,
+      id: ThreadId.make("parent-waiting"),
+      title: "Ship release",
+      runtime: {
+        status: "idle",
+        activeRunId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerName: null,
+        lastError: null,
+        updatedAt: "2026-01-01T00:05:00.000Z",
+      },
+      pendingBackgroundTasks: [
+        {
+          taskId: "subagent-1",
+          kind: "subagent",
+          description: "Verify staging deploy",
+          childThreadId: ThreadId.make("child-1"),
+        },
+      ],
+    });
+    const waitingCommandThread = makeThreadFixture({
+      environmentId: activeProject.environmentId,
+      projectId: activeProject.id,
+      id: ThreadId.make("command-waiting"),
+      title: "Run CI check",
+      runtime: {
+        status: "idle",
+        activeRunId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerName: null,
+        lastError: null,
+        updatedAt: "2026-01-01T00:04:00.000Z",
+      },
+      pendingBackgroundTasks: [
+        {
+          taskId: "cmd-1",
+          kind: "command",
+          description: "gh run watch",
+          awaited: true,
+        },
+      ],
+    });
+    vi.mocked(useProjects).mockReturnValue([activeProject]);
+    vi.mocked(useQuietThreadShells).mockReturnValue([waitingChildThread, waitingCommandThread]);
+    vi.mocked(useThreadRouteTarget).mockReturnValue({
+      kind: "server",
+      threadRef: {
+        environmentId: activeProject.environmentId,
+        threadId: waitingChildThread.id,
+      },
+    });
+    vi.mocked(useHandleNewThread).mockReturnValue({
+      activeDraftThread: null,
+      activeThread: null,
+      defaultProjectRef: {
+        environmentId: activeProject.environmentId,
+        projectId: activeProject.id,
+      },
+      defaultProjectFallbackReady: true,
+      handleNewThread: vi.fn().mockResolvedValue(null),
+      routeDraftId: null,
+      routeThreadRef: {
+        environmentId: activeProject.environmentId,
+        threadId: waitingChildThread.id,
+      },
+    });
+
+    await using screen = await render(
+      <SidebarProvider>
+        <Sidebar routeReveal={{ observedKey: null, pendingKey: null }} />
+      </SidebarProvider>,
+    );
+
+    const workingShelf = screen.container.querySelector<HTMLElement>(
+      '[data-sidebar-row="shelf:working"]',
+    );
+    if (workingShelf?.getAttribute("aria-expanded") === "false") {
+      await act(() => workingShelf.click());
+    }
+    const parentRow = screen.getByRole("button", {
+      name: /Ship release.*Waiting · Verify staging deploy/,
+    });
+    await expect.element(parentRow).toBeVisible();
+    await expect.element(screen.getByText("Verify staging deploy")).toBeVisible();
+    const commandRow = screen.getByRole("button", {
+      name: /Run CI check.*Waiting · gh run watch/,
+    });
+    await expect.element(commandRow).toBeVisible();
+    await expect.element(screen.getByText("gh run watch")).toBeVisible();
+
+    const clearedParent = makeThreadFixture({
+      ...waitingChildThread,
+      runtime: {
+        ...waitingChildThread.runtime!,
+        status: "completed",
+      },
+      pendingBackgroundTasks: [],
+    });
+    vi.mocked(useQuietThreadShells).mockReturnValue([clearedParent, waitingCommandThread]);
+    await screen.rerender(
+      <SidebarProvider>
+        <Sidebar routeReveal={{ observedKey: null, pendingKey: null }} />
+      </SidebarProvider>,
+    );
+
+    await expect.element(screen.getByText("Verify staging deploy")).not.toBeInTheDocument();
   });
 });

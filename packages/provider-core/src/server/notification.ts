@@ -200,7 +200,7 @@ function delegatedCompletionNotification(
     (task) => task.origin === "app_owned" && task.runId === completion.parentRunId,
   ).length;
   const outcome = combinedOutcome(reports.map((report) => report.outcome));
-  const verb = outcome === "failed" ? "failed" : outcome === "cancelled" ? "stopped" : "finished";
+  const verb = outcome === "failed" ? "failed" : outcome === "cancelled" ? "stopped" : "turn ended";
   const [only] = reports;
   if (reports.length === 1 && only !== undefined) {
     const label = reportLabel(only.label);
@@ -219,10 +219,16 @@ function delegatedCompletionNotification(
     delegatedByRun > taskIds.length
       ? `${taskIds.length} of ${delegatedByRun}`
       : `${taskIds.length}`;
+  const pluralPhrase =
+    outcome === "failed"
+      ? "delegated tasks failed"
+      : outcome === "cancelled"
+        ? "delegated tasks stopped"
+        : "delegated task turns ended";
   return {
     source: { kind: "delegated_task", taskIds },
     outcome,
-    summary: `${count} delegated tasks ${verb}${labels.length === 0 ? "" : `: ${labels.join(", ")}`}`,
+    summary: `${count} ${pluralPhrase}${labels.length === 0 ? "" : `: ${labels.join(", ")}`}`,
   };
 }
 

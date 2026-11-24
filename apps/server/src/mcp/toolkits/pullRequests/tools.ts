@@ -19,6 +19,7 @@ import {
   PullRequestVisibility,
   PullRequestWatchUntil,
   ThreadPullRequestLinkSource,
+  ThreadPullRequestWatchRecord,
   TrimmedNonEmptyString,
   ThreadId,
 } from "@t3tools/contracts";
@@ -293,6 +294,10 @@ export const ThreadPullRequestEntry = Schema.Struct({
       size: Schema.Int,
     }),
   ),
+  /** Why and when the last watch ended. */
+  watchEnded: ThreadPullRequestWatchRecord.fields.ended,
+  /** The last stretch of sweeps that could not read the PR, so sent no wake. */
+  watchSkipped: ThreadPullRequestWatchRecord.fields.skipped,
 });
 export type ThreadPullRequestEntry = typeof ThreadPullRequestEntry.Type;
 
@@ -684,6 +689,7 @@ const CreatePullRequestTool = Tool.make("pull_request_create", {
     title: TrimmedNonEmptyString,
     body: Schema.String,
     base: Schema.optional(TrimmedNonEmptyString),
+    repository: Schema.optional(TrimmedNonEmptyString),
     draft: Schema.optional(Schema.Boolean),
     private: Schema.optional(Schema.Boolean).annotate({
       description:

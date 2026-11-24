@@ -2197,6 +2197,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                       harness: "Muse Code",
                       model: session.model ?? undefined,
                       reasoningEffort: effort,
+                      delegatedChild:
+                        turnInput.appThread.lineage.relationshipToParent === "subagent",
                       runtimePolicy: turnInput.runtimePolicy,
                     }),
                   },

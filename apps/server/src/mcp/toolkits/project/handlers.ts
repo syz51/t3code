@@ -367,17 +367,24 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                   (settings) => resolveProjectSettings(settings, projectId, project).settings,
                 ),
               );
-        // An outside caller that names no workspace follows the new-threads-in-a-worktree
-        // default, as the composer does.
+        // A delegated task runs in the project's checkout, also when an older sender names no workspace.
+        // An outside caller follows the new-threads-in-a-worktree default from the checkout's
+        // current branch, as the composer does; a thread caller follows the project's setting.
         const requestedStrategy =
-          workspaceStrategy === undefined &&
-          caller === undefined &&
-          project !== undefined &&
-          projectSettings !== undefined &&
-          (projectSettings.defaultThreadEnvMode ??
-            (yield* projectFileThreadEnvMode(project.workspaceRoot))) === "worktree"
-            ? yield* defaultWorktreeStrategy(project.workspaceRoot)
-            : workspaceStrategy;
+          workspaceStrategy ??
+          (input.delegatedFrom !== undefined
+            ? undefined
+            : caller !== undefined
+              ? yield* ThreadLaunch.ThreadLaunchService.pipe(
+                  Effect.flatMap((launches) => launches.defaultWorkspaceStrategy(projectId)),
+                  Effect.mapError(unavailable),
+                )
+              : project !== undefined &&
+                  projectSettings !== undefined &&
+                  (projectSettings.defaultThreadEnvMode ??
+                    (yield* projectFileThreadEnvMode(project.workspaceRoot))) === "worktree"
+                ? yield* defaultWorktreeStrategy(project.workspaceRoot)
+                : undefined);
         // An omitted startFromOrigin follows the new-worktree setting, as the composer and
         // t3_worktree_handoff do. Otherwise a stale local branch silently becomes the base.
         const strategy =
@@ -388,9 +395,9 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ...requestedStrategy,
                 startFromOrigin: projectSettings.newWorktreesStartFromOrigin,
               }
-            : requestedStrategy;
+            : (requestedStrategy ?? ({ type: "root" } as const));
         // Reject unresolved base refs and blocked branch names before accepting a launch; worktree provisioning happens later.
-        if (!replaying && strategy?.type === "worktree")
+        if (!replaying && strategy.type === "worktree")
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -399,7 +406,12 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               (error) =>
                 new OrchestratorMcpFailure({
                   code: "invalid_request",
-                  message: `${error.message} No thread was created. ${worktreeCheckHint(error, strategy)}`,
+                  message: `${error.message} No thread was created. ${
+                    input.workspaceStrategy === undefined &&
+                    error._tag === "ThreadLaunchBaseRefError"
+                      ? "The project's new-thread setting chose this base. Pass workspaceStrategy {type:'root'} (CLI: --local) to run in the project folder."
+                      : worktreeCheckHint(error, strategy)
+                  }`,
                 }),
             ),
           );
@@ -455,7 +467,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           modelSelection,
           runtimeMode: startedRuntimeMode,
           interactionMode,
-          workspaceStrategy: strategy ?? { type: "root" },
+          workspaceStrategy: strategy,
           ...(input.message === undefined && attachments.length === 0
             ? {}
             : {

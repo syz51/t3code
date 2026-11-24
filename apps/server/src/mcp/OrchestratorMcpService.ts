@@ -116,6 +116,7 @@ import {
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { placeholderThreadTitle } from "../orchestration-v2/placeholderThreadTitle.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import { resolveDefaultBaseRef } from "../vcs/defaultBaseRef.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
@@ -2098,6 +2099,10 @@ const make = Effect.gen(function* () {
       messages: [...childControls.messages, ...resultRecords.messages],
       turnItems: resultRecords.turnItems,
     };
+    const retryAt =
+      heldForRestart && taskResultRun?.status === "failed"
+        ? yield* threadManagement.restartContinuationRetryAt(taskResultRun)
+        : null;
     const resultText = (run: OrchestrationV2Run) =>
       subagentResultForRun(
         { ...childProjection, runs: run.id === taskResultRun?.id ? reportRuns : [] },
@@ -2116,14 +2121,16 @@ const make = Effect.gen(function* () {
               ? { status: task.status }
               : childRun,
           )
-        : workState === "result_available"
-          ? // A cancelled task's finished turn settles it as interrupted.
-            task.cancelledRunId !== undefined && runStatus === "completed"
-            ? "interrupted"
-            : runStatus
-          : runStatus === "queued" || runStatus === "starting"
-            ? runStatus
-            : "running";
+        : retryAt !== null
+          ? "waiting"
+          : workState === "result_available"
+            ? // A cancelled task's finished turn settles it as interrupted.
+              task.cancelledRunId !== undefined && runStatus === "completed"
+              ? "interrupted"
+              : runStatus
+            : runStatus === "queued" || runStatus === "starting"
+              ? runStatus
+              : "running";
     const derivedResult =
       task.result !== null
         ? task.result
@@ -2183,6 +2190,7 @@ const make = Effect.gen(function* () {
       status,
       ...(interruptReason === undefined ? {} : { interruptReason }),
       workState,
+      ...(retryAt === null ? {} : { retryAt }),
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,
@@ -2457,39 +2465,9 @@ const make = Effect.gen(function* () {
       effect.pipe(Effect.timeoutOption(Duration.millis(timeoutMs)), Effect.map(Option.flatten)),
   );
 
-  const refExists = (cwd: string, revision: string) =>
-    gitDriver.resolveCommit({ cwd, revision }).pipe(
-      Effect.as(true),
-      Effect.orElseSucceed(() => false),
-    );
-
   const resolveScheduledTaskBaseRef = Effect.fn(
     "OrchestratorMcpService.resolveScheduledTaskBaseRef",
-  )(function* (cwd: string) {
-    const remoteName = yield* gitDriver
-      .resolvePrimaryRemoteName(cwd)
-      .pipe(Effect.orElseSucceed(() => null));
-    const conventional = ["main", "master"];
-    if (remoteName !== null) {
-      const remoteDefault = yield* gitDriver
-        .resolveDefaultBranchName(cwd, remoteName)
-        .pipe(Effect.orElseSucceed(() => null));
-      // Fetch does not update a recorded HEAD, so it can outlive the branch it names.
-      for (const branch of remoteDefault === null
-        ? conventional
-        : [remoteDefault, ...conventional]) {
-        // Launch resolves a bare name through a local branch's upstream, or else assumes `origin`.
-        if (yield* refExists(cwd, `refs/remotes/${remoteName}/${branch}`)) {
-          return `${remoteName}/${branch}`;
-        }
-      }
-    }
-    // Local-only repositories, or a remote with neither a usable HEAD nor a conventional branch.
-    for (const branch of conventional) {
-      if (yield* refExists(cwd, `refs/heads/${branch}`)) return branch;
-    }
-    return "main";
-  });
+  )((cwd: string) => resolveDefaultBaseRef(gitDriver, cwd));
 
   const scheduledTaskWorkspaceStrategy = Effect.fn(
     "OrchestratorMcpService.scheduledTaskWorkspaceStrategy",
@@ -3064,6 +3042,15 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      if (
+        input.isolation !== "worktree" &&
+        (input.baseRef !== undefined || input.startFromOrigin === true)
+      ) {
+        return yield* failure(
+          "invalid_request",
+          '`baseRef` and `startFromOrigin` choose where a new checkout starts, so they need isolation "worktree".',
+        );
+      }
       const environmentId =
         input.target === undefined
           ? undefined
@@ -3087,7 +3074,7 @@ const make = Effect.gen(function* () {
       ) {
         return yield* failure(
           "invalid_request",
-          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
+          "A local task runs in this thread's project, so omit target.projectId. For another project in this environment, use t3_thread_launch with its projectId and a worktree workspaceStrategy ({type: \"worktree\"}). target.environmentId only reaches a remote environment; this one's id changes nothing.",
         );
       }
       const parentRun =
@@ -3130,14 +3117,22 @@ const make = Effect.gen(function* () {
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
+        const startFromOrigin = input.startFromOrigin === true;
+        // A local base resolves where the parent works, so `HEAD` and relative refs mean its commit.
+        const localRef = startFromOrigin ? "HEAD" : (input.baseRef ?? "HEAD");
         const base = yield* gitDriver
           .resolveCommit({
             cwd: parent.thread.worktreePath ?? project.workspaceRoot,
-            revision: "HEAD",
+            revision: localRef,
           })
           .pipe(
             Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
+              failure(
+                "invalid_request",
+                localRef === "HEAD"
+                  ? "Unable to resolve the parent checkout commit."
+                  : `Base ref "${localRef}" does not resolve to a commit in the parent checkout. No task was created. Pass a branch, tag, or commit that exists there, or set startFromOrigin:true if it exists only on a remote.`,
+              ),
             ),
           );
         // Launch preparation creates the worktree from the project root, so a
@@ -3155,7 +3150,28 @@ const make = Effect.gen(function* () {
               ),
             );
         }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        if (startFromOrigin) {
+          const strategy = {
+            type: "worktree" as const,
+            baseRef: input.baseRef ?? (yield* resolveScheduledTaskBaseRef(project.workspaceRoot)),
+            startFromOrigin: true,
+          };
+          yield* threadLaunch
+            .checkWorktreeBase({ projectId: project.id, workspaceStrategy: strategy })
+            .pipe(
+              Effect.mapError((error) =>
+                failure(
+                  "invalid_request",
+                  input.baseRef === undefined
+                    ? `Project "${project.title}" (${project.workspaceRoot}) has no remote default branch and no local main or master. No task was created. Pass baseRef.`
+                    : `${error.message} No task was created. Pass a branch, tag, or commit that exists there; the project has no usable remote to fetch it from.`,
+                ),
+              ),
+            );
+          workspaceStrategy = strategy;
+        } else {
+          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        }
       }
       const parentNodeId = parentRun.rootNodeId;
       // The command commits the child's preparing run, which only this call

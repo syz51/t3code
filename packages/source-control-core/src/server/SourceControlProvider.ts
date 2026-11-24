@@ -177,6 +177,8 @@ export class SourceControlProvider extends Context.Service<
     }) => Effect.Effect<void>;
     /** True when `createChangeRequest` opens the change request as a draft when asked. */
     readonly createsDraftChangeRequests?: boolean;
+    /** False on hosts that do not yet support targeting an explicit repository when creating a change request. */
+    readonly supportsTargetRepository?: boolean;
     /**
      * The private companion of the checkout's repository, made when it has none. The branch of
      * a private change request is pushed to `url` and never to the repository itself, which
@@ -185,6 +187,7 @@ export class SourceControlProvider extends Context.Service<
     readonly privateChangeRequestRemote?: (input: {
       readonly cwd: string;
       readonly context?: SourceControlProviderContext;
+      readonly repository?: string;
     }) => Effect.Effect<
       { readonly url: string; readonly repository: string },
       SourceControlProviderError
@@ -196,10 +199,7 @@ export class SourceControlProvider extends Context.Service<
       readonly headSelector: string;
       readonly state: ChangeRequestState | "all";
       readonly limit?: number;
-      /**
-       * `owner/name` to search instead of the repository `createChangeRequest` targets. Only a
-       * host with `createsChangeRequestsIn` can target another repository, so others ignore it.
-       */
+      /** `owner/name` to search instead of the default target repository. */
       readonly repository?: string;
     }) => Effect.Effect<ReadonlyArray<ChangeRequest>, SourceControlProviderError>;
     readonly getChangeRequest: (input: {
@@ -236,6 +236,7 @@ export class SourceControlProvider extends Context.Service<
     readonly getDefaultBranch: (input: {
       readonly cwd: string;
       readonly context?: SourceControlProviderContext;
+      readonly repository?: string;
     }) => Effect.Effect<string | null, SourceControlProviderError>;
     readonly checkoutChangeRequest: (input: {
       readonly cwd: string;

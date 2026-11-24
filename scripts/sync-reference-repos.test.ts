@@ -19,8 +19,10 @@ it.layer(NodeServices.layer)("sync-reference-repos", (it) => {
         prefix: "sync-reference-repos-version-",
       });
       yield* fs.writeFileString(
-        path.join(rootDir, "pnpm-workspace.yaml"),
-        "catalog:\n  alchemy: 2.0.0-beta.84\n  effect: 4.0.0-beta.73\n",
+        path.join(rootDir, "package.json"),
+        JSON.stringify({
+          workspaces: { catalog: { alchemy: "2.0.0-beta.84", effect: "4.0.0-beta.73" } },
+        }),
       );
 
       assert.equal(
@@ -39,8 +41,8 @@ it.layer(NodeServices.layer)("sync-reference-repos", (it) => {
         prefix: "sync-reference-repos-plan-",
       });
       yield* fs.writeFileString(
-        path.join(rootDir, "pnpm-workspace.yaml"),
-        "catalog:\n  effect: 4.0.0-beta.73\n",
+        path.join(rootDir, "package.json"),
+        JSON.stringify({ workspaces: { catalog: { effect: "4.0.0-beta.73" } } }),
       );
 
       const plan = yield* planReferenceRepoSync(effectRepo, rootDir, false);

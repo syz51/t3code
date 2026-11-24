@@ -16,6 +16,7 @@ import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import { T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
 import type { AntigravityAuth } from "../../provider/AntigravityAuth.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -25,6 +26,7 @@ import {
   antigravityPermissionMode,
   antigravityRuntimeModeForSessionMode,
   antigravitySteersWithPrompt,
+  antigravityUsesSkipPermissions,
   applyAntigravityAcpModelSelection,
   buildAntigravityPrompt,
   type AntigravityAcpRuntimeInput,
@@ -44,6 +46,8 @@ import {
   antigravityCommandOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
+  extractAntigravityElicitationForm,
+  extractAntigravityProposedPlanMarkdown,
   extractAntigravityUserInputQuestion,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
@@ -80,7 +84,10 @@ const AntigravityProviderCapabilitiesV2 = {
 export type AntigravityAdapterV2RuntimeInput = Omit<
   AntigravityAcpRuntimeInput,
   "spawn" | "childProcessSpawner"
-> & { readonly processEnvironment?: NodeJS.ProcessEnv };
+> & {
+  readonly processEnvironment?: NodeJS.ProcessEnv;
+  readonly skipPermissions?: boolean;
+};
 
 export interface AntigravityAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
@@ -159,6 +166,7 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
+            skipPermissions: antigravityUsesSkipPermissions(input.runtimePolicy),
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
@@ -219,10 +227,12 @@ export function makeAntigravityAcpAdapterFlavor(
   return {
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
+    orchestrationInstructions: T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS,
     capabilities: AntigravityProviderCapabilitiesV2,
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
-    // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
+    // Antigravity supports HTTP MCP without advertising mcpCapabilities.http, skipping the stdio bridge.
     mcpOverHttp: true,
+    deferMcpTools: true,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
     buildAttachmentPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
@@ -272,6 +282,8 @@ export function makeAntigravityAcpAdapterFlavor(
     }),
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
+    requiresRuntimeRestartForPolicyChange: (previous, next) =>
+      antigravityUsesSkipPermissions(previous) !== antigravityUsesSkipPermissions(next),
     clientFileSystem: {
       readTextFile: (request, cwd) =>
         readAntigravityClientTextFile({
@@ -283,6 +295,7 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     permissionDisposition: antigravityPermissionDisposition,
     approvalOptions: antigravityApprovalOptions,
+    extractElicitationForm: extractAntigravityElicitationForm,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);
       if (question === undefined) return undefined;
@@ -304,6 +317,8 @@ export function makeAntigravityAcpAdapterFlavor(
     ...(profileDirectory === undefined
       ? {}
       : {
+          extractProposedPlanMarkdown: (toolCall) =>
+            extractAntigravityProposedPlanMarkdown(toolCall, profileDirectory),
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
           subagentsOutlivingPrompt: ({ sessionId, nativeTaskIds }) =>

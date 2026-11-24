@@ -1370,6 +1370,8 @@ const make = Effect.gen(function* () {
             ],
             { concurrency: 10 },
           );
+          // Drops the relay's remembered link, so no publish uses the removed credential.
+          yield* awarenessRelay.requestCatchUp();
           yield* setCliDesiredCloudLink(false).pipe(withSecrets);
           return { ok: true, endpointRuntimeStatus } satisfies EnvironmentCloudRelayConfigResult;
         }),
@@ -1430,7 +1432,11 @@ const make = Effect.gen(function* () {
             Option.match(previousActivity, {
               onNone: () => secrets.remove(PUBLISH_AGENT_ACTIVITY_SECRET),
               onSome: (bytes) => secrets.set(PUBLISH_AGENT_ACTIVITY_SECRET, bytes),
-            }).pipe(Effect.catch(rollbackFailed)),
+            }).pipe(
+              Effect.catch(rollbackFailed),
+              // A publish may have read the value this restores.
+              Effect.andThen(awarenessRelay.requestCatchUp()),
+            ),
           ),
         );
       }

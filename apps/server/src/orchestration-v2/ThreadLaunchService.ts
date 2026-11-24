@@ -20,6 +20,7 @@ import {
   type RunId,
   type RuntimeMode,
   type ScheduledTaskId,
+  type ServerSettingsError,
   type GitCommandError,
   type GitManagerServiceError,
   TaskFolderError,
@@ -50,14 +51,16 @@ import {
 
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
-import type * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { parseGitCloneProgressLine } from "../project/gitCloneProgress.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import { resolveDefaultBaseRef } from "../vcs/defaultBaseRef.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -254,6 +257,16 @@ export class ThreadLaunchService extends Context.Service<
       | ThreadLaunchNotRepositoryError
       | TaskFolderError
     >;
+    /**
+     * What a launch that names no workspace uses: the project's new-thread default, as the
+     * composer does. Worktree mode starts from the project's default branch.
+     */
+    readonly defaultWorkspaceStrategy: (
+      projectId: ProjectId,
+    ) => Effect.Effect<
+      ThreadLaunchWorkspaceStrategy,
+      ProjectService.ProjectOperationError | ServerSettingsError
+    >;
     /** True only when the project's folder is known not to be a Git repository. */
     readonly isNonGitProject: (projectId: ProjectId) => Effect.Effect<boolean>;
     readonly retryPreparation: (
@@ -284,6 +297,8 @@ const make = Effect.gen(function* () {
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
   const terminals = yield* TerminalManager.TerminalManager;
   const git = yield* GitWorkflow.GitWorkflowService;
+  const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+  const projectFiles = yield* T3ProjectFileLoader.T3ProjectFileLoader;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
@@ -481,6 +496,35 @@ const make = Effect.gen(function* () {
         conflictingBranch,
       });
   });
+
+  const defaultWorkspaceStrategy: ThreadLaunchService["Service"]["defaultWorkspaceStrategy"] =
+    Effect.fn("ThreadLaunchService.defaultWorkspaceStrategy")(function* (projectId) {
+      const root = { type: "root" } as const;
+      const project = Option.getOrUndefined(yield* projects.getById(projectId));
+      if (project === undefined || (yield* managedFolders.isScratchProject(projectId))) return root;
+      const cwd = project.workspaceRoot;
+      const { defaultThreadEnvMode, newWorktreesStartFromOrigin } = resolveProjectSettings(
+        yield* serverSettings.getSettings,
+        projectId,
+        project,
+        Option.getOrNull(yield* projectFiles.load(cwd)),
+      ).settings;
+      if (defaultThreadEnvMode !== "worktree") return root;
+      // A folder that is not a repository, or has no commit yet, has nothing to branch from.
+      const hasCommit = yield* git
+        .hasCommit({ cwd, refName: "HEAD" })
+        .pipe(Effect.orElseSucceed(() => false));
+      if (!hasCommit) return root;
+      const baseRef = yield* resolveDefaultBaseRef(gitDriver, cwd);
+      // The last-resort name can be absent, as in a local repository on another branch.
+      const baseExists = yield* gitDriver.resolveCommit({ cwd, revision: baseRef }).pipe(
+        Effect.as(true),
+        Effect.orElseSucceed(() => false),
+      );
+      return baseExists
+        ? { type: "worktree" as const, baseRef, startFromOrigin: newWorktreesStartFromOrigin }
+        : root;
+    });
 
   const isNonGitProject: ThreadLaunchService["Service"]["isNonGitProject"] = Effect.fn(
     "ThreadLaunchService.isNonGitProject",
@@ -1725,6 +1769,7 @@ const make = Effect.gen(function* () {
   return ThreadLaunchService.of({
     launch,
     checkWorktreeBase,
+    defaultWorkspaceStrategy,
     isNonGitProject,
     retryPreparation,
     prepareRun,

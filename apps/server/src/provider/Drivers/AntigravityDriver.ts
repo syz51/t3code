@@ -4,6 +4,7 @@ import {
   ProviderDriverKind,
   ProviderSetupError,
   RuntimeMode,
+  type ServerProvider,
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
@@ -31,10 +32,7 @@ import { HttpClient } from "effect/http";
 import * as AcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
-import {
-  isAntigravityTextGenerationAvailable,
-  makeAntigravityTextGeneration,
-} from "../../textGeneration/AntigravityTextGeneration.ts";
+import { makeAntigravityTextGeneration } from "../../textGeneration/AntigravityTextGeneration.ts";
 import { makeAntigravityAuth, type AntigravityAuth } from "../AntigravityAuth.ts";
 import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import { brokenRuntimeError } from "../providerCompatibility.ts";
@@ -94,6 +92,18 @@ const RememberedRuntimeModes = Schema.fromJsonString(
 );
 const decodeRememberedRuntimeModes = Schema.decodeUnknownOption(RememberedRuntimeModes);
 const encodeRememberedRuntimeModes = Schema.encodeSync(RememberedRuntimeModes);
+const CliOAuthTokenFile = Schema.fromJsonString(
+  Schema.Struct({
+    token: Schema.Struct({
+      access_token: Schema.NonEmptyString,
+      refresh_token: Schema.optional(Schema.String),
+      expiry: Schema.optional(Schema.String),
+    }),
+    id_token_email: Schema.optional(Schema.String),
+  }),
+);
+const decodeCliOAuthTokenFile = Schema.decodeUnknownOption(CliOAuthTokenFile);
+const CLI_RENEW_TIMEOUT = "20 seconds";
 const REFRESH_FAILED =
   "Could not refresh Antigravity models. The previous model list is unchanged.";
 const PYTHON_SOCKS_REQUIRED = "python-socks is required to use a SOCKS proxy";
@@ -200,6 +210,7 @@ export const AntigravityDriver: ProviderDriver<
     );
     for (const directory of [
       directories.runtimeTemp,
+      directories.isolatedProfiles,
       path.join(profileDirectory, "antigravity-acp", "tmp"),
     ]) {
       const removeRetired = yield* retireAntigravityRuntimeTempDirs(directory).pipe(
@@ -227,6 +238,8 @@ export const AntigravityDriver: ProviderDriver<
     const prepareSpawn = Effect.fn("AntigravityDriver.prepareSpawn")(function* (
       cwd: string,
       baseEnv: NodeJS.ProcessEnv,
+      isolatedProfileDirectory?: string,
+      skipPermissions?: boolean,
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
@@ -254,11 +267,14 @@ export const AntigravityDriver: ProviderDriver<
         ),
       );
       const profile = yield* prepareAntigravityProfile({
-        profileDirectory,
+        profileDirectory: isolatedProfileDirectory ?? profileDirectory,
         baseEnv: processEnvironment,
         auth,
         userHome,
         tempDirectory: directories.runtimeTemp,
+        ...(isolatedProfileDirectory === undefined
+          ? {}
+          : { isolatedSourceProfileDirectory: profileDirectory }),
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -307,12 +323,13 @@ export const AntigravityDriver: ProviderDriver<
           baseEnv,
           auth,
           runtimeTempDirectory,
+          ...(skipPermissions === true ? { skipPermissions: true } : {}),
         }),
       };
     });
 
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: AntigravityAdapterV2RuntimeInput,
+      input: AntigravityAdapterV2RuntimeInput & { readonly isolatedProfileDirectory?: string },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
       AcpErrors.AcpError | ProviderSetupError,
@@ -320,12 +337,19 @@ export const AntigravityDriver: ProviderDriver<
     > {
       // `buildAntigravityAcpSpawnInput` sets `extendEnv: false`, so thread variables only reach the
       // agent's shell through `baseEnv`.
-      const { processEnvironment: threadEnvironment, ...runtimeInput } = input;
+      const {
+        processEnvironment: threadEnvironment,
+        isolatedProfileDirectory,
+        skipPermissions,
+        ...runtimeInput
+      } = input;
       const { executable, spawn } = yield* prepareSpawn(
         runtimeInput.cwd,
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
+        isolatedProfileDirectory,
+        skipPermissions,
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
@@ -564,7 +588,7 @@ export const AntigravityDriver: ProviderDriver<
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
-          promptCapabilities: { image: true, audio: true, embeddedContext: true },
+          promptCapabilities: { image: true, audio: false, embeddedContext: true },
           sessionCapabilities: { list: {}, resume: {} },
         },
         authMethods: [{ id: "oauth-personal", name: "Log in with Google" }],
@@ -576,9 +600,56 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    let readProviderAuthStatus: () => Effect.Effect<ServerProvider["auth"]["status"]> = () =>
+      Effect.succeed("unknown");
+
+    const renewCliToken =
+      auth.authMethod !== "oauth-personal"
+        ? undefined
+        : Effect.fn("AntigravityDriver.renewCliToken")(
+            function* () {
+              if ((yield* readProviderAuthStatus()) === "unauthenticated") {
+                return;
+              }
+              const processScope = yield* Scope.make();
+              yield* Effect.addFinalizer((exit) => Scope.close(processScope, exit));
+              yield* authFlow
+                .withProcess(
+                  Scope.close(processScope, Exit.void),
+                  Effect.gen(function* () {
+                    const cwd = yield* fileSystem.makeTempDirectoryScoped({
+                      prefix: "t3-antigravity-renew-",
+                    });
+                    // Strip display vars alongside SSH_CONNECTION so a revoked token fails fast without opening a browser.
+                    const {
+                      DISPLAY: _display,
+                      WAYLAND_DISPLAY: _wayland,
+                      ...headlessEnv
+                    } = processEnvironment;
+                    const { executable, spawn } = yield* prepareSpawn(cwd, headlessEnv);
+                    const runtime = yield* makeAntigravityAcpRuntime({
+                      cwd,
+                      mcpServers: [],
+                      runtimeVersion: executable.version,
+                      authMethod: auth.authMethod,
+                      childProcessSpawner: spawner,
+                      spawn,
+                    }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
+                    yield* runtime.initialize();
+                    yield* runtime.request("authenticate", { methodId: auth.authMethod });
+                  }),
+                )
+                .pipe(Effect.provideService(Scope.Scope, processScope));
+            },
+            Effect.scoped,
+            Effect.timeout(CLI_RENEW_TIMEOUT),
+            Effect.ignore,
+          );
+
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      ...(renewCliToken ? { renewCliToken: renewCliToken() } : {}),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
@@ -591,6 +662,8 @@ export const AntigravityDriver: ProviderDriver<
       probe,
       probeUsage: usage.probe,
       clearUsage: usage.clear,
+      clearUsageBackoff: usage.clearRenewBackoff,
+      readAccountEmail: usage.readStoredEmail,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>
@@ -602,11 +675,7 @@ export const AntigravityDriver: ProviderDriver<
           Effect.provideService(Path.Path, path),
           Effect.catch(() => Effect.logWarning("Could not save Antigravity permission modes.")),
         ),
-      supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-        Effect.provideService(Path.Path, path),
-        Effect.orElseSucceed(() => false),
-      ),
+      supportsTextGeneration: Effect.succeed(true),
     }).pipe(
       Effect.mapError(
         (cause) =>
@@ -618,6 +687,8 @@ export const AntigravityDriver: ProviderDriver<
           }),
       ),
     );
+    readProviderAuthStatus = () =>
+      provider.snapshot.getSnapshot.pipe(Effect.map((snapshot) => snapshot.auth.status));
     const defaultModel = currentCatalog.pipe(Effect.map((catalog) => catalog?.defaultChatModel));
     const orchestrationAdapter = yield* makeAntigravityAdapterV2({
       instanceId,
@@ -649,15 +720,136 @@ export const AntigravityDriver: ProviderDriver<
           threadId,
         }),
     });
-    const textGeneration = yield* makeAntigravityTextGeneration({
-      profileDirectory,
-      defaultModel,
-      withProcess: authFlow.withProcess,
-      makeRuntime: (cwd) =>
-        makeRuntime({
+    const readCliTokenRecord = (filePath: string) =>
+      fileSystem.readFileString(filePath).pipe(
+        Effect.map((contents) =>
+          decodeCliOAuthTokenFile(contents).pipe(
+            Option.map((decoded) => ({
+              contents,
+              refreshToken: decoded.token.refresh_token?.trim() || undefined,
+              expiryMs: Date.parse(decoded.token.expiry ?? ""),
+              email: decoded.id_token_email?.trim().toLowerCase() || undefined,
+            })),
+            Option.getOrUndefined,
+          ),
+        ),
+        Effect.orElseSucceed(() => undefined),
+      );
+
+    const syncRenewedCliToken = Effect.fn("AntigravityDriver.syncRenewedCliToken")(
+      function* (input: {
+        readonly sourceTokenPath: string;
+        readonly isolatedTokenPath: string;
+        readonly originalSource:
+          | {
+              readonly refreshToken: string | undefined;
+              readonly email: string | undefined;
+            }
+          | undefined;
+      }) {
+        if (input.originalSource === undefined) return false;
+        const isolated = yield* readCliTokenRecord(input.isolatedTokenPath);
+        if (isolated === undefined || !Number.isFinite(isolated.expiryMs)) return false;
+        const currentSource = yield* readCliTokenRecord(input.sourceTokenPath);
+        if (currentSource === undefined) return false;
+        if (
+          (input.originalSource.refreshToken !== undefined &&
+            currentSource.refreshToken !== input.originalSource.refreshToken) ||
+          (input.originalSource.email !== undefined &&
+            currentSource.email !== input.originalSource.email) ||
+          (isolated.email !== undefined &&
+            currentSource.email !== undefined &&
+            isolated.email !== currentSource.email)
+        ) {
+          return false;
+        }
+        if (
+          Number.isFinite(currentSource.expiryMs) &&
+          isolated.expiryMs <= currentSource.expiryMs
+        ) {
+          return false;
+        }
+        yield* writeFileStringAtomically({
+          filePath: input.sourceTokenPath,
+          contents: isolated.contents,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
+        if ((yield* HostProcess.Platform) !== "win32") {
+          yield* fileSystem.chmod(input.sourceTokenPath, 0o600).pipe(Effect.ignore);
+        }
+        return true;
+      },
+    );
+
+    const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
+      function* (cwd: string) {
+        yield* fileSystem
+          .makeDirectory(directories.isolatedProfiles, { recursive: true, mode: 0o700 })
+          .pipe(
+            Effect.mapError(
+              () =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an isolated Antigravity text generation profile.",
+                }),
+            ),
+          );
+        if ((yield* HostProcess.Platform) !== "win32") {
+          yield* fileSystem.chmod(directories.isolatedProfiles, 0o700).pipe(Effect.ignore);
+        }
+        const isolatedProfileDirectory = yield* fileSystem
+          .makeTempDirectoryScoped({
+            directory: directories.isolatedProfiles,
+            prefix: "text-profile-",
+          })
+          .pipe(
+            Effect.mapError(
+              () =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an isolated Antigravity text generation profile.",
+                }),
+            ),
+          );
+        const sourceTokenPath = path.join(
+          profileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const isolatedTokenPath = path.join(
+          isolatedProfileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const originalSource = yield* readCliTokenRecord(sourceTokenPath);
+        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
+        yield* Effect.addFinalizer(() =>
+          syncRenewedCliToken({
+            sourceTokenPath,
+            isolatedTokenPath,
+            originalSource,
+          }).pipe(
+            Effect.flatMap((synced) => (synced ? provider.onTokenRefreshed : Effect.void)),
+            Effect.ignore,
+          ),
+        );
+        return yield* makeRuntime({
           cwd,
           mcpServers: [],
-        }),
+          isolatedProfileDirectory,
+        });
+      },
+    );
+    const textGeneration = yield* makeAntigravityTextGeneration({
+      profileDirectory,
+      isolatedProfile: true,
+      defaultModel,
+      withProcess: authFlow.withProcess,
+      makeRuntime: makeIsolatedTextRuntime,
     });
 
     const refreshModels = Effect.fn("AntigravityDriver.refreshModels")(

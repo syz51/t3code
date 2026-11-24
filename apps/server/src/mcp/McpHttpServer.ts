@@ -51,7 +51,9 @@ import {
   MAX_REPORTED_DEPTH,
   toolOutcome,
 } from "../telemetry/ProviderDimensions.ts";
+import { threadLinkRefs } from "@t3tools/shared/threadLinks";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
+import { compactToolResult } from "./compactResults.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
@@ -1312,6 +1314,79 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
   return yield* registration.pipe(Effect.provideService(McpServer.McpServer, tracingServer));
 });
 
+/**
+ * A thread's `link` works wherever its `threadId` does, and the largest results
+ * lose what an agent cannot use. Outside tool analytics, so analytics still
+ * reads the ids of the whole result, and inside tool result capture, so capture
+ * hashes the raw wire arguments and matches the wire result.
+ */
+const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, R>(
+  registration: Effect.Effect<A, E, R>,
+) {
+  const server = yield* McpServer.McpServer;
+  const wireServer = McpServer.McpServer.of({
+    ...server,
+    addTool: Effect.fn("McpServer.addTool")(function (options) {
+      const { name } = options.tool;
+      const takesEnvironment = "environmentId" in (options.tool.inputSchema.properties ?? {});
+      return server.addTool({
+        ...options,
+        handle: (payload) =>
+          Effect.withFiber((fiber) => {
+            const caller = Context.getOrUndefined(
+              fiber.context,
+              McpInvocationContext.McpInvocationContext,
+            );
+            if (caller === undefined) return options.handle(payload);
+            const linkRef = (value: unknown) =>
+              typeof value === "string"
+                ? threadLinkRefs(value, caller.environmentId)[0]
+                : undefined;
+            const linked = linkRef(payload?.threadId);
+            // A link to a thread elsewhere names the environment the call goes to. A tool
+            // that reaches no other environment keeps the link, and refuses it as a thread id.
+            const elsewhere =
+              linked !== undefined &&
+              linked.environmentId !== caller.environmentId &&
+              payload.environmentId == null;
+            const routed =
+              linked === undefined || (elsewhere && !takesEnvironment)
+                ? payload
+                : {
+                    ...payload,
+                    ...(elsewhere ? { environmentId: linked.environmentId } : {}),
+                    threadId: linked.threadId,
+                  };
+            // A transfer's target is in the environment the call goes to; a link to a
+            // thread in any other stays as written, and is refused as a thread id.
+            const target = linkRef(routed?.targetThreadId);
+            const params =
+              target !== undefined &&
+              target.environmentId === (routed.environmentId ?? caller.environmentId)
+                ? { ...routed, targetThreadId: target.threadId }
+                : routed;
+            const call = options.handle(params);
+            // A linked environment decodes the result itself, maybe with a schema that needs every field.
+            if (caller.client?.linked === true) return call;
+            return Effect.map(call, (result) => {
+              if (result instanceof McpSchema.InputRequired || result.isError === true)
+                return result;
+              const compact = compactToolResult(name, params, result.structuredContent);
+              return compact === undefined
+                ? result
+                : new McpSchema.CallToolResult({
+                    ...result,
+                    structuredContent: compact,
+                    content: [{ type: "text", text: JSON.stringify(compact) }],
+                  });
+            });
+          }),
+      });
+    }),
+  });
+  return yield* registration.pipe(Effect.provideService(McpServer.McpServer, wireServer));
+});
+
 /** `McpServer.registerToolkit` advertises the full codec schema; agents get the compact one. */
 const withAdvertisedSchemas = Effect.fn("McpHttpServer.withAdvertisedSchemas")(function* <
   Tools extends Record<string, Tool.Any>,
@@ -1363,10 +1438,12 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) =>
   Layer.effectDiscard(
-    withToolAnalytics(
-      withToolResultCapture(
-        withToolSpans(
-          withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+    withToolResultCapture(
+      withAgentWire(
+        withToolAnalytics(
+          withToolSpans(
+            withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
+          ),
         ),
       ),
     ),

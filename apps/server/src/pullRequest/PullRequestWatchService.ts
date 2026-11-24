@@ -1,6 +1,7 @@
 import {
   CommandId,
   ThreadId,
+  type OrchestrationV2Command,
   type OrchestrationV2ThreadShell,
   type PullRequestChecksState,
   type PullRequestUnavailableError,
@@ -76,8 +77,12 @@ export class PullRequestWatchService extends Context.Service<
       | PullRequestTargetError
       | PullRequestUnavailableError
     >;
+    /** Marks a client's new watch whose checks still run, as `setWatching` does for agents. */
+    readonly withChecksAtStart: <C extends WatchCommand>(command: C) => Effect.Effect<C>;
   }
 >()("t3/pullRequest/PullRequestWatchService") {}
+
+type WatchCommand = Extract<OrchestrationV2Command, { readonly type: "thread.pull-request.watch" }>;
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
@@ -95,6 +100,21 @@ const make = Effect.gen(function* () {
     }
     return thread;
   });
+
+  const readSummary = (
+    projectId: OrchestrationV2ThreadShell["projectId"],
+    target: Pick<ResolvedTarget, "host" | "repository" | "number">,
+  ) =>
+    pullRequests.summary(
+      {
+        projectId,
+        host: target.host,
+        repository: target.repository,
+        number: target.number,
+        allowStale: false,
+      },
+      { recoverTransientFailure: false, bypassCache: true },
+    );
 
   // Keep the registration span stable across the service extraction.
   const setWatching = Effect.fn("PullRequestsToolkit.setWatching")(function* (input: {
@@ -131,24 +151,13 @@ const make = Effect.gen(function* () {
     let checksPendingAtStart: boolean | undefined;
     let checksStateAtStart: PullRequestChecksState | undefined;
     if (watching && !wasWatching) {
-      const read = yield* pullRequests
-        .summary(
-          {
-            projectId: thread.projectId,
-            host: target.host,
-            repository: target.repository,
-            number: target.number,
-            allowStale: false,
-          },
-          { recoverTransientFailure: false, bypassCache: true },
-        )
-        .pipe(
-          Effect.catchTags({
-            // Host and transport errors can recover while the watch is active.
-            // A failed read leaves the seed to the link's last sync.
-            PullRequestOperationError: () => Effect.undefined,
-          }),
-        );
+      const read = yield* readSummary(thread.projectId, target).pipe(
+        Effect.catchTags({
+          // Host and transport errors can recover while the watch is active.
+          // A failed read leaves the seed to the link's last sync.
+          PullRequestOperationError: () => Effect.undefined,
+        }),
+      );
       if (read?.state === "merged" || read?.state === "closed") return alreadyEnded(read.state);
       checksPendingAtStart = read === undefined ? undefined : read.checksState === "pending";
       checksStateAtStart = read?.checksState ?? undefined;
@@ -185,7 +194,25 @@ const make = Effect.gen(function* () {
     };
   });
 
-  return PullRequestWatchService.of({ setWatching });
+  const withChecksAtStart = Effect.fn("PullRequestWatchService.withChecksAtStart")(function* <
+    C extends WatchCommand,
+  >(command: C) {
+    if (!command.watching || command.checksPending !== undefined) return command;
+    const thread = yield* engine.getThreadShell(command.threadId).pipe(Effect.orDie);
+    const link =
+      thread &&
+      threadPullRequestsOf(thread).find((linked) => threadPullRequestKeysEqual(linked, command));
+    if (thread === null || link?.watch !== undefined) return command;
+    // A failed read leaves the seed to the link's last sync, as an agent's does.
+    const summary = yield* readSummary(thread.projectId, command).pipe(
+      Effect.catch(() => Effect.undefined),
+    );
+    return summary === undefined
+      ? command
+      : { ...command, checksPending: summary.checksState === "pending" };
+  });
+
+  return PullRequestWatchService.of({ setWatching, withChecksAtStart });
 });
 
 export const layer = Layer.effect(PullRequestWatchService, make);
