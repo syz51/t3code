@@ -230,7 +230,7 @@ export function makeAntigravityAcpAdapterFlavor(
     orchestrationInstructions: T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS,
     capabilities: AntigravityProviderCapabilitiesV2,
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
-    // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
+    // Antigravity supports HTTP MCP without advertising mcpCapabilities.http, skipping the stdio bridge.
     mcpOverHttp: true,
     deferMcpTools: true,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,

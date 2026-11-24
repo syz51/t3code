@@ -3155,7 +3155,7 @@ describe("AntigravityAdapterV2 session system prompt", () => {
   );
 
   it.effect(
-    "sends t3-tool-exposure: deferred on HTTP MCP servers for session/new and session/resume",
+    "sends t3-tool-exposure: deferred on HTTP MCP servers for session/new and session/resume even without mcpCapabilities.http",
     () =>
       Effect.gen(function* () {
         const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -3194,7 +3194,6 @@ describe("AntigravityAdapterV2 session system prompt", () => {
                 cwd: input.cwd,
                 env: {
                   T3_ACP_ANTIGRAVITY: "1",
-                  T3_ACP_MCP_HTTP: "1",
                   T3_ACP_SESSION_LIFECYCLE: "1",
                   T3_ACP_REQUEST_LOG_PATH: requestLog,
                 },
