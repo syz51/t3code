@@ -68,7 +68,10 @@ import {
   SECRET_REQUEST_UNSAVED_NOTE,
 } from "@t3tools/contracts";
 import { getProviderOptionCurrentValue, withLegacyUltracodeEffort } from "@t3tools/shared/model";
-import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import {
+  backgroundWorkHoldsCompletion,
+  hasPendingBackgroundSubagent,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
@@ -138,7 +141,7 @@ import {
   runtimeModeRank,
   taskPrompt,
 } from "./delegatedTaskModes.ts";
-import { assertTargetWithinLimits, isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
+import { assertLiveCallerShell, assertTargetWithinLimits, threadNotFound } from "./threadAccess.ts";
 import { WITHHELD, withoutWebhookUrlToken } from "../scheduledTasks/webhookUrlToken.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
@@ -1529,9 +1532,7 @@ const make = Effect.gen(function* () {
       return threadManagement.getThreadShell(parent.thread.id).pipe(
         Effect.mapError(threadManagementFailure),
         Effect.flatMap((shell) =>
-          isLiveCallerShell(shell, scope.thread?.providerInstanceId)
-            ? Effect.void
-            : Effect.fail(notActive),
+          assertLiveCallerShell(threadManagement, shell, scope.thread?.providerInstanceId),
         ),
       );
     }
@@ -1550,9 +1551,15 @@ const make = Effect.gen(function* () {
         .getThreadShell(threadId)
         .pipe(Effect.mapError(threadManagementFailure));
       if (
-        shell?.activeRunId !== null ||
+        shell === null ||
+        shell.archivedAt !== null ||
+        shell.activeRunId !== null ||
         shell.latestRunId === null ||
-        !isLiveCallerShell(shell, scope.thread?.providerInstanceId)
+        shell.providerInstanceId !== scope.thread?.providerInstanceId ||
+        !hasPendingBackgroundSubagent(
+          shell.pendingBackgroundTasks,
+          scope.thread?.providerInstanceId,
+        )
       ) {
         return undefined;
       }

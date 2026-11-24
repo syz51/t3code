@@ -1064,12 +1064,14 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           getProjectThreadRecords: (input) =>
             input.threadId === foreignThreadId && input.projectId === foreignProjectId
               ? Effect.succeed(foreignProjection(input.threadId))
-              : Effect.fail(
-                  new ThreadManagementService.ThreadManagementThreadNotFoundError({
-                    projectId: input.projectId,
-                    threadId: input.threadId,
-                  }),
-                ),
+              : input.threadId === parentThreadId && input.projectId === parentShell?.projectId
+                ? Effect.succeed(parentProjection)
+                : Effect.fail(
+                    new ThreadManagementService.ThreadManagementThreadNotFoundError({
+                      projectId: input.projectId,
+                      threadId: input.threadId,
+                    }),
+                  ),
           sendToThread: () =>
             Effect.succeed({
               run: { id: "run-foreign", status: "queued" },
@@ -1214,6 +1216,43 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       .sendToThread(makeScope(), { threadId: foreignThreadId, message: "after stop" })
       .pipe(Effect.flip);
     expect(stopped.code).toBe("parent_not_active");
+
+    const queuedRunId = RunId.make("run-parent-queued-wake");
+    parentRuns = [
+      {
+        ...makeRun({ id: queuedRunId, ordinal: 2, status: "queued" }),
+        rootNodeId: taskId,
+      },
+    ];
+    parentShell = {
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      status: "queued",
+      latestRunId: queuedRunId,
+      latestRunRequestedAt: now,
+      latestRunCompletedAt: null,
+    };
+    const queuedSent = yield* service.sendToThread(makeScope(), {
+      threadId: foreignThreadId,
+      message: "queued wake",
+    });
+    expect(queuedSent.threadId).toBe(foreignThreadId);
+    // Queued wakes do not satisfy backgroundSubagentRun when no background subagent is pending.
+    const queuedDelegate = yield* service
+      .delegateTask(makeScope(), { task: "requires an active run" })
+      .pipe(Effect.flip);
+    expect(queuedDelegate.code).toBe("parent_not_active");
+
+    parentRuns = [
+      {
+        ...makeRun({ id: queuedRunId, ordinal: 2, status: "queued" }),
+        providerInstanceId: customCodexInstanceId,
+        rootNodeId: taskId,
+      },
+    ];
+    const foreignQueuedSent = yield* service
+      .sendToThread(makeScope(), { threadId: foreignThreadId, message: "foreign queued" })
+      .pipe(Effect.flip);
+    expect(foreignQueuedSent.code).toBe("parent_not_active");
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
