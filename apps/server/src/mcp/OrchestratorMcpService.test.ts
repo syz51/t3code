@@ -6186,4 +6186,259 @@ describe("OrchestratorMcpService thread stop", () => {
         }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
       }),
   );
+
+  it.effect(
+    "task_status derives interruptReason and summary for unsettled background-work-cancelled and cancelled-run tasks, and task_cancel resolves bare request keys",
+    () =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("mcp:parent-unsettled-interrupt");
+        const bgKey = "bg-loss-key-1";
+        const bgEncoded = encodeURIComponent(`command:mcp:provider-session:delegate-task:${bgKey}`);
+        const bgTaskId = NodeId.make(`node:delegated-task:${bgEncoded}`);
+        const bgChildThreadId = ThreadId.make(`thread:delegated-task:${bgEncoded}`);
+        const bgChildRunId = RunId.make("run:bg-loss-child-1");
+        const bgReason =
+          "Awaited background work was cancelled because the provider process exited unexpectedly.";
+
+        const cancelledKey = "cancelled-unsettled-key-2";
+        const cancelledEncoded = encodeURIComponent(
+          `command:mcp:provider-session:delegate-task:${cancelledKey}`,
+        );
+        const cancelledTaskId = NodeId.make(`node:delegated-task:${cancelledEncoded}`);
+        const cancelledChildThreadId = ThreadId.make(`thread:delegated-task:${cancelledEncoded}`);
+        const cancelledChildRunId = RunId.make("run:cancelled-child-1");
+
+        const runningKey = "cancel-by-key-3";
+        const runningEncoded = encodeURIComponent(
+          `command:mcp:provider-session:delegate-task:${runningKey}`,
+        );
+        const runningTaskId = NodeId.make(`node:delegated-task:${runningEncoded}`);
+        const runningChildThreadId = ThreadId.make(`thread:delegated-task:${runningEncoded}`);
+        const runningChildRunId = RunId.make("run:running-child-1");
+
+        const now = DateTime.makeUnsafe("2026-11-13T06:30:00Z");
+        const parentProjection = {
+          thread: {
+            id: parentThreadId,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          },
+          runs: [],
+          subagents: [
+            {
+              id: bgTaskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId: bgChildThreadId,
+              title: "bg-loss",
+              driver: "claudeAgent",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              model: "claude-sonnet-4-6",
+              status: "running",
+              result: null,
+              completionDelivery: { state: "acknowledged" },
+              startedAt: now,
+              updatedAt: now,
+            },
+            {
+              id: cancelledTaskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId: cancelledChildThreadId,
+              title: "cancelled-unsettled",
+              driver: "claudeAgent",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              model: "claude-sonnet-4-6",
+              status: "running",
+              cancelledRunId: cancelledChildRunId,
+              result: null,
+              completionDelivery: { state: "disposed" },
+              startedAt: now,
+              updatedAt: now,
+            },
+            {
+              id: runningTaskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId: runningChildThreadId,
+              title: "running-cancel-by-key",
+              driver: "claudeAgent",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              model: "claude-sonnet-4-6",
+              status: "running",
+              result: null,
+              completionDelivery: { state: "disposed" },
+              startedAt: now,
+              updatedAt: now,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+
+        const childProjections = new Map<ThreadId, OrchestrationV2ThreadProjection>([
+          [
+            bgChildThreadId,
+            {
+              thread: { id: bgChildThreadId, title: "bg-loss" },
+              runs: [
+                {
+                  id: bgChildRunId,
+                  ordinal: 1,
+                  status: "completed",
+                  restartCancelledBackgroundWork: [
+                    { taskId: "bg-1", kind: "command", awaited: true },
+                  ],
+                  interruptReason: bgReason,
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("claudeAgent"),
+                    model: "claude-sonnet-4-6",
+                  },
+                  startedAt: now,
+                  completedAt: now,
+                },
+              ],
+              contextTransfers: [],
+              messages: [],
+              turnItems: [],
+              subagents: [],
+              providerThreads: [],
+              providerTurns: [],
+              runtimeRequests: [],
+            } as unknown as OrchestrationV2ThreadProjection,
+          ],
+          [
+            cancelledChildThreadId,
+            {
+              thread: { id: cancelledChildThreadId, title: "cancelled-unsettled" },
+              runs: [
+                {
+                  id: cancelledChildRunId,
+                  ordinal: 1,
+                  status: "completed",
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("claudeAgent"),
+                    model: "claude-sonnet-4-6",
+                  },
+                  startedAt: now,
+                  completedAt: now,
+                },
+              ],
+              contextTransfers: [],
+              messages: [],
+              turnItems: [],
+              subagents: [],
+              providerThreads: [],
+              providerTurns: [],
+              runtimeRequests: [],
+            } as unknown as OrchestrationV2ThreadProjection,
+          ],
+          [
+            runningChildThreadId,
+            {
+              thread: { id: runningChildThreadId, title: "running-cancel-by-key" },
+              runs: [
+                {
+                  id: runningChildRunId,
+                  ordinal: 1,
+                  status: "running",
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("claudeAgent"),
+                    model: "claude-sonnet-4-6",
+                  },
+                  startedAt: now,
+                  completedAt: null,
+                },
+              ],
+              contextTransfers: [],
+              messages: [],
+              turnItems: [],
+              subagents: [],
+              providerThreads: [],
+              providerTurns: [],
+              runtimeRequests: [],
+            } as unknown as OrchestrationV2ThreadProjection,
+          ],
+        ]);
+
+        const cancelledTaskIds: Array<NodeId> = [];
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (threadId, _fields, filter) =>
+              Effect.sync(() => {
+                const child = childProjections.get(threadId);
+                if (child !== undefined) return child;
+                const subagents =
+                  filter?.subagentIds !== undefined
+                    ? parentProjection.subagents.filter((task) =>
+                        filter.subagentIds!.includes(task.id),
+                      )
+                    : parentProjection.subagents;
+                return { ...parentProjection, subagents };
+              }),
+            getThreadShell: (threadId) =>
+              Effect.succeed({
+                id: threadId,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                deletedAt: null,
+              } as never),
+            listAppOwnedChildThreadIds: () => Effect.succeed([]),
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            cancelDelegatedTask: ({ taskId }) =>
+              Effect.sync(() => {
+                cancelledTaskIds.push(taskId);
+              }),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        const parentScope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:mcp-unsettled"),
+          requestNamespace: "provider-session:mcp-unsettled",
+          thread: {
+            threadId: parentThreadId,
+            providerSessionId: "provider-session:mcp-unsettled",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const bgStatus = yield* service.taskStatus(parentScope, NodeId.make(bgKey));
+          assert.equal(bgStatus.status, "interrupted");
+          assert.equal(bgStatus.interruptReason, bgReason);
+          assert.equal(
+            bgStatus.summary,
+            `Child task ended with status interrupted.\n\n${bgReason}`,
+          );
+
+          const cancelledStatus = yield* service.taskStatus(parentScope, NodeId.make(cancelledKey));
+          assert.equal(cancelledStatus.status, "interrupted");
+          assert.equal(cancelledStatus.interruptReason, "Cancelled by its parent.");
+          assert.equal(
+            cancelledStatus.summary,
+            "Child task ended with status interrupted.\n\nCancelled by its parent.",
+          );
+
+          const cancelResult = yield* service.cancelTask(parentScope, {
+            taskId: NodeId.make(runningKey),
+            reason: "No longer needed",
+          });
+          assert.equal(cancelResult.taskId, runningTaskId);
+          assert.deepEqual(cancelledTaskIds, [runningTaskId]);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }),
+  );
 });

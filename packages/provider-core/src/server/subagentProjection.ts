@@ -239,8 +239,9 @@ function withStopNotice(
 ): string {
   const notice = subagentStopNotice(projection, run)?.message;
   const reason =
-    notice ??
-    (run.status === "interrupted" || run.status === "cancelled" ? run.interruptReason : undefined);
+    run.status === "interrupted" || run.status === "cancelled"
+      ? (run.interruptReason ?? notice)
+      : notice;
   return reason === undefined ? text : `${text}\n\n${reason}`;
 }
 

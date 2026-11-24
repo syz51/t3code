@@ -2081,9 +2081,12 @@ const make = Effect.gen(function* () {
         : [];
     const resultRunIds = [
       ...new Set(
-        [taskResultRun?.id, terminalRun?.id, ...reportRuns.map((run) => run.id)].filter(
-          (id): id is RunId => id !== undefined,
-        ),
+        [
+          taskResultRun?.id,
+          terminalRun?.id,
+          childRun?.id,
+          ...reportRuns.map((run) => run.id),
+        ].filter((id): id is RunId => id !== undefined),
       ),
     ];
     const resultRecords = yield* threadManagement
@@ -2091,7 +2094,7 @@ const make = Effect.gen(function* () {
         messageRoles: ["assistant"],
         messageRunIds: resultRunIds,
         turnItemRunIds: resultRunIds,
-        turnItemTypes: SUBAGENT_RESULT_TURN_ITEM_TYPES,
+        turnItemTypes: [...SUBAGENT_RESULT_TURN_ITEM_TYPES, "run_interrupt_request"],
       })
       .pipe(Effect.mapError(threadManagementFailure));
     const childProjection = {
@@ -2103,11 +2106,6 @@ const make = Effect.gen(function* () {
       heldForRestart && taskResultRun?.status === "failed"
         ? yield* threadManagement.restartContinuationRetryAt(taskResultRun)
         : null;
-    const resultText = (run: OrchestrationV2Run) =>
-      subagentResultForRun(
-        { ...childProjection, runs: run.id === taskResultRun?.id ? reportRuns : [] },
-        run,
-      ).text;
     const workState =
       task.result !== null ? "result_available" : heldForRestart ? "working" : taskWorkState;
     const runStatus = taskStatusForRun(taskResultRun ?? childRun);
@@ -2131,11 +2129,58 @@ const make = Effect.gen(function* () {
             : runStatus === "queued" || runStatus === "starting"
               ? runStatus
               : "running";
+    const interruptReasonForRun = (
+      run: OrchestrationV2Run | undefined,
+      effectiveStatus?: OrchestrationV2Run["status"],
+    ): string | undefined => {
+      if (run === undefined) return undefined;
+      const outcome = effectiveStatus ?? runOutcome(run);
+      if (outcome !== "interrupted" && outcome !== "cancelled") return undefined;
+      const interruptRequestItem = childProjection.turnItems.find(
+        (
+          item,
+        ): item is Extract<OrchestrationV2TurnItem, { readonly type: "run_interrupt_request" }> =>
+          item.runId === run.id && item.type === "run_interrupt_request",
+      );
+      return (
+        subagentInterruptReason(childProjection, run) ??
+        interruptRequestItem?.message ??
+        (task.cancelledRunId === run.id ||
+        (task.cancelledRunId !== undefined && run.id === taskResultRun?.id)
+          ? "Cancelled by its parent."
+          : undefined)
+      );
+    };
+    const interruptReason =
+      task.interruptReason ??
+      (status === "interrupted" || status === "cancelled"
+        ? (interruptReasonForRun(taskResultRun, status) ??
+          interruptReasonForRun(childRun, status) ??
+          (task.cancelledRunId !== undefined ? "Cancelled by its parent." : undefined))
+        : undefined);
+    const resultText = (run: OrchestrationV2Run, overrideStatus?: OrchestrationV2Run["status"]) => {
+      const effectiveStatus = overrideStatus ?? runOutcome(run);
+      const reason =
+        overrideStatus !== undefined && run.id === taskResultRun?.id
+          ? interruptReason
+          : interruptReasonForRun(run, effectiveStatus);
+      return subagentResultForRun(
+        { ...childProjection, runs: run.id === taskResultRun?.id ? reportRuns : [] },
+        {
+          ...run,
+          status: effectiveStatus,
+          ...(reason === undefined ? {} : { interruptReason: reason }),
+        },
+      ).text;
+    };
     const derivedResult =
       task.result !== null
         ? task.result
         : taskResultRun !== undefined && isTerminalTaskStatus(status)
-          ? resultText(taskResultRun)
+          ? resultText(
+              taskResultRun,
+              status === "interrupted" || status === "cancelled" ? status : undefined,
+            )
           : null;
     const resultTransfers = childControls.contextTransfers.filter(
       (transfer) =>
@@ -2170,14 +2215,6 @@ const make = Effect.gen(function* () {
         instanceId: task.providerInstanceId,
         model: task.model,
       };
-    const interruptReason =
-      task.interruptReason ??
-      (status === "interrupted" || status === "cancelled"
-        ? ((taskResultRun === undefined
-            ? undefined
-            : subagentInterruptReason(childProjection, taskResultRun)) ??
-          (childRun === undefined ? undefined : subagentInterruptReason(childProjection, childRun)))
-        : undefined);
     const result = {
       taskId: resolvedTaskId,
       childThreadId: task.childThreadId,

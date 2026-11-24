@@ -588,6 +588,23 @@ it("reports a provider's stop reason with and without assistant progress", () =>
     }).text,
     "Child task ended with status interrupted.\n\nAwaited background work was cancelled because the provider process exited unexpectedly.",
   );
+  // Interrupted runs prefer run.interruptReason over an earlier stop notice, matching subagentInterruptReason.
+  assert.equal(
+    subagentResultForRun(
+      {
+        ...projection,
+        messages: [{ ...progress.message, runId: run.id }],
+        turnItems: [{ ...progress.turnItem, runId: run.id }, notice],
+      },
+      {
+        ...run,
+        status: "interrupted",
+        interruptReason:
+          "Awaited background work was cancelled because the provider process exited unexpectedly.",
+      },
+    ).text,
+    `${progress.message.text}\n\nAwaited background work was cancelled because the provider process exited unexpectedly.`,
+  );
 });
 
 it("keeps the final report of a run that failed after its turn ended", () => {
