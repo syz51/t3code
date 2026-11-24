@@ -1316,8 +1316,9 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
 
 /**
  * A thread's `link` works wherever its `threadId` does, and the largest results
- * lose what an agent cannot use. Outermost, so the tool analytics inside still
- * read the ids of the whole result.
+ * lose what an agent cannot use. Outside tool analytics, so analytics still
+ * reads the ids of the whole result, and inside tool result capture, so capture
+ * hashes the raw wire arguments and matches the wire result.
  */
 const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, R>(
   registration: Effect.Effect<A, E, R>,
@@ -1437,9 +1438,9 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) =>
   Layer.effectDiscard(
-    withAgentWire(
-      withToolAnalytics(
-        withToolResultCapture(
+    withToolResultCapture(
+      withAgentWire(
+        withToolAnalytics(
           withToolSpans(
             withAdvertisedSchemas(toolkit, McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
           ),
