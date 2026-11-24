@@ -1,9 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS,
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+  T3_CODE_ORCHESTRATION_SECTIONS,
   t3AcpPromptWithInstructions,
   t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
@@ -96,5 +98,36 @@ describe("T3 device instructions", () => {
       "Again.",
     );
     assert.notInclude(t3AcpPromptWithInstructions({ prompt: "Hi.", state }), "## T3 Code devices");
+  });
+});
+
+describe("T3 orchestration instructions", () => {
+  it("tailors Antigravity ACP subagent guidance to native invoke_subagent without changing Claude/Codex defaults", () => {
+    const state = { interactionMode: "default", hasT3Mcp: true, hasDeviceTools: false } as const;
+
+    const defaultPrompt = t3AcpPromptWithInstructions({ prompt: "Inspect the repo.", state });
+    const antigravityPrompt = t3AcpPromptWithInstructions({
+      prompt: "Inspect the repo.",
+      state,
+      orchestrationInstructions: T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS,
+    });
+
+    assert.include(antigravityPrompt, "`invoke_subagent`");
+    assert.include(antigravityPrompt, "asynchronously in the background");
+    assert.include(antigravityPrompt, '`isolation:"worktree"`');
+    assert.include(antigravityPrompt, "`delegate_task`");
+    assert.notInclude(antigravityPrompt, "`run_in_background:false`");
+    assert.notInclude(antigravityPrompt, "never a background `Agent`");
+    assert.notInclude(antigravityPrompt, "`spawn_agent`");
+
+    assert.include(defaultPrompt, T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim());
+    assert.include(defaultPrompt, "`run_in_background:false`");
+    assert.include(defaultPrompt, "never a background `Agent`");
+    assert.notInclude(defaultPrompt, "`invoke_subagent`");
+    assert.notInclude(T3_CODE_ORCHESTRATION_SECTIONS.join("\n\n"), "`invoke_subagent`");
+    assert.equal(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      `\n\n${T3_CODE_ORCHESTRATION_SECTIONS.join("\n\n")}\n`,
+    );
   });
 });

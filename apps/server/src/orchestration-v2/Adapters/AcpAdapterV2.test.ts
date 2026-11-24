@@ -952,6 +952,7 @@ function assertReinjectedInstructions(
   assert.include(text, "T3 Code interaction mode: Default");
   assert.include(text, "## T3 Code browser");
   assert.include(text, "T3 Code orchestration");
+  assert.notInclude(text, "`invoke_subagent`");
   assert.include(text, `<user_request>\n${request}\n</user_request>`);
   assert.include(blocks[1]?.text ?? "", "<runtime_info>");
 }
