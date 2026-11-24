@@ -74,6 +74,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     keyringSecret?: string;
     /** Reads the OS keyring instead of `keyringSecret`. */
     nativeKeyring?: boolean;
+    renewCliToken?: Effect.Effect<void>;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -141,6 +142,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
     ...(options.nativeKeyring ? {} : { readKeyringSecret: Effect.succeed(options.keyringSecret) }),
+    ...(options.renewCliToken ? { renewCliToken: options.renewCliToken } : {}),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
   return { ...usage, requests, writeToken, tokenPath };
 });
@@ -773,6 +775,96 @@ describe("Antigravity subscription limits", () => {
       decodeGoKeyringSecret(bytes(`go-keyring-encoded:${Buffer.from(value).toString("hex")}`)),
     ).toBe(value);
   });
+
+  it.effect("renews an expired file-backed CLI token and exposes stored email separately", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      let renewCalls = 0;
+      let cliTokenPath = "";
+      const { probe, readStoredEmail, tokenPath } = yield* fixture({
+        missingToken: true,
+        userId: "google-user-1",
+        renewCliToken: Effect.gen(function* () {
+          renewCalls++;
+          yield* fs.writeFileString(
+            cliTokenPath,
+            JSON.stringify({
+              token: {
+                access_token: "access-token",
+                token_type: "Bearer",
+                refresh_token: "refresh-a",
+                expiry: "2026-10-09T13:00:00Z",
+              },
+              id_token_email: "someone@example.com",
+            }),
+          );
+        }).pipe(Effect.orDie),
+      });
+      cliTokenPath = path.join(path.dirname(tokenPath), "antigravity-oauth-token");
+      yield* fs.writeFileString(
+        cliTokenPath,
+        JSON.stringify({
+          token: {
+            access_token: "stale-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-a",
+            expiry: "2026-10-09T11:00:00Z",
+          },
+          id_token_email: "someone@example.com",
+        }),
+      );
+      expect(yield* readStoredEmail).toBe("someone@example.com");
+      const limits = yield* probe;
+      expect(renewCalls).toBe(1);
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+      expect(JSON.stringify(limits)).not.toMatch(/someone@example\.com/);
+      // When acp_token.json takes precedence, ignore a leftover CLI token's email.
+      yield* fs.writeFileString(tokenPath, JSON.stringify({ access_token: "acp-token" }));
+      expect(yield* readStoredEmail).toBeUndefined();
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("backs off failed CLI token renewals until backoff expires or is cleared", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      let renewCalls = 0;
+      const { probe, clearRenewBackoff, tokenPath } = yield* fixture({
+        missingToken: true,
+        renewCliToken: Effect.sync(() => {
+          renewCalls++;
+        }),
+      });
+      const cliTokenPath = path.join(path.dirname(tokenPath), "antigravity-oauth-token");
+      yield* fs.writeFileString(
+        cliTokenPath,
+        JSON.stringify({
+          token: {
+            access_token: "stale-access",
+            refresh_token: "refresh-a",
+            expiry: "2026-10-09T11:00:00Z",
+          },
+        }),
+      );
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      expect(renewCalls).toBe(1);
+      // Immediate retry skips re-spawning while within backoff.
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      expect(renewCalls).toBe(1);
+      // Explicit refresh clears the backoff.
+      yield* clearRenewBackoff;
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      expect(renewCalls).toBe(2);
+      // Advancing past the 15-minute backoff retries automatically.
+      yield* TestClock.adjust("15 minutes");
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      expect(renewCalls).toBe(3);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
 
   it.effect("does not make network requests for API keys or missing sign-ins", () =>
     Effect.gen(function* () {

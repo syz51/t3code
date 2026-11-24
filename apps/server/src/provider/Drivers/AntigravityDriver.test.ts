@@ -17,8 +17,9 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
-import { HttpClient } from "effect/http";
+import { HttpClient, HttpClientResponse } from "effect/http";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../../config.ts";
@@ -66,6 +67,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     readonly enabled?: boolean;
     /** Extra instance variables, such as ones a parent T3 turn already exported. */
     readonly environment?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
+    readonly httpClient?: HttpClient.HttpClient;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -93,6 +95,8 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       readonly newSessionErrorData?: unknown;
       readonly initialMode?: string;
       readonly agentVersion?: string;
+      /** Token JSON written to `$GEMINI_HOME/antigravity-acp/antigravity-oauth-token` on launch. */
+      readonly writeCliTokenOnLaunch?: string;
     } = {},
   ) {
     const directory = path.join(root, name);
@@ -104,6 +108,12 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       executablePath,
       [
         "#!/bin/sh",
+        ...(options.writeCliTokenOnLaunch === undefined
+          ? []
+          : [
+              `mkdir -p "$GEMINI_HOME/antigravity-acp"`,
+              `printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+            ]),
         ...(options.loginRequired
           ? [`printf '%s\\n' ${shellQuote(ANTIGRAVITY_AUTH_STDOUT_PREFIX + authorizationUrl)}`]
           : []),
@@ -221,7 +231,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       return handle;
     }),
   );
-  const instance = yield* AntigravityDriver.create({
+  const created = AntigravityDriver.create({
     instanceId,
     displayName: "Google test account",
     enabled: options.enabled ?? true,
@@ -242,6 +252,9 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     Effect.provide(layerInstallation),
     Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observedSpawner),
   );
+  const instance = yield* options.httpClient
+    ? created.pipe(Effect.provideService(HttpClient.HttpClient, options.httpClient))
+    : created;
   const refresh = instance.refreshModels;
   if (!refresh) return yield* Effect.die("Antigravity does not expose model refresh.");
   const readRequests = Effect.gen(function* () {
@@ -747,6 +760,120 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         if (helperLaunch?.profileDirectory) {
           expect(yield* h.fs.exists(helperLaunch.profileDirectory)).toBe(false);
         }
+        yield* h.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "syncs a renewed CLI token back from isolated text generation and renews expired tokens during limits refresh",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-09T12:00:00Z"));
+        const quotaHttp = HttpClient.make((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              request.url.endsWith("/userinfo")
+                ? Response.json({ id: "google-user-1", email: "user@example.com" })
+                : Response.json({
+                    groups: [
+                      {
+                        displayName: "Gemini Models",
+                        buckets: [
+                          {
+                            bucketId: "gemini-5h",
+                            window: "5h",
+                            remainingFraction: 0.92,
+                            resetTime: "2099-01-01T05:00:00Z",
+                          },
+                        ],
+                      },
+                    ],
+                  }),
+            ),
+          ),
+        );
+        const h = yield* makeHarness({
+          httpClient: quotaHttp,
+          environment: [
+            { name: "DISPLAY", value: ":0" },
+            { name: "WAYLAND_DISPLAY", value: "wayland-0" },
+          ],
+        });
+        const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
+        const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
+        yield* h.fs.makeDirectory(acpDir, { recursive: true });
+        const expiredToken = JSON.stringify({
+          token: {
+            access_token: "expired-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-a",
+            expiry: "2020-01-01T00:00:00Z",
+          },
+          id_token_email: "user@example.com",
+        });
+        const renewedToken = JSON.stringify({
+          token: {
+            access_token: "renewed-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-a",
+            expiry: "2099-01-01T00:00:00Z",
+          },
+          id_token_email: "user@example.com",
+        });
+        h.controls.selected = yield* h.makeExecutable("runtime renew", {
+          writeCliTokenOnLaunch: renewedToken,
+        });
+
+        // 1. Explicit snapshot.refresh renews an expired oauth-personal token via headless ACP authenticate.
+        yield* h.fs.writeFileString(tokenPath, expiredToken);
+        const launchesBeforeRenew = h.launches.length;
+        const refreshed = yield* h.instance.snapshot.refresh;
+        expect(refreshed.auth.email).toBe("user@example.com");
+        expect(refreshed.usageLimits?.unavailable).toBeUndefined();
+        expect(refreshed.usageLimits?.windows[0]?.id).toBe("gemini-5h");
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
+        const renewLaunch = h.launches
+          .slice(launchesBeforeRenew)
+          .find((launch) => launch.tempDirectory !== undefined);
+        expect(renewLaunch?.environment.SSH_CONNECTION).toBeTruthy();
+        expect(renewLaunch?.environment.DISPLAY).toBeUndefined();
+        expect(renewLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
+        const renewMethods = (yield* h.readRequests).map((entry) => entry.method);
+        expect(renewMethods).toContain("initialize");
+        expect(renewMethods).toContain("authenticate");
+        expect(renewMethods).not.toContain("session/new");
+
+        // 2. Isolated text generation syncs its renewed token back to the owning profile on scope exit.
+        yield* h.fs.writeFileString(tokenPath, expiredToken);
+        yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name this thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.ignore);
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
+
+        // 3. Isolated text generation never overwrites a newer token already on disk.
+        const evenNewerToken = JSON.stringify({
+          token: {
+            access_token: "even-newer-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-a",
+            expiry: "2099-06-01T00:00:00Z",
+          },
+          id_token_email: "user@example.com",
+        });
+        yield* h.fs.writeFileString(tokenPath, evenNewerToken);
+        yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name another thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.ignore);
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(evenNewerToken);
         yield* h.assertClosed;
       }),
   );

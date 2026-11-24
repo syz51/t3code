@@ -2318,6 +2318,17 @@ it.layer(
         );
       });
 
+      it("preserves auth.email discovered by restart probes on cached Antigravity accounts", () => {
+        const merged = ProviderRegistry.mergeProviderSnapshot(signedIn, {
+          ...restartProbe,
+          auth: { status: "unknown", type: "oauth-personal", email: "user@example.com" },
+        });
+        assert.deepStrictEqual(merged.auth, {
+          ...signedIn.auth,
+          email: "user@example.com",
+        });
+      });
+
       it("does not invent an account after sign-out, disable, uninstall, or for other providers", () => {
         const untouched = [
           { ...restartProbe, auth: { status: "unauthenticated" } },
