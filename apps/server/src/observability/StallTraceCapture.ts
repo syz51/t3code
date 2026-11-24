@@ -3,6 +3,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -123,53 +124,73 @@ export const make = Effect.fn("StallTraceCapture.make")(function* (options: {
     }
     yield* options.sink.flush.pipe(Effect.ignore);
 
-    const kept: Array<{ readonly line: string; readonly bytes: number }> = [];
-    let head = 0;
-    let keptBytes = 0;
+    const readWindow = Effect.fnUntraced(function* () {
+      const kept: Array<{ readonly line: string; readonly bytes: number }> = [];
+      let head = 0;
+      let keptBytes = 0;
 
-    const pushLine = (line: string) => {
-      if (line.length === 0) return;
-      const endTimeNs = extractEndTimeNs(line);
-      if (endTimeNs === undefined || endTimeNs < windowStartNs) return;
-      const bytes = Buffer.byteLength(line) + 1;
-      if (bytes > maxSnapshotBytes) return;
-      kept.push({ line, bytes });
-      keptBytes += bytes;
-      while (keptBytes > maxSnapshotBytes && head < kept.length) {
-        keptBytes -= kept[head]!.bytes;
-        head += 1;
-      }
-      if (head > 1024 && head * 2 >= kept.length) {
-        kept.splice(0, head);
-        head = 0;
-      }
-    };
+      const pushLine = (line: string) => {
+        if (line.length === 0) return;
+        const endTimeNs = extractEndTimeNs(line);
+        if (endTimeNs === undefined || endTimeNs < windowStartNs) return;
+        const bytes = Buffer.byteLength(line) + 1;
+        if (bytes > maxSnapshotBytes) return;
+        kept.push({ line, bytes });
+        keptBytes += bytes;
+        while (keptBytes > maxSnapshotBytes && head < kept.length) {
+          keptBytes -= kept[head]!.bytes;
+          head += 1;
+        }
+        if (head > 1024 && head * 2 >= kept.length) {
+          kept.splice(0, head);
+          head = 0;
+        }
+      };
 
-    const sourceFiles = [`${options.sink.filePath}.1`, options.sink.filePath];
-    for (const sourcePath of sourceFiles) {
-      yield* fs.stream(sourcePath).pipe(
-        Stream.decodeText(),
-        Stream.splitLines,
-        Stream.runForEachArray((lines) =>
-          Effect.sync(() => {
-            for (const line of lines) pushLine(line);
-          }),
-        ),
-        Effect.ignore,
+      const sourceFiles = [`${options.sink.filePath}.1`, options.sink.filePath];
+      for (const sourcePath of sourceFiles) {
+        yield* fs.stream(sourcePath).pipe(
+          Stream.decodeText(),
+          Stream.splitLines,
+          Stream.runForEachArray((lines) =>
+            Effect.sync(() => {
+              for (const line of lines) pushLine(line);
+            }),
+          ),
+          Effect.ignore,
+        );
+      }
+      return head === 0 ? kept : kept.slice(head);
+    });
+
+    const statActive = () =>
+      fs.stat(options.sink.filePath).pipe(
+        Effect.map((info) => ({ ino: Option.getOrUndefined(info.ino), size: info.size })),
+        Effect.orElseSucceed(() => undefined),
       );
+    const activeBefore = yield* statActive();
+    let retained = yield* readWindow();
+    const activeAfter = yield* statActive();
+    // Retry once if the active file rotated into `.1` while `.1` was streaming.
+    const rotatedDuringRead =
+      activeBefore !== undefined &&
+      activeAfter !== undefined &&
+      (activeBefore.ino !== activeAfter.ino || activeAfter.size < activeBefore.size);
+    if (rotatedDuringRead) {
+      retained = yield* readWindow();
     }
-
-    const retained = head === 0 ? kept : kept.slice(head);
     if (retained.length === 0) return undefined;
 
     yield* fs.makeDirectory(options.snapshotDir, { recursive: true });
     const fileName = `${STALL_SNAPSHOT_PREFIX}${DateTime.formatIso(detectedAt).replaceAll(":", "-")}${STALL_SNAPSHOT_SUFFIX}`;
     const snapshotPath = path.join(options.snapshotDir, fileName);
     const pendingPath = `${snapshotPath}.tmp`;
-    yield* fs.writeFileString(pendingPath, `${retained.map((entry) => entry.line).join("\n")}\n`);
     yield* fs
-      .rename(pendingPath, snapshotPath)
-      .pipe(Effect.tapError(() => fs.remove(pendingPath, { force: true }).pipe(Effect.ignore)));
+      .writeFileString(pendingPath, `${retained.map((entry) => entry.line).join("\n")}\n`)
+      .pipe(
+        Effect.andThen(fs.rename(pendingPath, snapshotPath)),
+        Effect.tapError(() => fs.remove(pendingPath, { force: true }).pipe(Effect.ignore)),
+      );
     lastSnapshotAtMs = detectedAtMs;
 
     const entries = (yield* fs.readDirectory(options.snapshotDir))

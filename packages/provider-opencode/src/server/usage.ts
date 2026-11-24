@@ -196,8 +196,6 @@ export const readOpenCodeUsage = Effect.fn("readOpenCodeUsage")(function* (
     });
     yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      // Fail promptly on live-writer locks instead of stalling the server.
-      yield* sql.unsafe("PRAGMA busy_timeout = 100");
       const tables = new Set(
         (yield* sql.unsafe<{ readonly name: unknown }>(
           "SELECT name FROM sqlite_master WHERE type = 'table'",
@@ -374,10 +372,15 @@ export const readOpenCodeUsage = Effect.fn("readOpenCodeUsage")(function* (
       }
     }).pipe(
       (read) => Effect.flatMap(SqlClient.SqlClient, (sql) => sql.withTransaction(read)),
-      // Run the scan on a reader worker so large databases do not block the server's event loop.
-      NodeSqliteClient.readOnly,
+      // Run open, queries, and close off the event loop for both WAL and non-WAL databases,
+      // failing promptly on live-writer locks instead of stalling the server.
       Effect.provide(
-        NodeSqliteClient.layer({ filename: file.path, readonly: true, readerWorker: true }),
+        NodeSqliteClient.layer({
+          filename: file.path,
+          readonly: true,
+          writerWorker: true,
+          busyTimeoutMs: 100,
+        }),
       ),
       Effect.catchTags({
         SqlError: () => {

@@ -939,7 +939,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
     });
   });
 
-  const busyTimeoutMs = Math.max(0, Math.floor(options.busyTimeoutMs ?? 5000));
+  const busyTimeoutMs =
+    options.busyTimeoutMs !== undefined && Number.isFinite(options.busyTimeoutMs)
+      ? Math.max(0, Math.floor(options.busyTimeoutMs))
+      : 5000;
   const semaphore = yield* Semaphore.make(1);
   const writerWorker = options.writerWorker === true && isFileDatabase;
   let checkpointAfterWrite: (() => void) | undefined;

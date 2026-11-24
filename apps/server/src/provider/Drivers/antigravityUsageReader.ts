@@ -405,7 +405,12 @@ const makeSqliteReaderWorker = Effect.gen(function* () {
         ReadonlyArray<Row>,
         AntigravityDatabaseDecodeError
       >,
-    close: (filename) => send(filename, { type: "close" }).pipe(Effect.asVoid, Effect.ignore),
+    close: (filename) =>
+      Effect.suspend(() =>
+        current === undefined
+          ? Effect.void
+          : send(filename, { type: "close" }).pipe(Effect.asVoid, Effect.ignore),
+      ),
   } satisfies SqliteReaderWorker;
 });
 
