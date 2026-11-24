@@ -25,6 +25,7 @@ import {
   formatWorkingDurationLabel,
   resolveThreadWorkingStartedAt,
 } from "@t3tools/client-runtime/state/models";
+import { presentPendingBackgroundWork } from "@t3tools/client-runtime/state/thread-execution";
 import {
   AuthOrchestrationOperateScope,
   type EnvironmentId,
@@ -889,6 +890,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const timeLabel = props.timeLabel && m(props.timeLabel);
   const snoozeWakeLabelText =
     props.snoozeWakeLabelText === undefined ? undefined : m(props.snoozeWakeLabelText);
+  const waitingWork =
+    status === "waiting" ? presentPendingBackgroundWork(thread.pendingBackgroundTasks, m) : null;
+  const waitingDetail = waitingWork?.waiting
+    ? waitingWork.items.length === 1
+      ? (waitingWork.items[0]?.label ?? waitingWork.title)
+      : waitingWork.title
+    : null;
   const rowAccessibilityLabel = threadListV2RowAccessibilityLabel(
     {
       title: thread.title,
@@ -899,7 +907,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         statusLabel &&
         (statusLabel.label ??
           (status === "waiting"
-            ? gt("Waiting", { $context: "thread status" })
+            ? waitingWork?.waiting
+              ? waitingWork.title
+              : gt("Waiting", { $context: "thread status" })
             : gt("Working", { $context: "thread status" }))),
       timeLabel,
       snoozeWakeLabel: snoozedRow ? snoozeWakeLabelText : undefined,
@@ -1518,6 +1528,30 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           >
             {thread.runtime.lastError}
           </Text>
+        ) : waitingDetail !== null ? (
+          <View className="min-w-0 flex-1 flex-row items-center gap-1">
+            <SymbolView
+              name="circle.dashed.inset.filled"
+              size={machineIconSize}
+              tintColorClassName={
+                selected
+                  ? selectedThreadRowColors.mutedIconTintClassName
+                  : rowAppearance.tertiaryIconTintClassName
+              }
+              type="monochrome"
+            />
+            <Text
+              className={cn(
+                "shrink text-xs",
+                selected
+                  ? selectedThreadRowColors.mutedForegroundClassName
+                  : rowAppearance.tertiaryForegroundClassName,
+              )}
+              numberOfLines={1}
+            >
+              {waitingDetail}
+            </Text>
+          </View>
         ) : props.environmentLabel ? (
           <View className="min-w-0 flex-1 flex-row items-center gap-1">
             {props.environmentMachine ? (

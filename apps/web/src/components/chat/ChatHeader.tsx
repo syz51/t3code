@@ -1,6 +1,7 @@
 import {
   AuthOrchestrationOperateScope,
   type EnvironmentId,
+  type OrchestrationV2PendingBackgroundTask,
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -8,11 +9,16 @@ import { contextMenuSourceOf } from "~/contextMenuSource";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import {
+  presentPendingBackgroundWork,
+  type PendingBackgroundWorkItem,
+  type PendingBackgroundWorkPresentation,
+} from "@t3tools/client-runtime/state/thread-execution";
+import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { T, useGT, Var } from "gt-react";
-import { ChevronDownIcon } from "lucide-react";
+import { T, useGT, useMessages, Var } from "gt-react";
+import { ChevronDownIcon, CircleDashedIcon, EyeIcon, TerminalIcon } from "lucide-react";
 import {
   memo,
   useEffect,
@@ -23,7 +29,9 @@ import {
 } from "react";
 import { isTrailingDoubleClick } from "../Sidebar.logic";
 import { Badge } from "../ui/badge";
+import { Button, InlineButton } from "../ui/button";
 import { MiddleTruncate } from "../ui/middle-truncate";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import { useThreadActionMenu } from "~/hooks/useThreadActionMenu";
@@ -51,6 +59,7 @@ interface ChatHeaderProps {
   activeThreadId: ThreadId;
   activeThreadTitle: string;
   activeThreadLinkOrigin?: string | null | undefined;
+  pendingBackgroundTasks?: ReadonlyArray<OrchestrationV2PendingBackgroundTask> | undefined;
   isServerThread: boolean;
   activeProject: EnvironmentProject | null;
   parentThreadLink: { threadId: ThreadId; title: string } | null;
@@ -59,6 +68,108 @@ interface ChatHeaderProps {
   onNewThreadInProject: () => void;
   onOpenProjectSettings?: (() => void) | undefined;
   onFindInThread?: ((threadRef: ScopedThreadRef) => void) | undefined;
+}
+
+function WaitingWorkItemIcon({ kind }: { readonly kind: PendingBackgroundWorkItem["kind"] }) {
+  if (kind === "subagent") {
+    return <CircleDashedIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />;
+  }
+  if (kind === "monitor") {
+    return <EyeIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />;
+  }
+  return <TerminalIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />;
+}
+
+function HeaderWaitingIndicator({
+  waitingWork,
+  onOpenThread,
+}: {
+  readonly waitingWork: PendingBackgroundWorkPresentation;
+  readonly onOpenThread: (threadId: ThreadId) => void;
+}) {
+  const gt = useGT();
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const singleChild =
+    waitingWork.items.length === 1 && waitingWork.items[0]?.childThreadId !== undefined
+      ? waitingWork.items[0]
+      : null;
+
+  if (popoverOpen && singleChild !== null) {
+    setPopoverOpen(false);
+  }
+
+  if (singleChild?.childThreadId !== undefined) {
+    const childThreadId = singleChild.childThreadId;
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="ghost-muted"
+              size="xs"
+              data-testid="chat-header-waiting"
+              aria-label={gt("{status}. Open child thread", { status: waitingWork.title })}
+              onClick={() => onOpenThread(childThreadId)}
+            />
+          }
+        >
+          <CircleDashedIcon aria-hidden />
+          <span className="max-w-36 truncate sm:max-w-56">{waitingWork.title}</span>
+        </TooltipTrigger>
+        <TooltipPopup side="bottom">
+          <T>
+            Open subagent: <Var>{singleChild.label}</Var>
+          </T>
+        </TooltipPopup>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
+      <PopoverTrigger
+        render={
+          <Button
+            variant="ghost-muted"
+            size="xs"
+            data-testid="chat-header-waiting"
+            aria-label={waitingWork.title}
+          />
+        }
+      >
+        <CircleDashedIcon aria-hidden />
+        <span className="max-w-36 truncate sm:max-w-56">{waitingWork.title}</span>
+      </PopoverTrigger>
+      <PopoverPopup
+        side="bottom"
+        align="end"
+        width="sm"
+        padding="compact"
+        aria-label={gt("Waiting on")}
+      >
+        <ul className="m-0 flex list-none flex-col gap-2 p-0 text-xs">
+          {waitingWork.items.map((item) => (
+            <li key={item.taskId} className="flex min-w-0 items-center justify-between gap-2">
+              <span className="flex min-w-0 items-center gap-1.5 text-foreground">
+                <WaitingWorkItemIcon kind={item.kind} />
+                <span className="min-w-0 truncate">{item.label}</span>
+              </span>
+              {item.childThreadId !== undefined ? (
+                <InlineButton
+                  onClick={() => {
+                    setPopoverOpen(false);
+                    onOpenThread(item.childThreadId!);
+                  }}
+                >
+                  <T context="verb, opens a child thread">Open</T>
+                </InlineButton>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </PopoverPopup>
+    </Popover>
+  );
 }
 
 function resolveRenameCommit(input: {
@@ -76,6 +187,7 @@ export const ChatHeader = memo(function ChatHeader({
   activeThreadId,
   activeThreadTitle,
   activeThreadLinkOrigin,
+  pendingBackgroundTasks,
   isServerThread,
   activeProject,
   parentThreadLink,
@@ -86,6 +198,7 @@ export const ChatHeader = memo(function ChatHeader({
   onFindInThread,
 }: ChatHeaderProps) {
   const gt = useGT();
+  const messages = useMessages();
   const activeProjectName = activeProject?.isScratch ? gt("No project") : activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const interfaceFont = useClientSettings((settings) => settings.fontFamilySans);
@@ -250,6 +363,11 @@ export const ChatHeader = memo(function ChatHeader({
       setRenaming(null);
     }
   };
+  const waitingPresentation =
+    isServerThread && renamingTitle === null && pendingBackgroundTasks?.length
+      ? presentPendingBackgroundWork(pendingBackgroundTasks, messages)
+      : null;
+  const headerWaitingWork = waitingPresentation?.waiting ? waitingPresentation : null;
   return (
     <div
       ref={breadcrumbContainerRef}
@@ -413,6 +531,13 @@ export const ChatHeader = memo(function ChatHeader({
           ) : null}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
+      {headerWaitingWork ? (
+        <HeaderWaitingIndicator
+          key={`${activeThreadEnvironmentId}:${activeThreadId}`}
+          waitingWork={headerWaitingWork}
+          onOpenThread={onOpenThread}
+        />
+      ) : null}
       {isServerThread ? <GuestShareIndicator threadRef={activeThreadRef} /> : null}
     </div>
   );

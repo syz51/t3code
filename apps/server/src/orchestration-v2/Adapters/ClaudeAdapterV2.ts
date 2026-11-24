@@ -139,6 +139,7 @@ import {
   type ThreadId,
   resolveIdleCompaction,
   isDelegatedAppThread,
+  isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
 
 import { FILE_HEADERS_ONLY, formatPatch, structuredPatch } from "diff";
@@ -15271,16 +15272,56 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 yield* Ref.get(pendingBackgroundTasksByNativeThread),
                 nativeThreadId,
               );
-              const matched = [...new Set(taskIds)].filter((taskId) => roster.has(taskId));
-              if (matched.length === 0) return { matched };
+              const liveQuery = awaited ? yield* Ref.get(queryContext) : null;
+              const liveQueryMatchesThread =
+                liveQuery !== null &&
+                !liveQuery.stopping &&
+                (liveQuery.nativeThreadId === nativeThreadId ||
+                  clearedNativeSessions.get(liveQuery.nativeThreadId) === nativeThreadId);
+              const subagents = liveQueryMatchesThread
+                ? yield* Ref.get(sessionSubagentsByTaskId)
+                : undefined;
+              const wakeBufferMap = liveQueryMatchesThread ? yield* Ref.get(wakeBuffers) : null;
+              const buffered =
+                liveQuery !== null && wakeBufferMap !== null
+                  ? liveQuery.nativeThreadId === nativeThreadId
+                    ? (wakeBufferMap.get(nativeThreadId)?.messages ?? [])
+                    : [
+                        ...(wakeBufferMap.get(liveQuery.nativeThreadId)?.messages ?? []),
+                        ...(wakeBufferMap.get(nativeThreadId)?.messages ?? []),
+                      ]
+                  : [];
+              const isActiveSubagent = (taskId: string) => {
+                if (!liveQueryMatchesThread || liveQuery === null) return false;
+                const subagent = subagents?.get(taskId);
+                return (
+                  subagent !== undefined &&
+                  subagent.task.threadId === providerThread.appThreadId &&
+                  subagent.confirmedOutcome === undefined &&
+                  isOrchestrationV2WorkActive(subagent.task.status) &&
+                  !liveQuery.subagentsFromEarlierProcesses.has(subagent) &&
+                  !buffered.some(
+                    (message) =>
+                      message.type === "system" &&
+                      message.subtype === "task_notification" &&
+                      message.task_id === taskId,
+                  )
+                );
+              };
+              const uniqueTaskIds = [...new Set(taskIds)];
+              const rosterMatched = uniqueTaskIds.filter((taskId) => roster.has(taskId));
+              const matched = uniqueTaskIds.filter(
+                (taskId) => roster.has(taskId) || isActiveSubagent(taskId),
+              );
+              if (rosterMatched.length === 0) return { matched };
               if (awaited) {
                 yield* addTaskIdsToNativeThreadSet(
                   awaitedBackgroundTasksByNativeThread,
                   nativeThreadId,
-                  matched,
+                  rosterMatched,
                 );
               } else {
-                for (const taskId of matched) {
+                for (const taskId of rosterMatched) {
                   yield* clearTaskIdFromNativeThreadSet(
                     awaitedBackgroundTasksByNativeThread,
                     nativeThreadId,
