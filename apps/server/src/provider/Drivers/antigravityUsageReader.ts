@@ -126,22 +126,28 @@ const MODEL_IDS: Record<number, string> = {
   1417: "gemini-4-argon",
   1418: "gemini-4-argon",
   1419: "gemini-4-argon",
+  1532: "gemini-4-neon",
+  1533: "gemini-4-neon",
+  1534: "gemini-4-neon",
+  1535: "gemini-4-neon",
+  1536: "gemini-4-neon",
   1537: "gemini-pro-orchestrator-neon",
 };
 
 // Effort and routing variants share the base model's price.
 export const antigravityRateModel = (model: string) => {
   const base = model.replace(
-    /-(?:extra-low|low|medium|high|xhigh|tiered|control|thinking|agent|orchestrator)$/,
+    /(?:-(?:extra-low|low|medium|high|xhigh|tiered|control|thinking|agent|orchestrator))+$/,
     "",
   );
-  return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
+  return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model) ||
+    /^gemini-3-flash-(?:agent-)?[ab]$/.test(base)
     ? "gemini-3.5-flash"
-    : model === "gemini-3.7-flash-safety-le"
+    : base === "gemini-3.7-flash-safety-le"
       ? "gemini-3.7-flash"
-      : model === "gemini-pro-orchestrator-neon"
+      : base === "gemini-pro-orchestrator-neon"
         ? "gemini-4-neon"
-        : model === "gemini-pro-orchestrator-g1-pro" || model === "gemini-pro-orchestrator-argon"
+        : base === "gemini-pro-orchestrator-g1-pro" || base === "gemini-pro-orchestrator-argon"
           ? "gemini-4-argon"
           : base === "gemini-3-flash"
             ? "gemini-3-flash-preview"
@@ -178,7 +184,17 @@ function isConcreteModel(model: string): boolean {
 
 function rememberModel(models: Map<number, string | null>, id: number, model: string | null) {
   const previous = models.get(id);
-  models.set(id, previous === undefined || previous === model ? model : null);
+  if (previous === undefined || previous === model) {
+    models.set(id, model);
+    return;
+  }
+  if (previous === null || model === null) {
+    models.set(id, null);
+    return;
+  }
+  // Generations for one numeric ID can omit the slug and fall back to a display name with effort.
+  const base = antigravityRateModel(previous);
+  models.set(id, base === antigravityRateModel(model) ? base : null);
 }
 
 interface Metadata {
