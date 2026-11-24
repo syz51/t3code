@@ -412,6 +412,8 @@ export interface ProjectionRecordFilter {
   readonly subagentIds?: ReadonlyArray<NodeId>;
   readonly subagentRunIds?: ReadonlyArray<RunId>;
   readonly subagentChildThreadIds?: ReadonlyArray<ThreadId>;
+  /** Matches app-owned delegated tasks by id, child thread id, remote child id, or request-key suffix. */
+  readonly subagentQuery?: string;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemRequestIds?: ReadonlyArray<RuntimeRequestId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
@@ -979,6 +981,10 @@ function upsertProviderTurn(
   });
 }
 
+function escapeSqlLike(value: string): string {
+  return value.replaceAll(/[\\%_]/g, "\\$&");
+}
+
 function preserveRunRecordedFields(
   current: OrchestrationV2Run | undefined,
   next: OrchestrationV2Run,
@@ -992,6 +998,9 @@ function preserveRunRecordedFields(
     ...(next.restartCancelledBackgroundWork === undefined &&
     current.restartCancelledBackgroundWork !== undefined
       ? { restartCancelledBackgroundWork: current.restartCancelledBackgroundWork }
+      : {}),
+    ...(next.interruptReason === undefined && current.interruptReason !== undefined
+      ? { interruptReason: current.interruptReason }
       : {}),
     // Only a submission sets the output; a lifecycle write carries it as it was when read.
     ...(current.output !== undefined ? { output: current.output } : {}),
@@ -1115,6 +1124,9 @@ export function applyToProjection(
             ? {
                 ...run,
                 restartCancelledBackgroundWork: event.payload.restartCancelledBackgroundWork,
+                ...(run.interruptReason === undefined && event.payload.interruptReason !== undefined
+                  ? { interruptReason: event.payload.interruptReason }
+                  : {}),
               }
             : run,
         ),
@@ -2627,25 +2639,48 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 completed_at = excluded.completed_at,
                 payload_json = ${keepRecordedRunOutput(
                   keepRecordedRunField(
-                    keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
-                    "$.restartCancelledBackgroundWork",
+                    keepRecordedRunField(
+                      keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                      "$.restartCancelledBackgroundWork",
+                    ),
+                    "$.interruptReason",
                   ),
                 )}
             `;
               break;
             }
             case "run.background-work-cancelled": {
-              // Only this field changes, so a concurrent lifecycle write is never regressed.
+              // Only these fields change, so a concurrent lifecycle write is never regressed.
               const workJson = yield* encodeRestartCancelledBackgroundWork(
                 event.payload.restartCancelledBackgroundWork,
               );
-              yield* sql`
+              const interruptReason = event.payload.interruptReason;
+              yield* interruptReason === undefined
+                ? sql`
               UPDATE orchestration_v2_projection_runs
               SET payload_json = json_set(
                 payload_json,
                 '$.restartCancelledBackgroundWork',
                 json(${workJson})
               )
+              WHERE run_id = ${event.payload.runId} AND thread_id = ${event.threadId}
+            `
+                : sql`
+              UPDATE orchestration_v2_projection_runs
+              SET payload_json = CASE
+                WHEN json_type(payload_json, '$.interruptReason') IS NULL THEN json_set(
+                  payload_json,
+                  '$.restartCancelledBackgroundWork',
+                  json(${workJson}),
+                  '$.interruptReason',
+                  ${interruptReason}
+                )
+                ELSE json_set(
+                  payload_json,
+                  '$.restartCancelledBackgroundWork',
+                  json(${workJson})
+                )
+              END
               WHERE run_id = ${event.payload.runId} AND thread_id = ${event.threadId}
             `;
               break;
@@ -4349,6 +4384,34 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentChildThreadIds === undefined ? sql`` : sql`AND child_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentChildThreadIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
+              ${
+                filter?.subagentQuery === undefined
+                  ? sql``
+                  : (() => {
+                      const query = filter.subagentQuery;
+                      const encoded = query.isWellFormed() ? encodeURIComponent(query) : query;
+                      const doubleEncoded = encoded.isWellFormed()
+                        ? encodeURIComponent(encoded)
+                        : encoded;
+                      const colonSuffix = `%:${escapeSqlLike(query)}`;
+                      const colonEncodedSuffix = `%:${escapeSqlLike(encoded)}`;
+                      const encodedColonSuffix = `%\\%3A${escapeSqlLike(encoded)}`;
+                      const doubleEncodedColonSuffix = `%\\%3A${escapeSqlLike(doubleEncoded)}`;
+                      return sql`AND origin = 'app_owned' AND (
+                        subagent_id = ${query}
+                        OR child_thread_id = ${query}
+                        OR subagent_id LIKE ${colonSuffix} ESCAPE '\\'
+                        OR subagent_id LIKE ${colonEncodedSuffix} ESCAPE '\\'
+                        OR subagent_id LIKE ${encodedColonSuffix} ESCAPE '\\'
+                        OR subagent_id LIKE ${doubleEncodedColonSuffix} ESCAPE '\\'
+                        OR child_thread_id LIKE ${colonSuffix} ESCAPE '\\'
+                        OR child_thread_id LIKE ${colonEncodedSuffix} ESCAPE '\\'
+                        OR child_thread_id LIKE ${encodedColonSuffix} ESCAPE '\\'
+                        OR child_thread_id LIKE ${doubleEncodedColonSuffix} ESCAPE '\\'
+                        OR (child_thread_id IS NULL AND json_extract(payload_json, '$.remoteChild.threadId') = ${query})
+                      )`;
+                    })()
+              }
               ${
                 filter?.omitSettledSubagents === true
                   ? sql`AND subagent.rowid IN (${unsettledSubagentRowids(threadId)})`

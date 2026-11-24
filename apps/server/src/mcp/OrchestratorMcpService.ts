@@ -93,6 +93,7 @@ import * as Stream from "effect/Stream";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
   SUBAGENT_RESULT_TURN_ITEM_TYPES,
+  subagentInterruptReason,
   subagentResultForRun,
   subagentStopNotice,
   delegatedTaskProgress,
@@ -809,6 +810,132 @@ function canExposeTaskRunResult(run: OrchestrationV2Run | undefined): run is Orc
   );
 }
 
+const DELEGATED_TASK_NODE_PREFIX = "node:delegated-task:";
+const DELEGATED_TASK_THREAD_PREFIX = "thread:delegated-task:";
+const DELEGATED_TASK_BARE_PREFIX = "delegated-task:";
+
+function encodeDelegatedSuffix(rest: string): string | null {
+  if (!rest.isWellFormed()) return null;
+  const encoded = encodeURIComponent(rest);
+  return encoded === rest ? null : encoded;
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function delegatedTaskCandidateIds(requestedId: NodeId): {
+  readonly nodeIds: ReadonlyArray<NodeId>;
+  readonly childThreadIds: ReadonlyArray<ThreadId>;
+  readonly prefersChildThread: boolean;
+} {
+  const raw = requestedId.trim();
+  const nodeIds = new Set<NodeId>();
+  const childThreadIds = new Set<ThreadId>();
+  const addNodeSuffix = (rest: string) => {
+    nodeIds.add(NodeId.make(`${DELEGATED_TASK_NODE_PREFIX}${rest}`));
+    const encoded = encodeDelegatedSuffix(rest);
+    if (encoded !== null) {
+      nodeIds.add(NodeId.make(`${DELEGATED_TASK_NODE_PREFIX}${encoded}`));
+    }
+  };
+  const addThreadSuffix = (rest: string) => {
+    childThreadIds.add(ThreadId.make(`${DELEGATED_TASK_THREAD_PREFIX}${rest}`));
+    const encoded = encodeDelegatedSuffix(rest);
+    if (encoded !== null) {
+      childThreadIds.add(ThreadId.make(`${DELEGATED_TASK_THREAD_PREFIX}${encoded}`));
+    }
+  };
+  if (raw.startsWith(DELEGATED_TASK_THREAD_PREFIX)) {
+    // A child thread may hold follow-up tasks; match by childThreadId so the latest task wins.
+    addThreadSuffix(raw.slice(DELEGATED_TASK_THREAD_PREFIX.length));
+    return {
+      nodeIds: [],
+      childThreadIds: [...childThreadIds],
+      prefersChildThread: true,
+    };
+  }
+  nodeIds.add(requestedId);
+  if (raw.startsWith(DELEGATED_TASK_NODE_PREFIX)) {
+    addNodeSuffix(raw.slice(DELEGATED_TASK_NODE_PREFIX.length));
+  } else if (raw.startsWith(DELEGATED_TASK_BARE_PREFIX)) {
+    const rest = raw.slice(DELEGATED_TASK_BARE_PREFIX.length);
+    addNodeSuffix(rest);
+    addThreadSuffix(rest);
+  } else if (raw.length > 0) {
+    childThreadIds.add(ThreadId.make(raw));
+  }
+  return {
+    nodeIds: [...nodeIds],
+    childThreadIds: [...childThreadIds],
+    prefersChildThread: false,
+  };
+}
+
+function taskRequestKeyMatches(taskId: NodeId, query: string): boolean {
+  if (query.length === 0) return false;
+  const decodedId = safeDecodeURIComponent(taskId);
+  if (decodedId === query || decodedId.endsWith(`:${query}`)) return true;
+  if (!taskId.startsWith(DELEGATED_TASK_NODE_PREFIX)) return false;
+  const decodedCommand = safeDecodeURIComponent(taskId.slice(DELEGATED_TASK_NODE_PREFIX.length));
+  if (decodedCommand === query || decodedCommand.endsWith(`:${query}`)) return true;
+  const lastColon = decodedCommand.lastIndexOf(":");
+  return lastColon !== -1 && safeDecodeURIComponent(decodedCommand.slice(lastColon + 1)) === query;
+}
+
+function latestDelegatedTask(
+  tasks: ReadonlyArray<OrchestrationV2Subagent>,
+): OrchestrationV2Subagent | undefined {
+  return tasks.reduce<OrchestrationV2Subagent | undefined>((latest, task) => {
+    if (latest === undefined) return task;
+    const latestStarted = DateTime.toEpochMillis(latest.startedAt ?? latest.updatedAt);
+    const taskStarted = DateTime.toEpochMillis(task.startedAt ?? task.updatedAt);
+    if (taskStarted !== latestStarted) return taskStarted > latestStarted ? task : latest;
+    const latestUpdated = DateTime.toEpochMillis(latest.updatedAt);
+    const taskUpdated = DateTime.toEpochMillis(task.updatedAt);
+    if (taskUpdated !== latestUpdated) return taskUpdated > latestUpdated ? task : latest;
+    return task.id > latest.id ? task : latest;
+  }, undefined);
+}
+
+function matchDelegatedTask(
+  subagents: ReadonlyArray<OrchestrationV2Subagent>,
+  parentThreadId: ThreadId,
+  requestedId: NodeId,
+): OrchestrationV2Subagent | undefined {
+  const owned = subagents.filter(
+    (candidate) =>
+      candidate.origin === "app_owned" &&
+      candidate.threadId === parentThreadId &&
+      (candidate.childThreadId !== null || candidate.remoteChild !== undefined),
+  );
+  if (owned.length === 0) return undefined;
+  const { nodeIds, childThreadIds } = delegatedTaskCandidateIds(requestedId);
+  const nodeIdSet = new Set<string>(nodeIds);
+  const exactNode = owned.find((candidate) => nodeIdSet.has(candidate.id));
+  if (exactNode !== undefined) return exactNode;
+
+  const raw = requestedId.trim();
+  const childThreadIdSet = new Set<string>(childThreadIds);
+  const byChild = owned.filter(
+    (candidate) =>
+      (candidate.childThreadId !== null && childThreadIdSet.has(candidate.childThreadId)) ||
+      candidate.remoteChild?.threadId === raw,
+  );
+  if (byChild.length > 0) return latestDelegatedTask(byChild);
+
+  const byKey = owned.filter((candidate) => taskRequestKeyMatches(candidate.id, raw));
+  if (byKey.length === 0) return undefined;
+  const childKeys = new Set(
+    byKey.map((task) => task.childThreadId ?? task.remoteChild?.threadId ?? task.id),
+  );
+  return childKeys.size === 1 ? latestDelegatedTask(byKey) : undefined;
+}
+
 function stablePart(value: string): string {
   return encodeURIComponent(value);
 }
@@ -1105,10 +1232,14 @@ function threadRun(
   projection: Pick<OrchestrationV2ThreadProjection, "providerTurns">,
   run: OrchestrationV2Run,
 ): OrchestratorMcpThreadRun {
+  const outcome = runOutcome(run);
   return {
     runId: run.id,
     ordinal: run.ordinal,
     status: run.status,
+    ...(run.interruptReason !== undefined && (outcome === "interrupted" || outcome === "cancelled")
+      ? { interruptReason: run.interruptReason }
+      : {}),
     providerInstanceId: run.modelSelection.instanceId,
     model: run.modelSelection.model,
     executedModel: runExecutedModel(projection, run),
@@ -1856,6 +1987,34 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const findDelegatedTask = Effect.fn("OrchestratorMcpService.findDelegatedTask")(function* (
+    scope: McpThreadInvocationScope,
+    taskId: NodeId,
+  ) {
+    const { nodeIds, childThreadIds, prefersChildThread } = delegatedTaskCandidateIds(taskId);
+    if (prefersChildThread && childThreadIds.length > 0) {
+      const { subagents } = yield* loadThreadRecords(scope.thread.threadId, ["subagents"], {
+        subagentChildThreadIds: childThreadIds,
+      });
+      const byChild = matchDelegatedTask(subagents, scope.thread.threadId, taskId);
+      if (byChild !== undefined) return byChild;
+    }
+    if (nodeIds.length > 0) {
+      const direct = matchDelegatedTask(
+        yield* loadTasks(scope.thread.threadId, nodeIds),
+        scope.thread.threadId,
+        taskId,
+      );
+      if (direct !== undefined) return direct;
+    }
+    const raw = taskId.trim();
+    if (raw.length === 0) return undefined;
+    const { subagents } = yield* loadThreadRecords(scope.thread.threadId, ["subagents"], {
+      subagentQuery: raw,
+    });
+    return matchDelegatedTask(subagents, scope.thread.threadId, taskId);
+  });
+
   const readTask = Effect.fn("OrchestratorMcpService.readTask")(function* (
     scope: McpThreadInvocationScope,
     taskId: NodeId,
@@ -1864,15 +2023,11 @@ const make = Effect.gen(function* () {
     acknowledgementOperation = "task-status-acknowledge",
   ): Effect.fn.Return<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure> {
     yield* requireCapability(scope);
-    const task = (yield* loadTasks(scope.thread.threadId, [taskId])).find(
-      (candidate) =>
-        candidate.id === taskId &&
-        candidate.origin === "app_owned" &&
-        candidate.threadId === scope.thread.threadId,
-    );
+    const task = yield* findDelegatedTask(scope, taskId);
     if (task === undefined || (task.childThreadId === null && task.remoteChild === undefined)) {
       return yield* taskNotFound(scope, taskId);
     }
+    const resolvedTaskId = task.id;
     if (task.childThreadId === null) {
       return yield* readRemoteTask(scope, task, waitTimedOut, acknowledgeTerminal);
     }
@@ -2008,16 +2163,25 @@ const make = Effect.gen(function* () {
         instanceId: task.providerInstanceId,
         model: task.model,
       };
+    const interruptReason =
+      task.interruptReason ??
+      (status === "interrupted" || status === "cancelled"
+        ? ((taskResultRun === undefined
+            ? undefined
+            : subagentInterruptReason(childProjection, taskResultRun)) ??
+          (childRun === undefined ? undefined : subagentInterruptReason(childProjection, childRun)))
+        : undefined);
     const result = {
-      taskId: task.id,
+      taskId: resolvedTaskId,
       childThreadId: task.childThreadId,
       link: formatThreadLink(
         { environmentId: scope.environmentId, threadId: task.childThreadId },
         childControls.thread.title,
       ),
       childRunId: childRun?.id ?? null,
-      childNodeId: task.id,
+      childNodeId: resolvedTaskId,
       status,
+      ...(interruptReason === undefined ? {} : { interruptReason }),
       workState,
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,
@@ -2074,14 +2238,14 @@ const make = Effect.gen(function* () {
             operation: acknowledgementOperation,
           }),
           parentThreadId: scope.thread.threadId,
-          taskId,
+          taskId: resolvedTaskId,
           observedByRunId: observingRun?.id ?? null,
         })
         .pipe(
           Effect.mapError((error) =>
             failure(
               "orchestration_error",
-              `Unable to acknowledge delegated task ${taskId}: ${errorMessage(error)}`,
+              `Unable to acknowledge delegated task ${resolvedTaskId}: ${errorMessage(error)}`,
             ),
           ),
         );
@@ -2217,6 +2381,7 @@ const make = Effect.gen(function* () {
       childRunId: null,
       childNodeId: task.id,
       status,
+      ...(task.interruptReason === undefined ? {} : { interruptReason: task.interruptReason }),
       workState: terminal ? "result_available" : "working",
       hasPendingChildRuns: false,
       providerInstanceId: task.providerInstanceId,
@@ -2252,6 +2417,7 @@ const make = Effect.gen(function* () {
       if (endsTaskWait(initial)) {
         return Option.some(initial);
       }
+      const resolvedTaskId = initial.taskId;
       // One stream per event type, so transcript events never fill a buffer.
       // A remote task has no child here; its completion lands on the parent.
       const childThreadId = initial.childThreadId;
@@ -2275,14 +2441,14 @@ const make = Effect.gen(function* () {
                 ({ event }) =>
                   thread === "child" ||
                   event.type !== "subagent.updated" ||
-                  event.payload.id === taskId,
+                  event.payload.id === resolvedTaskId,
               ),
             ),
         ),
         { concurrency: "unbounded" },
       ).pipe(
         Stream.mapError(streamError),
-        Stream.mapEffect(() => readTask(scope, taskId, false, true)),
+        Stream.mapEffect(() => readTask(scope, resolvedTaskId, false, true)),
         Stream.filter(endsTaskWait),
         Stream.runHead,
       );
@@ -3070,18 +3236,17 @@ const make = Effect.gen(function* () {
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");
       const current = yield* readTask(scope, input.taskId);
+      const taskId = current.taskId;
       const childThreadId = current.childThreadId;
       if (childThreadId === null) {
         // The task runs in a linked environment: its thread there is stopped through the link.
-        const subagents = yield* loadTasks(scope.thread.threadId, [input.taskId]);
+        const subagents = yield* loadTasks(scope.thread.threadId, [taskId]);
         const remoteTask = subagents.find(
           (task) =>
-            task.id === input.taskId &&
-            task.origin === "app_owned" &&
-            task.remoteChild !== undefined,
+            task.id === taskId && task.origin === "app_owned" && task.remoteChild !== undefined,
         );
         if (remoteTask === undefined) {
-          return yield* taskNotFound(scope, input.taskId);
+          return yield* taskNotFound(scope, taskId);
         }
         return yield* remoteDelegation.cancel(scope, remoteTask, input);
       }
@@ -3111,8 +3276,8 @@ const make = Effect.gen(function* () {
         }
       });
       yield* assertStoppable(childThreadId);
-      const parentTask = (yield* loadTasks(scope.thread.threadId, [input.taskId])).find(
-        (task) => task.id === input.taskId && task.origin === "app_owned",
+      const parentTask = (yield* loadTasks(scope.thread.threadId, [taskId])).find(
+        (task) => task.id === taskId && task.origin === "app_owned",
       );
       const disposeCompletionDelivery =
         parentTask?.completionDelivery?.state === "disposed"
@@ -3126,14 +3291,14 @@ const make = Effect.gen(function* () {
                   operation: "cancel-task-completion-delivery",
                 }),
                 parentThreadId: scope.thread.threadId,
-                taskId: input.taskId,
+                taskId,
               })
               .pipe(
                 Effect.asVoid,
                 Effect.mapError((error) =>
                   failure(
                     "orchestration_error",
-                    `Unable to dispose delegated task ${input.taskId} completion delivery: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                    `Unable to dispose delegated task ${taskId} completion delivery: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
                   ),
                 ),
               );
@@ -3150,7 +3315,7 @@ const make = Effect.gen(function* () {
         yield* threadManagement
           .cancelDelegatedTask({
             parentThreadId: scope.thread.threadId,
-            taskId: input.taskId,
+            taskId,
             command,
             stopDescendants: (remoteDispatch) =>
               threadManagement.stopDelegatedTasks({
@@ -3164,7 +3329,7 @@ const make = Effect.gen(function* () {
             Effect.mapError((error) =>
               failure(
                 "task_not_cancellable",
-                `Unable to stop delegated task ${input.taskId}: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                `Unable to stop delegated task ${taskId}: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
               ),
             ),
           );
@@ -3174,7 +3339,7 @@ const make = Effect.gen(function* () {
         for (const run of stopped.runs) {
           if (
             run.status !== "queued" ||
-            (run.delegatedTaskId !== input.taskId && run.id !== current.childRunId)
+            (run.delegatedTaskId !== taskId && run.id !== current.childRunId)
           )
             continue;
           // Stop preserves the queue for Resume. Cancelling a task must also
@@ -3236,9 +3401,9 @@ const make = Effect.gen(function* () {
         const { subagents } = yield* threadManagement.getThreadRecords(
           scope.thread.threadId,
           ["subagents"],
-          { subagentIds: [input.taskId] },
+          { subagentIds: [taskId] },
         );
-        return subagents.some((task) => task.id === input.taskId && task.status === "cancelled");
+        return subagents.some((task) => task.id === taskId && task.status === "cancelled");
       }).pipe(Effect.mapError(threadManagementFailure));
       if (isTerminalTaskStatus(current.status)) {
         // The child can still run work for another turn, so it is stopped either way.
@@ -3246,7 +3411,7 @@ const make = Effect.gen(function* () {
         const cancelled = yield* cancelOrphan;
         yield* disposeCompletionDelivery;
         return {
-          taskId: input.taskId,
+          taskId,
           status: cancelled ? "cancelled" : current.status,
         } satisfies OrchestratorMcpTaskCancelResult;
       }
@@ -3257,26 +3422,26 @@ const make = Effect.gen(function* () {
         !child.runs.some(
           (run) =>
             run.status === "queued" &&
-            (run.delegatedTaskId === input.taskId || run.id === current.childRunId),
+            (run.delegatedTaskId === taskId || run.id === current.childRunId),
         )
       ) {
-        if (yield* cancelOrphan) return { taskId: input.taskId, status: "cancelled" };
+        if (yield* cancelOrphan) return { taskId, status: "cancelled" };
         return yield* failure(
           "task_not_cancellable",
-          `Delegated task ${input.taskId} has no interruptible child run.`,
+          `Delegated task ${taskId} has no interruptible child run.`,
         );
       }
       yield* stopWithinLimit;
       yield* disposeCompletionDelivery.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("orchestrator-mcp.cancel-task.delivery-dispose-failed", {
-            taskId: input.taskId,
+            taskId,
             cause,
           }),
         ),
       );
       return {
-        taskId: input.taskId,
+        taskId,
         status: "cancel_requested",
       };
     }),

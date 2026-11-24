@@ -6161,4 +6161,294 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         assert.notEqual(finished?.completionDelivery?.state, "disposed");
       }),
   );
+
+  it.effect(
+    "records a child run's interruptReason on the parent task and wake notice, and finds tasks by request-key suffix",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const driver = ProviderDriverKind.make("codex");
+        const threadId = ThreadId.make("mcp:8c3ddbeb-1111-4222-8333-444444444444");
+        const projectId = ProjectId.make("project:interrupt-reason-delivery");
+        const parentRunId = RunId.make("run:interrupt-reason-parent");
+        const parentRootNodeId = NodeId.make("node:interrupt-reason-parent-root");
+        const requestKey = "c5aa9215-76d7-43c3-803f-1d504c5eac47";
+        const commandId = CommandId.make(`command:mcp:session-1:delegate-task:${requestKey}`);
+        const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+        const childThreadId = IdAllocator.derive.delegatedTaskThread({ commandId });
+        const childRunId = RunId.make(`run:${childThreadId}:1`);
+        const reason = "Claude aborted tool execution.";
+
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId: parentRunId,
+          rootNodeId: parentRootNodeId,
+          taskId: NodeId.make("node:interrupt-reason-seed"),
+          deliveryState: "acknowledged",
+          now,
+        });
+        const childRun = runEvent({
+          threadId: childThreadId,
+          runId: childRunId,
+          ordinal: 1,
+          status: "running",
+          now,
+        });
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event:interrupt-reason:child-thread"),
+              type: "thread.created",
+              threadId: childThreadId,
+              occurredAt: now,
+              payload: {
+                createdBy: "agent",
+                creationSource: "mcp",
+                id: childThreadId,
+                projectId,
+                title: "Investigate t3code-108",
+                providerInstanceId: modelSelection.instanceId,
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: null,
+                activeProviderThreadId: null,
+                lineage: {
+                  parentThreadId: threadId,
+                  relationshipToParent: "subagent",
+                  rootThreadId: threadId,
+                },
+                forkedFrom: { type: "node", nodeId: taskId },
+                createdAt: now,
+                updatedAt: now,
+                archivedAt: null,
+                settledOverride: null,
+                settledAt: null,
+                lastVisitedAt: null,
+                deletedAt: null,
+              },
+            },
+            {
+              id: EventId.make("event:interrupt-reason:task"),
+              type: "subagent.updated",
+              threadId,
+              runId: parentRunId,
+              nodeId: taskId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: taskId,
+                threadId,
+                runId: parentRunId,
+                parentNodeId: parentRootNodeId,
+                origin: "app_owned",
+                createdBy: "agent",
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerThreadId: null,
+                childThreadId,
+                nativeTaskRef: null,
+                prompt: "Work on t3code-108",
+                title: "t3code-108",
+                model: modelSelection.model,
+                completionWake: "always",
+                status: "running",
+                result: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+            childRun,
+          ],
+        });
+
+        // SQLite subagentQuery locates the parent's task by its bare request-key UUID suffix,
+        // handles double-encoded clientRequestIds, and escapes '%' in '%3A'.
+        const slashCommandId = CommandId.make(
+          `command:mcp:session-1:delegate-task:${encodeURIComponent("team/slash-key")}`,
+        );
+        const slashTaskId = IdAllocator.derive.delegatedTaskNode({ commandId: slashCommandId });
+        const decoyTaskId = NodeId.make(
+          "node:delegated-task:prefix3ac5aa9215-76d7-43c3-803f-1d504c5eac47",
+        );
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event:interrupt-reason:slash-task"),
+              type: "subagent.updated",
+              threadId,
+              runId: parentRunId,
+              nodeId: slashTaskId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: slashTaskId,
+                threadId,
+                runId: parentRunId,
+                parentNodeId: parentRootNodeId,
+                origin: "app_owned",
+                createdBy: "agent",
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerThreadId: null,
+                childThreadId: ThreadId.make("thread:delegated-task:slash"),
+                nativeTaskRef: null,
+                prompt: "Slash key",
+                title: "Slash",
+                model: modelSelection.model,
+                completionWake: "always",
+                status: "running",
+                result: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+            {
+              id: EventId.make("event:interrupt-reason:decoy-task"),
+              type: "subagent.updated",
+              threadId,
+              runId: parentRunId,
+              nodeId: decoyTaskId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: decoyTaskId,
+                threadId,
+                runId: parentRunId,
+                parentNodeId: parentRootNodeId,
+                origin: "app_owned",
+                createdBy: "agent",
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerThreadId: null,
+                childThreadId: ThreadId.make("thread:delegated-task:decoy"),
+                nativeTaskRef: null,
+                prompt: "Decoy",
+                title: "Decoy",
+                model: modelSelection.model,
+                completionWake: "always",
+                status: "running",
+                result: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+        const queried = yield* orchestrator.getThreadRecords(threadId, ["subagents"], {
+          subagentQuery: requestKey,
+        });
+        assert.deepEqual(
+          queried.subagents.map((task) => task.id),
+          [taskId],
+        );
+        const queriedSlash = yield* orchestrator.getThreadRecords(threadId, ["subagents"], {
+          subagentQuery: "team/slash-key",
+        });
+        assert.deepEqual(
+          queriedSlash.subagents.map((task) => task.id),
+          [slashTaskId],
+        );
+
+        const beforeEnd = yield* sink.latestSequence();
+        const settled = sink
+          .stream({ afterSequence: beforeEnd, eventType: "subagent.updated" })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "subagent.updated" &&
+                stored.event.payload.id === taskId &&
+                stored.event.payload.status === "interrupted",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+          );
+        yield* sink.write({
+          events: [
+            {
+              ...childRun,
+              id: EventId.make("event:interrupt-reason:child-run-ended"),
+              type: "run.updated",
+              payload: {
+                ...childRun.payload,
+                status: "interrupted",
+                interruptReason: reason,
+                startedAt: now,
+                completedAt: now,
+              },
+            },
+          ],
+        });
+        yield* settled;
+
+        const parentAfter = yield* orchestrator.getThreadProjection(threadId);
+        const finishedTask = parentAfter.subagents.find((task) => task.id === taskId);
+        assert.equal(finishedTask?.status, "interrupted");
+        assert.equal(finishedTask?.interruptReason, reason);
+        assert.include(finishedTask?.result ?? "", reason);
+
+        // A later background-work-cancelled event preserves the run's existing interruptReason.
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event:interrupt-reason:bg-cancel"),
+              type: "run.background-work-cancelled",
+              threadId: childThreadId,
+              runId: childRunId,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                runId: childRunId,
+                restartCancelledBackgroundWork: [
+                  { kind: "shell", label: "bg", id: "bg-1", awaited: true },
+                ],
+                interruptReason: "Later fallback reason",
+              },
+            },
+          ],
+        });
+        const childAfterBgCancel = yield* orchestrator.getThreadProjection(childThreadId);
+        assert.equal(
+          childAfterBgCancel.runs.find((run) => run.id === childRunId)?.interruptReason,
+          reason,
+        );
+
+        const delivery = parentAfter.runs.find((run) => run.id === parentRunId)?.delegatedCompletion
+          ?.delivery;
+        assert.isNotNull(delivery);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("command:interrupt-reason:wake"),
+          threadId,
+          messageId: delivery!.messageId,
+          text: "Delegated task ended.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: {
+            parentRunId,
+            generation: delivery!.generation,
+            taskIds: delivery!.taskIds,
+          },
+        });
+        const wakeMessage = (yield* orchestrator.getThreadProjection(threadId)).messages.find(
+          (message) => message.id === delivery!.messageId,
+        );
+        assert.include(
+          wakeMessage?.text ?? "",
+          `Delegated task ${taskId} (t3code-108) in child thread ${childThreadId} [interrupted] (${reason})`,
+        );
+      }),
+  );
 });

@@ -229,6 +229,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     description:
       "starting means the child's provider has not started its turn yet, so no work has begun.",
   }),
+  interruptReason: Schema.optional(Schema.String),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
@@ -509,6 +510,7 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
   runId: RunId,
   ordinal: PositiveInt,
   status: OrchestrationV2RunStatus,
+  interruptReason: Schema.optional(Schema.String),
   providerInstanceId: ProviderInstanceId,
   model: Schema.String,
   executedModel: Schema.optional(OrchestratorMcpExecutedModel),

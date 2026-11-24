@@ -562,6 +562,32 @@ it("reports a provider's stop reason with and without assistant progress", () =>
     ).text,
     `${progress.message.text}\n\n${notice.message}`,
   );
+  const recoveryNotice = {
+    ...notice,
+    id: IdAllocator.derive.runSignalTurnItem({ runId: run.id, signal: "server-recovery" }),
+    title: "Server restarted",
+    message: "Cancelled because the server restarted before the provider work completed.",
+  } satisfies OrchestrationV2TurnItem;
+  assert.equal(
+    subagentResultForRun(
+      {
+        ...projection,
+        messages: [{ ...progress.message, runId: run.id }],
+        turnItems: [{ ...progress.turnItem, runId: run.id }, recoveryNotice],
+      },
+      { ...run, status: "cancelled" },
+    ).text,
+    `${progress.message.text}\n\n${recoveryNotice.message}`,
+  );
+  assert.equal(
+    subagentResultForRun(projection, {
+      ...run,
+      status: "interrupted",
+      interruptReason:
+        "Awaited background work was cancelled because the provider process exited unexpectedly.",
+    }).text,
+    "Child task ended with status interrupted.\n\nAwaited background work was cancelled because the provider process exited unexpectedly.",
+  );
 });
 
 it("keeps the final report of a run that failed after its turn ended", () => {

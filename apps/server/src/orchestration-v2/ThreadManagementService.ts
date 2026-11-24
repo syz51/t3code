@@ -1763,6 +1763,10 @@ const make = Effect.gen(function* () {
                 parentThreadId: input.threadId,
                 taskId: task.id,
                 status: "interrupted",
+                interruptReason:
+                  input.reason === undefined
+                    ? "Stopped with its parent."
+                    : `Stopped with its parent: ${input.reason}`,
                 result:
                   input.reason === undefined
                     ? "Stopped with its parent."

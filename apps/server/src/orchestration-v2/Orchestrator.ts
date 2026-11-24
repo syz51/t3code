@@ -210,6 +210,7 @@ import {
   endRunlessRootTurns,
   makeSubagentChildThread,
   SUBAGENT_RESULT_TURN_ITEM_TYPES,
+  subagentInterruptReason,
   subagentResultForRun,
   delegatedTaskProgress,
   delegatedTaskReportRuns,
@@ -971,7 +972,8 @@ function delegatedCompletionWakeDetail(
       const task = tasks.find((candidate) => candidate.id === taskId);
       // A follow-up gets a fresh task id; the child thread links it to the task delegate_task returned.
       const thread = task?.childThreadId == null ? "" : ` in child thread ${task.childThreadId}`;
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${thread}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
+      const reason = task?.interruptReason == null ? "" : ` (${task.interruptReason})`;
+      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${thread}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}${reason}`;
       if (task?.result != null) {
         const detail = `${label}:\n${task.result}`;
         const bytes = Buffer.byteLength(detail);
@@ -10750,6 +10752,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...task,
       remoteChild,
       status: command.status,
+      ...(command.interruptReason === undefined
+        ? {}
+        : { interruptReason: command.interruptReason }),
       result: command.result,
       ...(command.executedModel === undefined ? {} : { executedModel: command.executedModel }),
       completedAt: now,
@@ -13422,6 +13427,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       });
     }
+    const reason =
+      (input.command.type === "thread.background-work.settle" ? input.command.reason : undefined) ??
+      (yield* runInterruptReason(input.command, input.events, run.id));
     if (providerThread !== undefined) {
       yield* emitEvent({
         ...base,
@@ -13431,10 +13439,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           run,
           rootNode,
           providerThread,
-          reason:
-            (input.command.type === "thread.background-work.settle"
-              ? input.command.reason
-              : undefined) ?? (yield* runInterruptReason(input.command, input.events, run.id)),
+          reason,
           completedAt: input.now,
         }),
       });
@@ -13446,6 +13451,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...runWithoutDelegatedCompletion,
         status: "interrupted",
+        interruptReason: reason ?? "Stopped by the provider",
         completedAt: input.now,
       },
     });
@@ -14170,6 +14176,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Run ${command.runId} has no active attempt to interrupt.`,
         });
       }
+      const interruptReason = command.reason ?? "Run interrupted before provider start";
       const interruptResultItem: OrchestrationV2TurnItem = {
         id: idAllocator.derive.runSignalTurnItem({
           runId: run.id,
@@ -14189,7 +14196,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         completedAt: now,
         updatedAt: now,
         type: "run_interrupt_result",
-        message: "Run interrupted before provider start",
+        message: interruptReason,
       };
       yield* emitEvent({
         type: "turn-item.updated",
@@ -14261,7 +14268,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         nodeId: rootNode.id,
         providerInstanceId: run.providerInstanceId,
         occurredAt: now,
-        payload: { ...run, status: "interrupted", completedAt: now },
+        payload: { ...run, status: "interrupted", interruptReason, completedAt: now },
       });
       // Stop cancels a pending restart, so it must end the turn that restart could not stop.
       const supersededTurn = projection.providerTurns.findLast(
@@ -15507,7 +15514,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const now = yield* DateTime.now;
-      const result = subagentResultForRun(childProjection, { ...childRun, status: outcome });
+      const interruptRequestItem = childResult.turnItems.find(
+        (
+          item,
+        ): item is Extract<OrchestrationV2TurnItem, { readonly type: "run_interrupt_request" }> =>
+          item.runId === childRun.id && item.type === "run_interrupt_request",
+      );
+      const interruptReason =
+        terminalStatus === "interrupted" || terminalStatus === "cancelled"
+          ? (subagentInterruptReason(childProjection, childRun) ??
+            interruptRequestItem?.message ??
+            (cancelled
+              ? "Cancelled by its parent."
+              : stopped
+                ? "Stopped with its parent."
+                : undefined))
+          : undefined;
+      const result = subagentResultForRun(childProjection, {
+        ...childRun,
+        status: outcome,
+        ...(interruptReason === undefined ? {} : { interruptReason }),
+      });
       const { parentRun, ...parentProjection } = yield* readDelegatedCompletionPlanRecords(
         parentThreadId,
         task,
@@ -15520,6 +15547,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...task,
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
+        ...(interruptReason === undefined ? {} : { interruptReason }),
         result: result.text,
         completedAt: now,
         updatedAt: now,

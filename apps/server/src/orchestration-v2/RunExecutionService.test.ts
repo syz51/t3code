@@ -3165,13 +3165,15 @@ it.effect.each([
   "emits run_interrupt_result with $expected when finalizing the active attempt",
   ({ providerReason, requestReason, expected }) =>
     Effect.gen(function* () {
-      const { written, observed, committedEffects } = yield* captureRootRunTermination({
-        key: "hard-stop",
-        shouldFinalizeRun: () => Effect.succeed(true),
-        loadRunInterruptReason: () => Effect.succeed(requestReason),
-        events: (ids) =>
-          Stream.make({ ...rootTerminalEvent(ids, "interrupted"), reason: providerReason }),
-      });
+      const { written, finalEvents, observed, committedEffects } = yield* captureRootRunTermination(
+        {
+          key: "hard-stop",
+          shouldFinalizeRun: () => Effect.succeed(true),
+          loadRunInterruptReason: () => Effect.succeed(requestReason),
+          events: (ids) =>
+            Stream.make({ ...rootTerminalEvent(ids, "interrupted"), reason: providerReason }),
+        },
+      );
       assert.deepEqual(
         written.map((item) => item.type),
         ["run_interrupt_result"],
@@ -3182,8 +3184,53 @@ it.effect.each([
         expected,
       );
       assert.deepEqual(
+        finalEvents.flatMap((event) =>
+          event.type === "run.updated" ? [event.payload.interruptReason] : [],
+        ),
+        [expected],
+      );
+      assert.deepEqual(
         committedEffects.map((effect) => effect.request.type),
         ["checkpoint.capture"],
+      );
+    }),
+);
+
+it.effect(
+  "records a provider's cancellation reason on a cancelled run, preferring stop request reason",
+  () =>
+    Effect.gen(function* () {
+      const providerReason = "The provider cancelled the turn.";
+      const { finalEvents } = yield* captureRootRunTermination({
+        key: "cancelled-provider-reason",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({ ...rootTerminalEvent(ids, "cancelled"), reason: providerReason }),
+      });
+      assert.deepEqual(
+        finalEvents.flatMap((event) =>
+          event.type === "run.updated"
+            ? [{ status: event.payload.status, interruptReason: event.payload.interruptReason }]
+            : [],
+        ),
+        [{ status: "cancelled", interruptReason: providerReason }],
+      );
+
+      const stopReason = "Stopped by an agent: superseded";
+      const { finalEvents: stopEvents } = yield* captureRootRunTermination({
+        key: "cancelled-stop-reason",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        loadRunInterruptReason: () => Effect.succeed(stopReason),
+        events: (ids) =>
+          Stream.make({ ...rootTerminalEvent(ids, "cancelled"), reason: providerReason }),
+      });
+      assert.deepEqual(
+        stopEvents.flatMap((event) =>
+          event.type === "run.updated"
+            ? [{ status: event.payload.status, interruptReason: event.payload.interruptReason }]
+            : [],
+        ),
+        [{ status: "cancelled", interruptReason: stopReason }],
       );
     }),
 );
