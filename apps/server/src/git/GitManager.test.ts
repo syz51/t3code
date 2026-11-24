@@ -87,6 +87,7 @@ interface FakeProviderScenario {
   kind?: string;
   /** False for a host that opens every change request ready for review. */
   createsDraftChangeRequests?: boolean;
+  supportsTargetRepository?: boolean;
   /** The companion repository of a host with private change requests. */
   privateRemote?: { readonly url: string; readonly repository: string };
   /** Answers to successive change request listings, whatever their head selector. */
@@ -97,6 +98,8 @@ interface FakeProviderScenario {
   prListOtherwise?: ReadonlyArray<FakeChangeRequest>;
   /** Answers to listings that name a repository; the lists above answer the others. */
   prListByRepository?: Record<string, ReadonlyArray<FakeChangeRequest>>;
+  prListSequenceByRepository?: Record<string, ReadonlyArray<ReadonlyArray<FakeChangeRequest>>>;
+  createsChangeRequestsIn?: SourceControlProvider["Service"]["createsChangeRequestsIn"];
   defaultBranch?: string;
   pullRequest?: FakeChangeRequest;
   repositoryCloneUrls?: Record<string, { url: string; sshUrl: string }>;
@@ -119,10 +122,12 @@ type FakeProviderCall =
       readonly headSelector: string;
       readonly state: string;
       readonly limit: number | undefined;
+      readonly repository?: string;
     }
   | {
       readonly operation: "createChangeRequest";
       readonly source: SourceControlRefSelector | undefined;
+      readonly target?: SourceControlRefSelector | undefined;
       readonly baseRefName: string;
       readonly headSelector: string;
       readonly title: string;
@@ -136,7 +141,7 @@ type FakeProviderCall =
       readonly force: boolean;
     }
   | { readonly operation: "getRepositoryCloneUrls"; readonly repository: string }
-  | { readonly operation: "getDefaultBranch" };
+  | { readonly operation: "getDefaultBranch"; readonly repository?: string };
 
 const listed = (calls: ReadonlyArray<FakeProviderCall>) =>
   calls.flatMap((call) => (call.operation === "listChangeRequests" ? [call] : []));
@@ -399,6 +404,12 @@ function createFakeSourceControlProvider(scenario: FakeProviderScenario = {}): {
       [...values],
     ]),
   );
+  const prListQueueByRepository = new Map(
+    Object.entries(scenario.prListSequenceByRepository ?? {}).map(([repository, values]) => [
+      repository,
+      [...values],
+    ]),
+  );
   const calls: FakeProviderCall[] = [];
 
   const record = (cwd: string, call: FakeProviderCall) =>
@@ -487,6 +498,12 @@ function createFakeSourceControlProvider(scenario: FakeProviderScenario = {}): {
     service: {
       kind,
       createsDraftChangeRequests: scenario.createsDraftChangeRequests ?? true,
+      ...(scenario.supportsTargetRepository === undefined
+        ? {}
+        : { supportsTargetRepository: scenario.supportsTargetRepository }),
+      ...(scenario.createsChangeRequestsIn === undefined
+        ? {}
+        : { createsChangeRequestsIn: scenario.createsChangeRequestsIn }),
       ...(scenario.privateRemote === undefined
         ? {}
         : { privateChangeRequestRemote: () => Effect.succeed(scenario.privateRemote!) }),
@@ -497,10 +514,13 @@ function createFakeSourceControlProvider(scenario: FakeProviderScenario = {}): {
           headSelector: input.headSelector,
           state: input.state,
           limit: input.limit,
+          ...(input.repository === undefined ? {} : { repository: input.repository }),
         }).pipe(
           Effect.map(() =>
             (input.repository !== undefined
-              ? (scenario.prListByRepository?.[input.repository] ?? [])
+              ? (prListQueueByRepository.get(input.repository)?.shift() ??
+                scenario.prListByRepository?.[input.repository] ??
+                [])
               : (prListQueueByHeadSelector.get(input.headSelector)?.shift() ??
                 scenario.prListByHeadSelector?.[input.headSelector] ??
                 prListQueue.shift() ??
@@ -520,6 +540,7 @@ function createFakeSourceControlProvider(scenario: FakeProviderScenario = {}): {
         record(input.cwd, {
           operation: "createChangeRequest",
           source: input.source,
+          ...(input.target === undefined ? {} : { target: input.target }),
           baseRefName: input.baseRefName,
           headSelector: input.headSelector,
           title: input.title,
@@ -527,7 +548,10 @@ function createFakeSourceControlProvider(scenario: FakeProviderScenario = {}): {
           ...(input.private === undefined ? {} : { private: input.private }),
         }),
       getDefaultBranch: (input) =>
-        record(input.cwd, { operation: "getDefaultBranch" }).pipe(
+        record(input.cwd, {
+          operation: "getDefaultBranch",
+          ...(input.repository === undefined ? {} : { repository: input.repository }),
+        }).pipe(
           Effect.map(() => {
             const value = (scenario.defaultBranch ?? "main").trim();
             return value.length > 0 ? value : null;
@@ -5573,6 +5597,228 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         { baseRefName: "main", headSelector: "octocat:topic" },
       ]);
     }),
+  );
+
+  it.effect(
+    "createPullRequest targets an explicit fork repository while preserving default upstream behavior when omitted",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        yield* initRepo(repoDir);
+        const forkDir = yield* createBareRemote();
+        const upstreamDir = yield* createBareRemote();
+        yield* runGit(repoDir, ["remote", "add", "origin", forkDir]);
+        yield* runGit(repoDir, ["remote", "add", "upstream", upstreamDir]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+        yield* runGit(repoDir, ["push", "upstream", "main"]);
+        yield* runGit(repoDir, ["checkout", "-b", "fork"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "fork"]);
+        yield* configureVisibleRemoteUrlWithLocalRewrite(
+          repoDir,
+          "origin",
+          "git@github.com:syz51/t3code.git",
+          forkDir,
+        );
+        yield* configureVisibleRemoteUrlWithLocalRewrite(
+          repoDir,
+          "upstream",
+          "git@github.com:pingdotgg/t3code.git",
+          upstreamDir,
+        );
+        yield* runGit(repoDir, ["config", "remote.upstream.gh-resolved", "base"]);
+
+        const targetsUpstreamOnly: SourceControlProvider["Service"]["createsChangeRequestsIn"] = ({
+          repository,
+        }) => Effect.succeed(repository?.toLowerCase() === "pingdotgg/t3code");
+
+        // Commits on the fork base branch are never pushed when targeting that fork base.
+        NodeFS.writeFileSync(NodePath.join(repoDir, "on-fork.txt"), "on-fork\n");
+        yield* runGit(repoDir, ["add", "on-fork.txt"]);
+        yield* runGit(repoDir, ["commit", "-m", "On fork base"]);
+        const onForkBase = yield* makeManager({
+          providerScenario: {
+            createsChangeRequestsIn: targetsUpstreamOnly,
+            prListByRepository: { "syz51/t3code": [] },
+          },
+        });
+        const baseError = yield* Effect.flip(
+          onForkBase.manager.createPullRequest({
+            cwd: repoDir,
+            projectId: ProjectId.make("project-1"),
+            title: "Should fail",
+            body: "Body",
+            baseBranch: "fork",
+            repository: "syz51/t3code",
+          }),
+        );
+        expect(baseError.message).toContain("fork is the base branch");
+        expect(created(onForkBase.providerCalls)).toEqual([]);
+        yield* runGit(repoDir, ["reset", "--hard", "origin/fork"]);
+
+        // Creating on an explicit fork repository pushes to origin, uses a same-repo head selector,
+        // and looks up the PR on the fork before and after create.
+        yield* runGit(repoDir, ["checkout", "-b", "feat/fork-pr"]);
+        NodeFS.writeFileSync(NodePath.join(repoDir, "fork-pr.txt"), "fork pr\n");
+        yield* runGit(repoDir, ["add", "fork-pr.txt"]);
+        yield* runGit(repoDir, ["commit", "-m", "Fork PR commit"]);
+        const forkPr = {
+          number: 54,
+          title: "Fork PR",
+          url: "https://github.com/syz51/t3code/pull/54",
+          baseRefName: "fork",
+          headRefName: "feat/fork-pr",
+          isCrossRepository: false,
+          headRepositoryNameWithOwner: "syz51/t3code",
+          headRepositoryOwnerLogin: "syz51",
+        };
+        const onFork = yield* makeManager({
+          providerScenario: {
+            createsChangeRequestsIn: targetsUpstreamOnly,
+            prListSequenceByRepository: { "syz51/t3code": [[], [forkPr]] },
+          },
+        });
+        const createdForkPr = yield* onFork.manager.createPullRequest({
+          cwd: repoDir,
+          projectId: ProjectId.make("project-1"),
+          title: "Fork PR",
+          body: "Body",
+          baseBranch: "fork",
+          repository: "syz51/t3code",
+        });
+        expect(createdForkPr).toMatchObject({
+          status: "created",
+          url: "https://github.com/syz51/t3code/pull/54",
+          number: 54,
+          baseBranch: "fork",
+          headBranch: "feat/fork-pr",
+        });
+        expect(
+          (yield* runGit(forkDir, [
+            "--git-dir=.",
+            "rev-parse",
+            "--verify",
+            "refs/heads/feat/fork-pr",
+          ])).stdout.trim().length,
+        ).toBeGreaterThan(0);
+        expect(
+          (yield* runGit(repoDir, [
+            "ls-remote",
+            "upstream",
+            "refs/heads/feat/fork-pr",
+          ])).stdout.trim(),
+        ).toBe("");
+        expect(listed(onFork.providerCalls)).toMatchObject([
+          { headSelector: "feat/fork-pr", state: "open", repository: "syz51/t3code" },
+          { headSelector: "feat/fork-pr", state: "open", repository: "syz51/t3code" },
+        ]);
+        expect(
+          onFork.providerCalls.filter((call) => call.operation === "createChangeRequest"),
+        ).toMatchObject([
+          {
+            baseRefName: "fork",
+            headSelector: "feat/fork-pr",
+            target: { repository: "syz51/t3code", refName: "fork" },
+          },
+        ]);
+
+        // Re-running finds the existing open PR on the fork instead of creating another.
+        const existingFork = yield* makeManager({
+          providerScenario: {
+            createsChangeRequestsIn: targetsUpstreamOnly,
+            prListByRepository: { "syz51/t3code": [forkPr] },
+          },
+        });
+        const foundExisting = yield* existingFork.manager.createPullRequest({
+          cwd: repoDir,
+          projectId: ProjectId.make("project-1"),
+          title: "Fork PR",
+          body: "Body",
+          baseBranch: "fork",
+          repository: "syz51/t3code",
+        });
+        expect(foundExisting).toMatchObject({
+          status: "opened_existing",
+          url: "https://github.com/syz51/t3code/pull/54",
+          number: 54,
+        });
+        expect(created(existingFork.providerCalls)).toEqual([]);
+
+        // Omitting repository preserves default upstream resolution and cross-repository head selector.
+        const upstreamPr = {
+          number: 99,
+          title: "Upstream PR",
+          url: "https://github.com/pingdotgg/t3code/pull/99",
+          baseRefName: "main",
+          headRefName: "feat/fork-pr",
+          isCrossRepository: true,
+          headRepositoryNameWithOwner: "syz51/t3code",
+          headRepositoryOwnerLogin: "syz51",
+        };
+        const defaultUpstream = yield* makeManager({
+          providerScenario: {
+            createsChangeRequestsIn: targetsUpstreamOnly,
+            prListSequence: [[], [upstreamPr]],
+          },
+        });
+        const createdUpstreamPr = yield* defaultUpstream.manager.createPullRequest({
+          cwd: repoDir,
+          projectId: ProjectId.make("project-1"),
+          title: "Upstream PR",
+          body: "Body",
+          baseBranch: "main",
+        });
+        expect(createdUpstreamPr).toMatchObject({
+          status: "created",
+          url: "https://github.com/pingdotgg/t3code/pull/99",
+          number: 99,
+        });
+        expect(listed(defaultUpstream.providerCalls)).toMatchObject([
+          { headSelector: "feat/fork-pr", state: "open" },
+          { headSelector: "feat/fork-pr", state: "open" },
+        ]);
+        expect(
+          listed(defaultUpstream.providerCalls).every((call) => call.repository === undefined),
+        ).toBe(true);
+        expect(
+          defaultUpstream.providerCalls.filter((call) => call.operation === "createChangeRequest"),
+        ).toMatchObject([
+          {
+            baseRefName: "main",
+            headSelector: "syz51:feat/fork-pr",
+          },
+        ]);
+        expect(
+          defaultUpstream.providerCalls.find((call) => call.operation === "createChangeRequest")
+            ?.target,
+        ).toBeUndefined();
+
+        // A host that does not support explicit target repositories refuses before pushing.
+        yield* runGit(repoDir, ["checkout", "-b", "feat/unsupported-target", "origin/fork"]);
+        NodeFS.writeFileSync(NodePath.join(repoDir, "unsupported.txt"), "unsupported\n");
+        yield* runGit(repoDir, ["add", "unsupported.txt"]);
+        yield* runGit(repoDir, ["commit", "-m", "Unsupported target commit"]);
+        const unsupportedTarget = yield* makeManager({
+          providerScenario: { kind: "gitlab", supportsTargetRepository: false },
+        });
+        const unsupportedError = yield* Effect.flip(
+          unsupportedTarget.manager.createPullRequest({
+            cwd: repoDir,
+            projectId: ProjectId.make("project-1"),
+            title: "Unsupported",
+            body: "Body",
+            repository: "syz51/t3code",
+          }),
+        );
+        expect(unsupportedError.message).toContain("Nothing was pushed");
+        expect(
+          (yield* runGit(repoDir, [
+            "ls-remote",
+            "origin",
+            "refs/heads/feat/unsupported-target",
+          ])).stdout.trim(),
+        ).toBe("");
+        expect(created(unsupportedTarget.providerCalls)).toEqual([]);
+      }),
   );
 
   it.effect("generates PR content from the created worktree's selected remote base", () =>

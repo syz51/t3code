@@ -1253,6 +1253,8 @@ describe("source control tools", () => {
     Effect.gen(function* () {
       const opened: Array<{
         readonly cwd: string;
+        readonly baseBranch: string | undefined;
+        readonly repository: string | undefined;
         readonly draft: boolean | undefined;
         readonly private: boolean | undefined;
       }> = [];
@@ -1264,13 +1266,19 @@ describe("source control tools", () => {
         git: {
           createPullRequest: (input) =>
             Effect.sync(() =>
-              opened.push({ cwd: input.cwd, draft: input.draft, private: input.private }),
+              opened.push({
+                cwd: input.cwd,
+                baseBranch: input.baseBranch,
+                repository: input.repository,
+                draft: input.draft,
+                private: input.private,
+              }),
             ).pipe(
               Effect.as({
                 status: "created" as const,
-                url: "https://github.com/t3tools/t3code/pull/43",
+                url: `https://github.com/${input.repository ?? "t3tools/t3code"}/pull/43`,
                 number: 43,
-                baseBranch: "main",
+                baseBranch: input.baseBranch ?? "main",
                 headBranch: "tools",
                 title: input.title,
               }),
@@ -1283,11 +1291,82 @@ describe("source control tools", () => {
         draft: true,
         private: true,
       });
-      expect(result).toMatchObject({ number: 43, created: true });
-      expect(opened).toEqual([{ cwd: "/workspace/worktree", draft: true, private: true }]);
-      expect(yield* Ref.get(harness.commands)).toMatchObject([
-        { type: "thread.pull-request.link", number: 43, source: "created" },
+      expect(result).toMatchObject({ repository: "t3tools/t3code", number: 43, created: true });
+      expect(opened).toEqual([
+        {
+          cwd: "/workspace/worktree",
+          baseBranch: undefined,
+          repository: undefined,
+          draft: true,
+          private: true,
+        },
       ]);
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        {
+          type: "thread.pull-request.link",
+          repository: "t3tools/t3code",
+          number: 43,
+          source: "created",
+        },
+      ]);
+
+      // An explicit repository targets and links the named fork repository.
+      const forkResult = yield* harness.call("pull_request_create", {
+        title: "Fork change",
+        body: "Targets fork.",
+        base: "fork",
+        repository: "syz51/t3code",
+      });
+      expect(forkResult).toMatchObject({
+        host: "github.com",
+        repository: "syz51/t3code",
+        number: 43,
+        url: "https://github.com/syz51/t3code/pull/43",
+        created: true,
+      });
+      expect(opened[1]).toEqual({
+        cwd: "/workspace/worktree",
+        baseBranch: "fork",
+        repository: "syz51/t3code",
+        draft: undefined,
+        private: undefined,
+      });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        {
+          type: "thread.pull-request.link",
+          repository: "t3tools/t3code",
+          number: 43,
+          source: "created",
+        },
+        {
+          type: "thread.pull-request.link",
+          repository: "syz51/t3code",
+          number: 43,
+          url: "https://github.com/syz51/t3code/pull/43",
+          source: "created",
+        },
+      ]);
+
+      // Malformed repository values fail before pushing or opening a PR.
+      for (const badRepository of [
+        "github.com/syz51/t3code",
+        "https://github.com/syz51/t3code",
+        "syz51",
+        "syz51/t3code/extra",
+        "syz51/..",
+        "syz51/t3code?foo=bar",
+      ]) {
+        const error = yield* harness
+          .call("pull_request_create", {
+            title: "Bad repo",
+            body: "Should fail.",
+            repository: badRepository,
+          })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({ _tag: "PullRequestRepositoryInvalidError" });
+        expect(error.message).toContain("owner/repo");
+      }
+      expect(opened).toHaveLength(2);
     }),
   );
 

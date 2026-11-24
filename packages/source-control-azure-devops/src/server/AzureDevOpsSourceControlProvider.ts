@@ -126,6 +126,20 @@ export const make = Effect.gen(function* () {
     ),
     listChangeRequests: Effect.fn("AzureDevOpsSourceControlProvider.listChangeRequests")(
       function (input) {
+        if (input.repository !== undefined) {
+          return Effect.fail(
+            new SourceControlProviderError({
+              provider: SourceControlProviderKind.make("azure-devops"),
+              operation: "listChangeRequests",
+              cwd: input.cwd,
+              repository: SourceControlProvider.transportSafeSourceControlErrorValue(
+                input.repository,
+              ),
+              detail:
+                "Targeting an explicit repository when creating an Azure DevOps pull request is not supported yet.",
+            }),
+          );
+        }
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         return azure
           .listPullRequests({
@@ -179,8 +193,23 @@ export const make = Effect.gen(function* () {
       },
     ),
     createsDraftChangeRequests: true,
+    supportsTargetRepository: false,
     createChangeRequest: Effect.fn("AzureDevOpsSourceControlProvider.createChangeRequest")(
       function (input) {
+        if (input.target?.repository !== undefined) {
+          return Effect.fail(
+            new SourceControlProviderError({
+              provider: SourceControlProviderKind.make("azure-devops"),
+              operation: "createChangeRequest",
+              cwd: input.cwd,
+              repository: SourceControlProvider.transportSafeSourceControlErrorValue(
+                input.target.repository,
+              ),
+              detail:
+                "Targeting an explicit repository when creating an Azure DevOps pull request is not supported yet.",
+            }),
+          );
+        }
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         return azure
           .createPullRequest({

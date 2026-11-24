@@ -550,6 +550,20 @@ export function pullRequestCheckoutBranchName(input: {
 const contextHost = (context: SourceControlProvider.SourceControlProviderContext | undefined) =>
   context === undefined ? undefined : new URL(context.provider.baseUrl).host;
 
+function parseGitHubTargetRepository(
+  repository: string,
+  host: string,
+): GitHubRepositoryLocator | null {
+  const segments = repository.trim().split("/");
+  if (
+    segments.length !== 2 ||
+    !segments.every((segment) => /^[\w.-]+$/u.test(segment) && segment !== "." && segment !== "..")
+  ) {
+    return null;
+  }
+  return { host, owner: segments[0]!, name: segments[1]! };
+}
+
 export const make = Effect.gen(function* () {
   const api = yield* GitHubRest.GitHubRest;
   const sourceControlHost = yield* SourceControlHost.SourceControlHost;
@@ -613,6 +627,25 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const resolveTargetRepository = Effect.fn("GitHubSourceControlProvider.resolveTargetRepository")(
+    function* (
+      input: {
+        readonly cwd: string;
+        readonly host?: string | undefined;
+        readonly context?: SourceControlProvider.SourceControlProviderContext | undefined;
+      },
+      repository: string | undefined,
+    ) {
+      const base = yield* resolveRepository(input);
+      if (repository === undefined) return base;
+      const locator = parseGitHubTargetRepository(repository, base.host);
+      if (locator === null) {
+        return yield* failure("Pass repository as owner/repo, without the host.");
+      }
+      return locator;
+    },
+  );
+
   const client = yield* GraphQLClient.make(
     GraphQLGroup.make(LenientPullRequestsByHead, PullRequestByNumber).middleware(
       GitHubGraphQlClient.GitHubGraphQlAuth,
@@ -658,12 +691,7 @@ export const make = Effect.gen(function* () {
     readonly repository?: string | undefined;
     readonly allowReserve: boolean;
   }) {
-    const base = yield* resolveRepository(input);
-    const locator =
-      input.repository === undefined
-        ? base
-        : parseGitHubRepositorySelector(input.repository, base.host);
-    if (locator === null) return yield* failure(`${input.repository} is not a GitHub repository.`);
+    const locator = yield* resolveTargetRepository(input, input.repository);
     const limit = Math.min(Math.max(Math.trunc(input.limit), 1), 100);
     const ownerMatch = /^([^:/\s]+):(.+)$/u.exec(input.headSelector.trim());
     const headRefName = ownerMatch?.[2] ?? input.headSelector.trim();
@@ -1120,7 +1148,7 @@ export const make = Effect.gen(function* () {
     createsDraftChangeRequests: true,
     createChangeRequest: Effect.fn("GitHubSourceControlProvider.createChangeRequest")(
       function* (input) {
-        const locator = yield* resolveRepository(input);
+        const locator = yield* resolveTargetRepository(input, input.target?.repository);
         const body = yield* fileSystem
           .readFileString(input.bodyFile)
           .pipe(
@@ -1136,7 +1164,7 @@ export const make = Effect.gen(function* () {
           path: `repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}/pulls`,
           // Explicitly allow maintainer edits to match gh; the API default is undocumented.
           body: {
-            base: input.baseRefName,
+            base: input.target?.refName ?? input.baseRefName,
             head: input.headSelector,
             title: input.title,
             body,
@@ -1240,11 +1268,14 @@ export const make = Effect.gen(function* () {
     ),
     getDefaultBranch: Effect.fn("GitHubSourceControlProvider.getDefaultBranch")(
       function* (input) {
-        const locator = yield* resolveRepository({
-          cwd: input.cwd,
-          host: contextHost(input.context),
-          context: input.context,
-        });
+        const locator = yield* resolveTargetRepository(
+          {
+            cwd: input.cwd,
+            host: contextHost(input.context),
+            context: input.context,
+          },
+          input.repository,
+        );
         const repository = yield* readRepository(locator);
         const branch = repository.default_branch?.trim() ?? "";
         return branch.length > 0 ? branch : null;

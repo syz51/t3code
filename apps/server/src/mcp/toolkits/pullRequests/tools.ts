@@ -689,6 +689,7 @@ const CreatePullRequestTool = Tool.make("pull_request_create", {
     title: TrimmedNonEmptyString,
     body: Schema.String,
     base: Schema.optional(TrimmedNonEmptyString),
+    repository: Schema.optional(TrimmedNonEmptyString),
     draft: Schema.optional(Schema.Boolean),
     private: Schema.optional(Schema.Boolean).annotate({
       description:

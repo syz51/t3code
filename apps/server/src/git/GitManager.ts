@@ -204,6 +204,8 @@ export class GitManager extends Context.Service<
       readonly title: string;
       readonly body: string;
       readonly baseBranch?: string | undefined;
+      /** `owner/repo` on the checkout's host to open the pull request in instead of the default target. */
+      readonly repository?: string | undefined;
       readonly draft?: boolean | undefined;
       /**
        * Opens it where only people with write access see it. The branch goes to the host's
@@ -1942,7 +1944,12 @@ export const make = Effect.gen(function* () {
 
   const resolveBranchHeadContext = Effect.fn("resolveBranchHeadContext")(function* (
     cwd: string,
-    details: { branch: string; upstreamRef: string | null; remoteName?: string },
+    details: {
+      branch: string;
+      upstreamRef: string | null;
+      remoteName?: string;
+      targetRepository?: string | undefined;
+    },
   ) {
     const branchRemote =
       details.remoteName ??
@@ -1976,16 +1983,20 @@ export const make = Effect.gen(function* () {
     const isForeignRemote = remoteName !== null && remoteName !== "origin" && !isOnlyRemote;
 
     const isCrossRepository =
-      (remoteRepository.repositoryNameWithOwner !== null &&
-      originRepository.repositoryNameWithOwner !== null
-        ? remoteRepository.repositoryNameWithOwner.toLowerCase() !==
-          originRepository.repositoryNameWithOwner.toLowerCase()
-        : isForeignRemote && remoteRepository.repositoryNameWithOwner !== null) ||
-      // A fork as origin, with the host targeting another remote such as upstream.
-      (remoteName !== null &&
-        !isOnlyRemote &&
-        remoteRepository.repositoryNameWithOwner !== null &&
-        !(yield* targetsRemote(cwd, remoteName, remoteRepository)));
+      details.targetRepository !== undefined
+        ? remoteRepository.repositoryNameWithOwner !== null &&
+          remoteRepository.repositoryNameWithOwner.toLowerCase() !==
+            details.targetRepository.toLowerCase()
+        : (remoteRepository.repositoryNameWithOwner !== null &&
+          originRepository.repositoryNameWithOwner !== null
+            ? remoteRepository.repositoryNameWithOwner.toLowerCase() !==
+              originRepository.repositoryNameWithOwner.toLowerCase()
+            : isForeignRemote && remoteRepository.repositoryNameWithOwner !== null) ||
+          // A fork as origin, with the host targeting another remote such as upstream.
+          (remoteName !== null &&
+            !isOnlyRemote &&
+            remoteRepository.repositoryNameWithOwner !== null &&
+            !(yield* targetsRemote(cwd, remoteName, remoteRepository)));
 
     const ownerHeadSelector =
       remoteRepository.ownerLogin && headBranch.length > 0
@@ -2247,6 +2258,7 @@ export const make = Effect.gen(function* () {
       | "isCrossRepository"
     >,
     ownerHeadSelector?: string,
+    repository?: string,
   ) {
     const provider = yield* sourceControlProvider(cwd);
     const probe = headBranchProbe(provider, headContext.headSelectors, "open", ownerHeadSelector);
@@ -2256,6 +2268,7 @@ export const make = Effect.gen(function* () {
         headSelector,
         state: "open",
         limit: probe.limit,
+        ...(repository === undefined ? {} : { repository }),
       });
       const normalizedPullRequests = pullRequests.map(toPullRequestInfo);
 
@@ -2451,6 +2464,7 @@ export const make = Effect.gen(function* () {
     branch: string,
     upstreamRef: string | null,
     headContext: Pick<BranchHeadContext, "isCrossRepository" | "remoteName">,
+    targetRepository?: string,
   ) {
     const configuredRef = yield* gitCore.readConfigValue(cwd, `branch.${branch}.t3-merge-base-ref`);
     if (configuredRef?.startsWith("refs/heads/") || configuredRef?.startsWith("refs/remotes/")) {
@@ -2491,7 +2505,12 @@ export const make = Effect.gen(function* () {
     }
 
     const defaultFromProvider = yield* sourceControlProvider(cwd).pipe(
-      Effect.flatMap((provider) => provider.getDefaultBranch({ cwd })),
+      Effect.flatMap((provider) =>
+        provider.getDefaultBranch({
+          cwd,
+          ...(targetRepository === undefined ? {} : { repository: targetRepository }),
+        }),
+      ),
       Effect.orElseSucceed(() => null),
     );
     if (defaultFromProvider) {
@@ -2720,6 +2739,8 @@ export const make = Effect.gen(function* () {
     cwd: string,
     status: { branch: string; upstreamRef: string | null; hasUpstream: boolean },
     changeRequestLabel: string,
+    targetRepository?: string,
+    requestedBase?: string,
   ) {
     const target = yield* gitCore.resolvePushTarget(cwd, status);
     if (!target) return;
@@ -2727,16 +2748,15 @@ export const make = Effect.gen(function* () {
       branch: status.branch,
       upstreamRef: `${target.remoteName}/${target.branchName}`,
       remoteName: target.remoteName,
+      targetRepository,
     });
     if (headContext.isCrossRepository) return;
-    const { baseBranch } = yield* resolvePrBase(
-      cwd,
-      status.branch,
-      status.upstreamRef,
-      headContext,
-    );
+    const baseBranch =
+      requestedBase ??
+      (yield* resolvePrBase(cwd, status.branch, status.upstreamRef, headContext, targetRepository))
+        .baseBranch;
     if (baseBranch !== target.branchName) return;
-    if (yield* findOpenPr(cwd, headContext)) return;
+    if (yield* findOpenPr(cwd, headContext, undefined, targetRepository)) return;
     return yield* new GitManagerError({
       operation: "runStackedAction",
       cwd,
@@ -2757,6 +2777,7 @@ export const make = Effect.gen(function* () {
       readonly baseRef: string;
       readonly headBranch: string;
     }) => Effect.Effect<{ readonly title: string; readonly body: string }, E>,
+    targetRepository?: string,
   ) {
     const provider = yield* sourceControlProvider(cwd);
     const terms = sourceControlDefinitions.get(provider.kind).changeRequest;
@@ -2781,10 +2802,12 @@ export const make = Effect.gen(function* () {
     // tracking its upstream, so the PR head is the push remote's branch.
     const headContext = yield* resolveBranchHeadContext(
       cwd,
-      pushRemoteRef ? { branch, ...pushRemoteRef } : { branch, upstreamRef: details.upstreamRef },
+      pushRemoteRef
+        ? { branch, ...pushRemoteRef, targetRepository }
+        : { branch, upstreamRef: details.upstreamRef, targetRepository },
     );
 
-    const existing = yield* findOpenPr(cwd, headContext);
+    const existing = yield* findOpenPr(cwd, headContext, undefined, targetRepository);
     if (existing) {
       return {
         status: "opened_existing" as const,
@@ -2805,12 +2828,15 @@ export const make = Effect.gen(function* () {
         detail: `The branch has ${details.aheadCount} unpushed commit${details.aheadCount === 1 ? "" : "s"}. Push before opening the PR.`,
       });
     }
-    const resolved = yield* resolvePrBase(cwd, branch, details.upstreamRef, headContext);
-    const baseBranch = requestedBase ?? resolved.baseBranch;
+    const resolved =
+      requestedBase === undefined
+        ? yield* resolvePrBase(cwd, branch, details.upstreamRef, headContext, targetRepository)
+        : null;
+    const baseBranch = requestedBase ?? resolved!.baseBranch;
     const generated = yield* content({
       provider,
       baseBranch,
-      baseRef: requestedBase ?? resolved.baseRef,
+      baseRef: requestedBase ?? resolved!.baseRef,
       headBranch: headContext.headBranch,
     });
     const bodyFile = path.join(
@@ -2848,6 +2874,14 @@ export const make = Effect.gen(function* () {
               },
             }
           : {}),
+        ...(targetRepository !== undefined
+          ? {
+              target: {
+                repository: targetRepository,
+                refName: baseBranch,
+              },
+            }
+          : {}),
         title: generated.title,
         bodyFile,
         ...(draft ? { draft: true } : {}),
@@ -2855,7 +2889,7 @@ export const make = Effect.gen(function* () {
       .pipe(Effect.ensuring(fileSystem.remove(bodyFile).pipe(Effect.ignore)));
 
     // The PR already exists at this point, so a failed lookup only loses its metadata.
-    const created = yield* findOpenPr(cwd, headContext).pipe(
+    const created = yield* findOpenPr(cwd, headContext, undefined, targetRepository).pipe(
       Effect.catch((error) =>
         Effect.logWarning("GitManager.runPrStep lookup after create failed", {
           provider: provider.kind,
@@ -2955,19 +2989,29 @@ export const make = Effect.gen(function* () {
     const status = yield* gitCore.statusDetails(cwd);
     const branch = status.branch;
     if (!branch) return yield* fail("Cannot create a pull request from detached HEAD.");
-    const resolved = yield* resolvePrBase(cwd, branch, status.upstreamRef, {
-      isCrossRepository: false,
-      remoteName: publishedRemoteName(
-        yield* readConfigValueNullable(cwd, `branch.${branch}.remote`),
-      ),
-    });
-    const baseBranch = input.baseBranch ?? resolved.baseBranch;
+    const baseBranch =
+      input.baseBranch ??
+      (yield* resolvePrBase(
+        cwd,
+        branch,
+        status.upstreamRef,
+        {
+          isCrossRepository: false,
+          remoteName: publishedRemoteName(
+            yield* readConfigValueNullable(cwd, `branch.${branch}.remote`),
+          ),
+        },
+        input.repository,
+      )).baseBranch;
     if (baseBranch === branch) {
       return yield* fail(
         `${branch} is the base branch. Check out a feature branch to create ${terms.shortLabelWithArticle}.`,
       );
     }
-    const companion = yield* provider.privateChangeRequestRemote({ cwd });
+    const companion = yield* provider.privateChangeRequestRemote({
+      cwd,
+      ...(input.repository === undefined ? {} : { repository: input.repository }),
+    });
     const remoteName = yield* gitCore.ensureRemote({
       cwd,
       preferredName: companion.repository.split("/")[0] || "private",
@@ -2998,7 +3042,12 @@ export const make = Effect.gen(function* () {
       .setBranchUpstream({ cwd, branch, remoteName, remoteBranch: branch })
       .pipe(Effect.ensuring(invalidateStatus(cwd)));
     const findOpen = provider
-      .listChangeRequests({ cwd, headSelector: branch, state: "open" })
+      .listChangeRequests({
+        cwd,
+        headSelector: branch,
+        state: "open",
+        ...(input.repository === undefined ? {} : { repository: input.repository }),
+      })
       .pipe(
         Effect.map(
           (listed) =>
@@ -3035,6 +3084,9 @@ export const make = Effect.gen(function* () {
         cwd,
         baseRefName: baseBranch,
         headSelector: branch,
+        ...(input.repository === undefined
+          ? {}
+          : { target: { repository: input.repository, refName: baseBranch } }),
         title: input.title,
         bodyFile,
         private: true,
@@ -3055,9 +3107,25 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const ensureTargetRepositorySupported = Effect.fn("GitManager.ensureTargetRepositorySupported")(
+    function* (cwd: string, repository: string | undefined) {
+      if (repository === undefined) return;
+      const provider = yield* sourceControlProvider(cwd);
+      if (provider.supportsTargetRepository === false) {
+        const definition = sourceControlDefinitions.get(provider.kind);
+        return yield* new GitManagerError({
+          operation: "createPullRequest",
+          cwd,
+          detail: `Targeting an explicit repository when creating ${definition.changeRequest.shortLabelWithArticle} on ${definition.label} is not supported yet. Nothing was pushed.`,
+        });
+      }
+    },
+  );
+
   const pushAndOpenPullRequest = Effect.fn("GitManager.pushAndOpenPullRequest")(function* (
     input: Parameters<GitManager["Service"]["createPullRequest"]>[0],
   ) {
+    yield* ensureTargetRepositorySupported(input.cwd, input.repository);
     const status = yield* gitCore.statusDetails(input.cwd);
     const needsPush = yield* createPrNeedsPush(input.cwd, status);
     if (needsPush && status.branch) {
@@ -3065,6 +3133,8 @@ export const make = Effect.gen(function* () {
         input.cwd,
         { ...status, branch: status.branch },
         (yield* changeRequestTermsFor(input.cwd)).shortLabelWithArticle,
+        input.repository,
+        input.baseBranch,
       );
     }
     const push = needsPush
@@ -3099,6 +3169,7 @@ export const make = Effect.gen(function* () {
         input.baseBranch,
         input.draft === true,
         () => Effect.succeed({ title: input.title, body: input.body }),
+        input.repository,
       );
     }).pipe(
       // A push changes the ahead count, and a new PR changes the branch's PR lookup, so

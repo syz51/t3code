@@ -55,6 +55,7 @@ export const make = Effect.gen(function* () {
             ...(source ? { source } : {}),
             state: input.state,
             ...(input.limit !== undefined ? { limit: input.limit } : {}),
+            ...(input.repository !== undefined ? { repository: input.repository } : {}),
           })
           .pipe(
             Effect.map((items) => items.map(toChangeRequest)),
@@ -67,7 +68,7 @@ export const make = Effect.gen(function* () {
                   reference: SourceControlProvider.transportSafeSourceControlErrorValue(
                     input.headSelector,
                   ),
-                  detail: "Failed to list change requests.",
+                  detail: repositoryDetail(error, "Failed to list change requests."),
                   cause: error,
                 }),
             ),
@@ -118,7 +119,7 @@ export const make = Effect.gen(function* () {
                   reference: SourceControlProvider.transportSafeSourceControlErrorValue(
                     input.headSelector,
                   ),
-                  detail: "Failed to create change request.",
+                  detail: repositoryDetail(error, "Failed to create change request."),
                   cause: error,
                 }),
             ),
@@ -169,6 +170,7 @@ export const make = Effect.gen(function* () {
           .getDefaultBranch({
             cwd: input.cwd,
             ...(input.context ? { context: input.context } : {}),
+            ...(input.repository !== undefined ? { repository: input.repository } : {}),
           })
           .pipe(
             Effect.mapError(
@@ -177,7 +179,7 @@ export const make = Effect.gen(function* () {
                   provider: SourceControlProviderKind.make("bitbucket"),
                   operation: "getDefaultBranch",
                   cwd: input.cwd,
-                  detail: "Failed to get default branch.",
+                  detail: repositoryDetail(error, "Failed to get default branch."),
                   cause: error,
                 }),
             ),

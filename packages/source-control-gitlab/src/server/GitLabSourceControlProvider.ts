@@ -256,6 +256,20 @@ export const make = Effect.gen(function* () {
     },
     listChangeRequests: Effect.fn("GitLabSourceControlProvider.listChangeRequests")(
       function (input) {
+        if (input.repository !== undefined) {
+          return Effect.fail(
+            new SourceControlProviderError({
+              provider: SourceControlProviderKind.make("gitlab"),
+              operation: "listChangeRequests",
+              cwd: input.cwd,
+              repository: SourceControlProvider.transportSafeSourceControlErrorValue(
+                input.repository,
+              ),
+              detail:
+                "Targeting an explicit repository when creating a GitLab merge request is not supported yet.",
+            }),
+          );
+        }
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         return gitlab
           .listMergeRequests({
@@ -304,8 +318,23 @@ export const make = Effect.gen(function* () {
       );
     }),
     createsDraftChangeRequests: true,
+    supportsTargetRepository: false,
     createChangeRequest: Effect.fn("GitLabSourceControlProvider.createChangeRequest")(
       function (input) {
+        if (input.target?.repository !== undefined) {
+          return Effect.fail(
+            new SourceControlProviderError({
+              provider: SourceControlProviderKind.make("gitlab"),
+              operation: "createChangeRequest",
+              cwd: input.cwd,
+              repository: SourceControlProvider.transportSafeSourceControlErrorValue(
+                input.target.repository,
+              ),
+              detail:
+                "Targeting an explicit repository when creating a GitLab merge request is not supported yet.",
+            }),
+          );
+        }
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         return gitlab
           .createMergeRequest({
