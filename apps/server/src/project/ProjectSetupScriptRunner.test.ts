@@ -2,7 +2,11 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import {
+  DEFAULT_SERVER_SETTINGS,
   ProjectId,
+  type ProjectScript,
+  type ServerSettings as ServerSettingsType,
+  type T3ProjectFile,
   TerminalNotRunningError,
   type TerminalEvent,
   type TerminalOpenInput,
@@ -12,7 +16,10 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -23,6 +30,7 @@ import * as TerminalManager from "../terminal/Manager.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectService from "./ProjectService.ts";
 import * as ProjectSetupScriptRunner from "./ProjectSetupScriptRunner.ts";
+import * as T3ProjectFileLoader from "./T3ProjectFileLoader.ts";
 
 const threadId = "thread-1";
 const terminalId = "setup-setup";
@@ -48,10 +56,22 @@ const makeHarness = Effect.fn(function* (options: {
   readonly opening?: Deferred.Deferred<void>;
   readonly previousSession?: TerminalSessionSnapshot;
   readonly shell?: string | null;
+  readonly scripts?: ReadonlyArray<ProjectScript>;
+  readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
+  readonly rawServerSettings?: ServerSettingsType;
+  readonly projectFile?: T3ProjectFile | null;
+  readonly trigger?: "setup" | "settle";
+  readonly runtimeMode?: "full-access" | "auto" | "auto-accept-edits" | "approval-required" | null;
+  readonly linkOrigin?: {
+    readonly linkId: string;
+    readonly label: string;
+    readonly access?: "full-access" | "restricted";
+  };
 }) {
   const listeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
   const opens: TerminalOpenInput[] = [];
   const openedSessions: TerminalSessionSnapshot[] = [];
+  const loadedProjectFileRoots: string[] = [];
   let session = options.previousSession;
   const writes = yield* Queue.unbounded<string>();
   const outputLines = yield* Queue.unbounded<string>();
@@ -97,10 +117,35 @@ const makeHarness = Effect.fn(function* (options: {
       Layer.mergeAll(
         terminals,
         Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(ProjectionStore.ProjectionStoreV2)({
-          getThreadShell: () => Effect.succeed(null),
+        Layer.mock(T3ProjectFileLoader.T3ProjectFileLoader)({
+          load: (workspaceRoot) =>
+            Effect.sync(() => {
+              loadedProjectFileRoots.push(workspaceRoot);
+              return Option.fromNullishOr(options.projectFile);
+            }),
         }),
-        ServerSettings.layerTest(),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadShell: () =>
+            Effect.succeed(
+              options.linkOrigin === undefined && options.runtimeMode === undefined
+                ? null
+                : options.runtimeMode === null
+                  ? null
+                  : ({
+                      ...(options.runtimeMode === undefined
+                        ? {}
+                        : { runtimeMode: options.runtimeMode }),
+                      ...(options.linkOrigin === undefined
+                        ? {}
+                        : { linkOrigin: options.linkOrigin }),
+                    } as never),
+            ),
+        }),
+        options.rawServerSettings === undefined
+          ? ServerSettings.layerTest(options.serverSettings)
+          : Layer.mock(ServerSettings.ServerSettingsService)({
+              getSettings: Effect.succeed(options.rawServerSettings),
+            }),
         NodeCrypto.layer,
       ),
     ),
@@ -108,11 +153,12 @@ const makeHarness = Effect.fn(function* (options: {
   const start = runner.runForThread({
     threadId,
     worktreePath: "/repo/.t3/worktrees/feature",
+    ...(options.trigger === undefined ? {} : { trigger: options.trigger }),
     observeCompletion: { onOutputLine: (line) => Queue.offer(outputLines, line) },
     project: {
       id: ProjectId.make("project-1"),
       workspaceRoot: "/repo",
-      scripts: [
+      scripts: options.scripts ?? [
         {
           id: "setup",
           name: "Setup",
@@ -125,7 +171,16 @@ const makeHarness = Effect.fn(function* (options: {
   });
   const emit = (terminalEvent: TerminalEvent) =>
     Effect.forEach([...listeners], (listener) => listener(terminalEvent), { discard: true });
-  return { start, listeners, writes, outputLines, emit, openedSessions, opens };
+  return {
+    start,
+    listeners,
+    writes,
+    outputLines,
+    emit,
+    openedSessions,
+    opens,
+    loadedProjectFileRoots,
+  };
 });
 
 const setup = Effect.fn(function* (
@@ -310,6 +365,295 @@ describe("ProjectSetupScriptRunner", () => {
         expect(yield* Queue.size(writes)).toBe(0);
         expect(listeners.size).toBe(0);
       }),
+  );
+
+  it.effect(
+    "falls back to the project checkout's t3.json setup script for full-access threads when none is imported",
+    () =>
+      Effect.gen(function* () {
+        const { start, opens, loadedProjectFileRoots } = yield* makeHarness({
+          scripts: [],
+          runtimeMode: "full-access",
+          serverSettings: { projectSettingsFolded: true },
+          projectFile: {
+            scripts: [
+              { name: "Dev", command: "vp run dev", icon: "play" },
+              {
+                name: "Setup Worktree",
+                command: "bun scripts/setup-worktree.ts",
+                icon: "configure",
+                runOnWorktreeCreate: true,
+                async: false,
+              },
+            ],
+          },
+        });
+        const result = yield* start;
+        expect(loadedProjectFileRoots).toEqual(["/repo"]);
+        expect(result).toMatchObject({
+          status: "started",
+          scriptId: "setup-worktree",
+          scriptName: "Setup Worktree",
+          scriptCommand: "bun scripts/setup-worktree.ts",
+          terminalId: "setup-setup-worktree",
+          async: false,
+        });
+        expect(opens[0]?.env).toMatchObject({
+          T3CODE_PROJECT_ROOT: "/repo",
+          T3CODE_WORKTREE_PATH: "/repo/.t3/worktrees/feature",
+        });
+      }),
+  );
+
+  it.effect("falls back to t3.json when a legacy project script override was reset to null", () =>
+    Effect.gen(function* () {
+      const { start, loadedProjectFileRoots } = yield* makeHarness({
+        runtimeMode: "full-access",
+        scripts: [
+          {
+            id: "legacy-dev",
+            name: "Legacy Dev",
+            command: "vp run dev",
+            icon: "play",
+            runOnWorktreeCreate: false,
+          },
+        ],
+        rawServerSettings: {
+          ...DEFAULT_SERVER_SETTINGS,
+          projectSettingsFolded: false,
+          projectScriptOverrides: {
+            [ProjectId.make("project-1")]: null,
+          },
+        },
+        projectFile: {
+          scripts: [
+            {
+              name: "Setup Worktree",
+              command: "bun scripts/setup-worktree.ts",
+              runOnWorktreeCreate: true,
+            },
+          ],
+        },
+      });
+      const result = yield* start;
+      expect(loadedProjectFileRoots).toEqual(["/repo"]);
+      expect(result).toMatchObject({
+        status: "started",
+        scriptId: "setup-worktree",
+        scriptCommand: "bun scripts/setup-worktree.ts",
+      });
+    }),
+  );
+
+  it.effect("skips unimported t3.json setup scripts for non-full-access or missing threads", () =>
+    Effect.gen(function* () {
+      const projectFile: T3ProjectFile = {
+        scripts: [
+          {
+            name: "Setup Worktree",
+            command: "bun scripts/setup-worktree.ts",
+            runOnWorktreeCreate: true,
+          },
+        ],
+      };
+      for (const runtimeMode of ["approval-required", "auto-accept-edits", "auto", null] as const) {
+        const { start, opens, loadedProjectFileRoots } = yield* makeHarness({
+          scripts: [],
+          runtimeMode,
+          serverSettings: { projectSettingsFolded: true },
+          projectFile,
+        });
+        expect(yield* start).toEqual({ status: "no-script" });
+        expect(loadedProjectFileRoots).toEqual([]);
+        expect(opens).toEqual([]);
+      }
+    }),
+  );
+
+  it.effect(
+    "respects an explicit empty project script override instead of falling back to t3.json",
+    () =>
+      Effect.gen(function* () {
+        const { start, opens, loadedProjectFileRoots } = yield* makeHarness({
+          scripts: [],
+          runtimeMode: "full-access",
+          serverSettings: {
+            projectSettingsFolded: true,
+            projectSettingsOverrides: {
+              [ProjectId.make("project-1")]: { defaultProjectScripts: [] },
+            },
+          },
+          projectFile: {
+            scripts: [
+              {
+                name: "Setup Worktree",
+                command: "bun scripts/setup-worktree.ts",
+                runOnWorktreeCreate: true,
+              },
+            ],
+          },
+        });
+        const result = yield* start;
+        expect(result).toEqual({ status: "no-script" });
+        expect(loadedProjectFileRoots).toEqual([]);
+        expect(opens).toEqual([]);
+      }),
+  );
+
+  it.effect("prefers a configured environment setup script over t3.json", () =>
+    Effect.gen(function* () {
+      const { start, loadedProjectFileRoots } = yield* makeHarness({
+        scripts: [],
+        runtimeMode: "full-access",
+        serverSettings: {
+          projectSettingsFolded: true,
+          defaultProjectScripts: [
+            {
+              id: "env-setup",
+              name: "Env Setup",
+              command: "echo env-setup",
+              icon: "configure",
+              runOnWorktreeCreate: true,
+            },
+          ],
+        },
+        projectFile: {
+          scripts: [
+            {
+              name: "Setup Worktree",
+              command: "bun scripts/setup-worktree.ts",
+              runOnWorktreeCreate: true,
+            },
+          ],
+        },
+      });
+      const result = yield* start;
+      expect(result).toMatchObject({
+        status: "started",
+        scriptId: "env-setup",
+        scriptCommand: "echo env-setup",
+      });
+      expect(loadedProjectFileRoots).toEqual([]);
+    }),
+  );
+
+  it.effect("does not fall back to t3.json for settle triggers or fenced links", () =>
+    Effect.gen(function* () {
+      const projectFile: T3ProjectFile = {
+        scripts: [
+          {
+            name: "Setup Worktree",
+            command: "bun scripts/setup-worktree.ts",
+            runOnWorktreeCreate: true,
+            runOnSettle: true,
+          },
+        ],
+      };
+      const settleHarness = yield* makeHarness({
+        scripts: [],
+        runtimeMode: "full-access",
+        serverSettings: { projectSettingsFolded: true },
+        projectFile,
+        trigger: "settle",
+      });
+      expect(yield* settleHarness.start).toEqual({ status: "no-script" });
+      expect(settleHarness.loadedProjectFileRoots).toEqual([]);
+
+      const fencedHarness = yield* makeHarness({
+        scripts: [],
+        runtimeMode: "full-access",
+        serverSettings: { projectSettingsFolded: true },
+        projectFile,
+        linkOrigin: { linkId: "link-1", label: "Peer", access: "restricted" },
+      });
+      expect(yield* fencedHarness.start).toEqual({ status: "skipped-for-link" });
+      expect(fencedHarness.loadedProjectFileRoots).toEqual([]);
+    }),
+  );
+
+  it.effect(
+    "reads t3.json from project.workspaceRoot rather than worktreePath via T3ProjectFileLoader",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-setup-t3json-" });
+        const projectRoot = path.join(root, "project");
+        const worktreeRoot = path.join(root, "worktree");
+        yield* fs.makeDirectory(projectRoot, { recursive: true });
+        yield* fs.makeDirectory(worktreeRoot, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(projectRoot, "t3.json"),
+          JSON.stringify({
+            scripts: [
+              {
+                name: "Setup Worktree",
+                command: "bun scripts/setup-worktree.ts",
+                icon: "configure",
+                runOnWorktreeCreate: true,
+              },
+            ],
+          }),
+        );
+        yield* fs.writeFileString(
+          path.join(worktreeRoot, "t3.json"),
+          JSON.stringify({
+            scripts: [
+              {
+                name: "Untrusted Worktree Script",
+                command: "echo untrusted",
+                runOnWorktreeCreate: true,
+              },
+            ],
+          }),
+        );
+        const opens: TerminalOpenInput[] = [];
+        const runner = yield* ProjectSetupScriptRunner.make.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.mock(TerminalManager.TerminalManager)({
+                open: (input) =>
+                  Effect.sync(() => opens.push(input)).pipe(Effect.as(openSnapshot(""))),
+                getShell: () => Effect.succeed("/bin/zsh"),
+                subscribe: () => Effect.succeed(() => {}),
+                write: () => Effect.void,
+                close: () => Effect.void,
+                closeIdle: () => Effect.void,
+                closeOnSettle: () => Effect.void,
+              }),
+              Layer.mock(ProjectService.ProjectService)({}),
+              T3ProjectFileLoader.layer,
+              Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getThreadShell: () => Effect.succeed({ runtimeMode: "full-access" } as never),
+              }),
+              ServerSettings.layerTest({ projectSettingsFolded: true }),
+              NodeCrypto.layer,
+            ),
+          ),
+        );
+        const result = yield* runner.runForThread({
+          threadId,
+          worktreePath: worktreeRoot,
+          project: {
+            id: ProjectId.make("project-real-t3json"),
+            workspaceRoot: projectRoot,
+            scripts: [],
+          },
+        });
+        expect(result).toMatchObject({
+          status: "started",
+          scriptId: "setup-worktree",
+          scriptName: "Setup Worktree",
+          scriptCommand: "bun scripts/setup-worktree.ts",
+          terminalId: "setup-setup-worktree",
+          async: true,
+        });
+        expect(opens[0]?.cwd).toBe(worktreeRoot);
+        expect(opens[0]?.env).toMatchObject({
+          T3CODE_PROJECT_ROOT: projectRoot,
+          T3CODE_WORKTREE_PATH: worktreeRoot,
+        });
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
 
