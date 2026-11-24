@@ -1,5 +1,4 @@
 import * as NodeOS from "node:os";
-import * as NodeSqlite from "node:sqlite";
 import * as NodeZlib from "node:zlib";
 
 import {
@@ -27,11 +26,13 @@ import * as Path from "effect/Path";
 import * as Pull from "effect/Pull";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import { splitsSurrogatePair } from "@t3tools/shared/assistantCitations";
 import { isBareGitConfig, parseOriginUrlFromGitConfig } from "@t3tools/shared/git";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { repositoryPathFromRemoteUrl } from "@t3tools/source-control-core/server/SourceControlProvider";
 
@@ -1585,33 +1586,37 @@ export const make = Effect.gen(function* () {
   ) {
     const rootsByThread = new Map<string, Array<string>>();
     const databasePath = path.join(homePath, CODEX_STATE_DATABASE);
-    return yield* Effect.try({
-      try: () => {
-        const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
-        try {
-          database.exec("PRAGMA busy_timeout = 100");
-          const rows = database
-            .prepare(
-              `SELECT threads.id AS id, project_roots.path AS path
-               FROM threads JOIN project_roots ON project_roots.project_id = threads.project_id
-               ORDER BY threads.rowid DESC, project_roots.position LIMIT ?`,
-            )
-            .all(MAX_CODEX_PROJECT_ROOT_ROWS);
-          for (const { id, path: root } of rows) {
-            if (typeof id !== "string" || typeof root !== "string" || root.trim().length === 0) {
-              continue;
-            }
-            const roots = rootsByThread.get(id);
-            if (roots === undefined) rootsByThread.set(id, [root]);
-            else roots.push(root);
-          }
-          return rootsByThread;
-        } finally {
-          database.close();
+    if (!(yield* fileSystem.exists(databasePath).pipe(Effect.orElseSucceed(() => false)))) {
+      return rootsByThread;
+    }
+    return yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly id: unknown; readonly path: unknown }>`
+        SELECT threads.id AS id, project_roots.path AS path
+        FROM threads JOIN project_roots ON project_roots.project_id = threads.project_id
+        ORDER BY threads.rowid DESC, project_roots.position LIMIT ${MAX_CODEX_PROJECT_ROOT_ROWS}
+      `;
+      for (const { id, path: root } of rows) {
+        if (typeof id !== "string" || typeof root !== "string" || root.trim().length === 0) {
+          continue;
         }
-      },
-      catch: (cause) => new CodexStateReadError({ databasePath, cause }),
-    }).pipe(Effect.orElseSucceed((): ReadonlyMap<string, ReadonlyArray<string>> => new Map()));
+        const roots = rootsByThread.get(id);
+        if (roots === undefined) rootsByThread.set(id, [root]);
+        else roots.push(root);
+      }
+      return rootsByThread;
+    }).pipe(
+      Effect.provide(
+        NodeSqliteClient.layer({
+          filename: databasePath,
+          readonly: true,
+          writerWorker: true,
+          busyTimeoutMs: 100,
+        }),
+      ),
+      Effect.mapError((cause) => new CodexStateReadError({ databasePath, cause })),
+      Effect.orElseSucceed((): ReadonlyMap<string, ReadonlyArray<string>> => new Map()),
+    );
   });
 
   // Only chats left in an excluded folder, such as Codex's scratch folder, take their project's root.

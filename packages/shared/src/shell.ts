@@ -1024,22 +1024,40 @@ export function npmShimExecutable(
   return isFile(executable) ? executable : undefined;
 }
 
-export type XcodeGitLocator = (env: NodeJS.ProcessEnv) => string | undefined;
+export type XcodeGitLocator = (
+  env: NodeJS.ProcessEnv,
+) => string | undefined | Promise<string | undefined>;
 
 // xcrun honors DEVELOPER_DIR and the `xcode-select` choice, as the shim does.
-function locateXcodeGitWithXcrun(env: NodeJS.ProcessEnv): string | undefined {
-  try {
-    const located = NodeChildProcess.execFileSync("/usr/bin/xcrun", ["--find", "git"], {
-      encoding: "utf8",
-      env,
-      timeout: 5_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return NodePath.isAbsolute(located) ? located : undefined;
-  } catch {
-    return undefined;
-  }
+function locateXcodeGitWithXcrun(env: NodeJS.ProcessEnv): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    try {
+      NodeChildProcess.execFile(
+        "/usr/bin/xcrun",
+        ["--find", "git"],
+        {
+          encoding: "utf8",
+          env,
+          timeout: 5_000,
+          windowsHide: true,
+        },
+        (error, stdout) => {
+          if (error) {
+            resolve(undefined);
+            return;
+          }
+          const located = stdout.trim();
+          resolve(NodePath.isAbsolute(located) ? located : undefined);
+        },
+      );
+    } catch {
+      resolve(undefined);
+    }
+  });
 }
+
+// Deduplicate concurrent cold/expired xcrun lookups so N simultaneous git spawns launch one xcrun.
+const inFlightXcodeGitLookups = new Map<string, Promise<string | undefined>>();
 
 export const XcodeGitLocation = Context.Reference<XcodeGitLocator>(
   "@t3tools/shared/shell/XcodeGitLocation",
@@ -1083,7 +1101,23 @@ const resolveMacosGit = Effect.fnUntraced(function* (
     }
   }
   const pathGit = yield* Effect.promise(async () => resolveExecutable("git", "darwin", env));
-  const located = pathGit === MACOS_GIT_SHIM ? locateXcodeGit(env) : undefined;
+  const located =
+    pathGit === MACOS_GIT_SHIM
+      ? yield* Effect.promise(() => {
+          const existing = inFlightXcodeGitLookups.get(cacheKey);
+          if (existing !== undefined) return existing;
+          const lookup = Promise.resolve()
+            .then(() => locateXcodeGit(env))
+            .catch(() => undefined)
+            .finally(() => {
+              if (inFlightXcodeGitLookups.get(cacheKey) === lookup) {
+                inFlightXcodeGitLookups.delete(cacheKey);
+              }
+            });
+          inFlightXcodeGitLookups.set(cacheKey, lookup);
+          return lookup;
+        })
+      : undefined;
   const realGit =
     located !== undefined &&
     (yield* Effect.promise(async () => resolveExecutable(located, "darwin", env))) !== undefined
