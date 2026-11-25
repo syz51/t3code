@@ -130,4 +130,17 @@ describe("T3 orchestration instructions", () => {
       `\n\n${T3_CODE_ORCHESTRATION_SECTIONS.join("\n\n")}\n`,
     );
   });
+
+  it("lets standing project or board-dispatch rules and tool refusals count as the user's ask for t3_thread_launch while keeping the subagent guard", () => {
+    for (const instructions of [
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      T3_CODE_ANTIGRAVITY_ORCHESTRATION_INSTRUCTIONS,
+    ]) {
+      assert.include(
+        instructions,
+        "`t3_thread_launch` and `create_threads` make new top-level threads, only when the user asks (directly, in standing project or board-dispatch rules, or via a T3 tool refusal naming `t3_thread_launch`).",
+      );
+      assert.include(instructions, '"Subagent", "delegate", and "parallel" never mean one.');
+    }
+  });
 });
