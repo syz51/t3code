@@ -358,6 +358,29 @@ const READER_POOL_SIZE = 4;
 const READER_STARTUP_TIMEOUT = Duration.seconds(10);
 const READER_RETRY_DELAY = Duration.seconds(1);
 const READER_RETRY_MAX_DELAY = Duration.minutes(1);
+const WORKER_CLOSE_TIMEOUT = Duration.seconds(5);
+
+const closeWorker = (worker: NodeWorkerThreads.Worker, message: unknown) =>
+  worker.threadId === -1
+    ? Effect.promise(() => worker.terminate())
+    : Effect.callback<void>((resume) => {
+        const finish = () => resume(Effect.void);
+        worker.once("exit", finish);
+        worker.ref();
+        try {
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          worker.postMessage(message);
+        } catch {
+          resume(Effect.void);
+        }
+        return Effect.sync(() => {
+          worker.off("exit", finish);
+          worker.unref();
+        });
+      }).pipe(
+        Effect.timeoutOption(WORKER_CLOSE_TIMEOUT),
+        Effect.andThen(Effect.promise(() => worker.terminate())),
+      );
 
 // Bind transactions to one worker; fail after its exit instead of resuming outside the transaction on a replacement.
 const makeWorkerConnection = Effect.fnUntraced(function* (options: {
@@ -374,6 +397,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
         readonly worker: NodeWorkerThreads.Worker;
         readonly connection: Connection;
         readonly started: Promise<WorkerStartup>;
+        ready: boolean;
       }
     | undefined;
   let nextRequestId = 0;
@@ -424,6 +448,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
     };
     worker.on("message", (reply: WorkerReply | WorkerStartup) => {
       if ("type" in reply) {
+        if (reply.type === "ready" && current?.worker === worker) current.ready = true;
         announce(reply);
         if (pending.size === 0) worker.unref();
         return;
@@ -540,25 +565,29 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
         return Stream.die(new UnsupportedNodeSqliteOperationError());
       },
     });
-    current = { worker, connection, started };
+    current = { worker, connection, started, ready: false };
     return current;
   };
 
-  yield* Effect.addFinalizer(() =>
-    Effect.promise(async () => {
-      const open = current;
-      if (open === undefined) return;
-      if (options.role === "writer") {
+  yield* Effect.addFinalizer(() => {
+    const open = current;
+    if (open === undefined) return Effect.void;
+    if (options.role === "writer") {
+      return Effect.promise(async () => {
         await new Promise<void>((resolve) => {
           open.worker.once("exit", () => resolve());
           open.worker.ref();
           // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
           open.worker.postMessage({ type: "close" });
         });
-      }
-      await open.worker.terminate();
-    }),
-  );
+        await open.worker.terminate();
+      });
+    }
+    if (open.ready) {
+      return closeWorker(open.worker, { type: "close" }).pipe(Effect.asVoid);
+    }
+    return Effect.promise(() => open.worker.terminate()).pipe(Effect.asVoid);
+  });
 
   const retire = (worker: NodeWorkerThreads.Worker) => {
     if (current?.worker === worker) current = undefined;
@@ -724,7 +753,17 @@ const run = (force) => {
     parentPort.postMessage({ type: "failed", message: String(error && error.message ? error.message : error) });
   }
 };
-parentPort.on("message", () => run(false));
+parentPort.on("message", (message) => {
+  if (message && message.type === "close") {
+    clearTimeout(idle);
+    try {
+      if (db !== undefined) db.close();
+    } catch {}
+    parentPort.close();
+    return;
+  }
+  run(false);
+});
 `;
 
 const sqliteVersion = () => {
@@ -775,12 +814,11 @@ const startCheckpointWorker = Effect.fnUntraced(function* (filename: string) {
   });
   worker.on("error", (cause) => stop(cause.message));
   worker.on("exit", (code) => stop(`exited with code ${code}`));
-  yield* Effect.addFinalizer(() =>
-    Effect.promise(() => {
-      stopped = true;
-      return worker.terminate();
-    }),
-  );
+  yield* Effect.addFinalizer(() => {
+    if (stopped) return Effect.promise(() => worker.terminate()).pipe(Effect.asVoid);
+    stopped = true;
+    return closeWorker(worker, { type: "close" }).pipe(Effect.asVoid);
+  });
   let scheduled = false;
   return () => {
     if (stopped || scheduled) return;
