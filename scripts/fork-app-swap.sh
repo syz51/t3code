@@ -73,13 +73,18 @@ df_dir="$backup_root"
 free_kib="$(df -k "$df_dir" | awk 'NR == 2 { print $4 }')"
 ((free_kib > need_kib)) || fail "need $need_kib KiB free for the backup and the app, have $free_kib"
 
-run mkdir -p "$backup_dir"
+run mkdir -p "$(dirname "$backup_dir")"
+run mkdir "$backup_dir"
 backup_db="$backup_dir/statev2.sqlite"
 echo "+ sqlite3 '$state_db' \"PRAGMA busy_timeout = 5000; VACUUM INTO '$backup_db'\""
 if [[ $dry_run -eq 0 ]]; then
   # Open normally (never immutable=1) so any uncheckpointed -wal frames are replayed into the backup.
-  if ! sqlite3 "$state_db" "PRAGMA busy_timeout = 5000; VACUUM INTO '${backup_db//\'/\'\'}'" ||
-    [[ "$(sqlite3 "file:$backup_db?mode=ro" "PRAGMA quick_check")" != "ok" ]]; then
+  if ! sqlite3 "$state_db" "PRAGMA busy_timeout = 5000; VACUUM INTO '${backup_db//\'/\'\'}'"; then
+    rm -f "$backup_db" "$backup_db-wal" "$backup_db-shm"
+    rmdir "$backup_dir" 2>/dev/null || true
+    fail "database backup failed; nothing else changed"
+  fi
+  if [[ "$(sqlite3 "file:$backup_db?mode=ro" "PRAGMA quick_check")" != "ok" ]]; then
     rm -f "$backup_db" "$backup_db-wal" "$backup_db-shm"
     rmdir "$backup_dir" 2>/dev/null || true
     fail "the database backup failed its quick_check; nothing else changed"

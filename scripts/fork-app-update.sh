@@ -139,13 +139,14 @@ fi
 
 backup_db="$backup/statev2.sqlite"
 old_app="$backup/$(basename "$app")"
-echo "+ mkdir -p '$backup'"
+echo "+ mkdir -p '$(dirname "$backup")' && mkdir '$backup'"
 echo "+ sqlite3 '$db' \"PRAGMA busy_timeout = 5000; VACUUM INTO '$backup_db'\""
 if [[ $dry_run -eq 0 ]]; then
-  mkdir -p "$backup" || {
+  if ! mkdir -p "$(dirname "$backup")" || ! mkdir "$backup"; then
+    log "could not create backup folder $backup; nothing else changed"
     reopen
     exit 1
-  }
+  fi
   # Open normally (never immutable=1) so any uncheckpointed -wal frames are replayed into the backup.
   if ! sqlite3 "$db" "PRAGMA busy_timeout = 5000; VACUUM INTO '${backup_db//\'/\'\'}'" ||
     [[ "$(sqlite3 "file:$backup_db?mode=ro" "PRAGMA quick_check")" != "ok" ]]; then
