@@ -41,7 +41,41 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-const projectRoot = process.env.T3CODE_PROJECT_ROOT;
+const INHERITED_GIT_REPO_ENV_KEYS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_PREFIX",
+] as const;
+
+function resolveMainWorktree(): string | undefined {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of INHERITED_GIT_REPO_ENV_KEYS) {
+    delete env[key];
+  }
+  const result = NodeChildProcess.spawnSync("git", ["worktree", "list", "--porcelain"], {
+    cwd: worktree,
+    env,
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return undefined;
+  const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("worktree "));
+  const mainWorktree = line?.slice("worktree ".length);
+  return mainWorktree && mainWorktree.length > 0 ? mainWorktree : undefined;
+}
+
+function samePath(a: string, b: string): boolean {
+  try {
+    return NodeFS.realpathSync.native(a) === NodeFS.realpathSync.native(b);
+  } catch {
+    return NodePath.resolve(a) === NodePath.resolve(b);
+  }
+}
+
+const projectRoot = process.env.T3CODE_PROJECT_ROOT || resolveMainWorktree();
 if (!projectRoot) {
   throw new Error("T3CODE_PROJECT_ROOT is not set. Run this through the t3.json setup action.");
 }
@@ -75,17 +109,19 @@ if (installStatus !== 0 || cancelSignal) {
 }
 
 // Worktrees link main-checkout env files; replace only symlinks so real files always survive.
-for (const file of ENV_FILES) {
-  const source = NodePath.join(projectRoot, file);
-  const sourceStat = NodeFS.lstatSync(source, { throwIfNoEntry: false });
-  if (!sourceStat) continue;
-  if (!sourceStat.isFile()) {
-    process.stderr.write(`Skipping ${file}: ${source} is not a regular file.\n`);
-    continue;
+if (!samePath(projectRoot, worktree)) {
+  for (const file of ENV_FILES) {
+    const source = NodePath.join(projectRoot, file);
+    const sourceStat = NodeFS.lstatSync(source, { throwIfNoEntry: false });
+    if (!sourceStat) continue;
+    if (!sourceStat.isFile()) {
+      process.stderr.write(`Skipping ${file}: ${source} is not a regular file.\n`);
+      continue;
+    }
+    const target = NodePath.join(worktree, file);
+    const existing = NodeFS.lstatSync(target, { throwIfNoEntry: false });
+    if (existing && !existing.isSymbolicLink()) continue;
+    if (existing) NodeFS.rmSync(target);
+    NodeFS.symlinkSync(source, target);
   }
-  const target = NodePath.join(worktree, file);
-  const existing = NodeFS.lstatSync(target, { throwIfNoEntry: false });
-  if (existing && !existing.isSymbolicLink()) continue;
-  if (existing) NodeFS.rmSync(target);
-  NodeFS.symlinkSync(source, target);
 }
