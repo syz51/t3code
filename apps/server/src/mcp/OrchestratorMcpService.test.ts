@@ -5091,7 +5091,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     };
     const delegate = (
       input: Partial<OrchestratorMcpDelegateTaskInput>,
-      { knownBase = true, foreignParent = false } = {},
+      { knownBase = true, foreignParent = false, nonGitProject = false } = {},
     ) =>
       Effect.gen(function* () {
         const commands: Array<{ readonly workspaceStrategy?: unknown }> = [];
@@ -5137,6 +5137,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const service = OrchestratorMcpService.layer.pipe(
           Layer.provide(
             Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+              isNonGitProject: () => Effect.succeed(nonGitProject),
               checkWorktreeBase: (input) =>
                 Effect.sync(() => checked.push(input)).pipe(
                   Effect.andThen(
@@ -5255,6 +5256,21 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.isTrue(result._tag === "Failure");
         if (result._tag === "Failure") assert.equal(result.failure.code, "invalid_request");
         assert.deepEqual(commands, []);
+      }),
+    );
+
+    it.effect("forwards baseRef and startFromOrigin for a non-git project", () =>
+      Effect.gen(function* () {
+        const { result, commands } = yield* delegate(
+          { isolation: "worktree", baseRef: "release/v2", startFromOrigin: true },
+          { nonGitProject: true },
+        );
+        assert.isTrue(result._tag === "Success");
+        assert.deepEqual(commands[0]?.workspaceStrategy, {
+          type: "worktree",
+          baseRef: "release/v2",
+          startFromOrigin: true,
+        });
       }),
     );
   });

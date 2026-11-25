@@ -2975,7 +2975,11 @@ const make = Effect.gen(function* () {
         (yield* threadLaunch.isNonGitProject(parent.thread.projectId))
       ) {
         // A plain project folder has no commit of its own; `HEAD` leaves each repository on its default branch.
-        workspaceStrategy = { type: "worktree", baseRef: "HEAD" };
+        workspaceStrategy = {
+          type: "worktree",
+          baseRef: input.baseRef ?? "HEAD",
+          ...(input.startFromOrigin === true ? { startFromOrigin: true } : {}),
+        };
       } else if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
         const startFromOrigin = input.startFromOrigin === true;
