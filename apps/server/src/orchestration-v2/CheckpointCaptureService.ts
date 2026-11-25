@@ -378,6 +378,9 @@ export const layer: Layer.Layer<
                   ? {
                       ...runWithoutDelegatedCompletion,
                       status: settledStatus,
+                      ...(stopRequest?.type === "run_interrupt_request"
+                        ? { interruptReason: stopRequest.message }
+                        : {}),
                       completedAt: capturedAt,
                       checkpointId: checkpoint.id,
                     }

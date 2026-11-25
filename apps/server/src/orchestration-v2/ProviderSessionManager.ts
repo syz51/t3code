@@ -64,6 +64,7 @@ import {
   awaitingProviderThreadId,
   cancelledRosterTaskWork,
   cancelledTurnItemWork,
+  isAwaitedWork,
   latestStartedRun,
   mergeRestartCancelledBackgroundWork,
 } from "./RestartBackgroundNote.ts";
@@ -1319,6 +1320,12 @@ export const layerWithOptions = (
                   run.restartCancelledBackgroundWork ?? [],
                   work,
                 ),
+                ...(work.some(isAwaitedWork)
+                  ? {
+                      interruptReason:
+                        "Awaited background work was cancelled because the provider process exited unexpectedly.",
+                    }
+                  : {}),
               },
             });
             effects.push({

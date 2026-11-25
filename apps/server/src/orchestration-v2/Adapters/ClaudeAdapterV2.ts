@@ -9949,6 +9949,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           >;
           readonly completedAt: DateTime.Utc;
           readonly failure?: OrchestrationV2ProviderFailure;
+          readonly reason?: string;
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
         }) {
@@ -10199,6 +10200,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   runOrdinal: input.context.input.runOrdinal,
                   status: input.status,
                   failure: null,
+                  ...(input.reason === undefined ? {} : { reason: input.reason }),
                   threadDisposition,
                 };
           yield* Effect.all(
@@ -10441,8 +10443,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           // A replacement query can reuse the native thread id; only this query's turn is ours.
           const context = closedQuery.lastTurn;
           if (context === null) return;
-          const interrupted =
-            closedQuery.stopping || (yield* Ref.get(interruptedTurns)).has(context.providerTurnId);
+          const explicitlyInterrupted = (yield* Ref.get(interruptedTurns)).has(
+            context.providerTurnId,
+          );
+          const interrupted = closedQuery.stopping || explicitlyInterrupted;
           // Finalization can yield to a replacement process; capture ownership and outcomes first.
           const subagents = yield* Ref.get(sessionSubagentsByTaskId);
           const buffered = (yield* Ref.get(wakeBuffers)).get(closedQuery.nativeThreadId)?.messages;
@@ -10452,7 +10456,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               status: interrupted ? "interrupted" : "failed",
               completedAt: yield* DateTime.now,
               ...(interrupted
-                ? {}
+                ? explicitlyInterrupted
+                  ? {}
+                  : { reason: "Claude provider query closed while stopping." }
                 : {
                     failure: makeProviderFailure({
                       cause: cause === undefined ? undefined : Cause.squash(cause),
@@ -12797,11 +12803,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               }
               return;
             }
+            const terminalReason =
+              !interrupted && (status === "interrupted" || status === "cancelled")
+                ? message.terminal_reason === "aborted_tools"
+                  ? "Claude aborted tool execution."
+                  : message.terminal_reason === "aborted_streaming"
+                    ? "Claude aborted response streaming."
+                    : message.subtype !== "success" && message.errors.length > 0
+                      ? message.errors.join("\n")
+                      : undefined
+                : undefined;
             yield* finalizeActiveTurn({
               context,
               status,
               completedAt,
               result: message,
+              ...(terminalReason === undefined ? {} : { reason: terminalReason }),
               ...(terminalFailure === null ? {} : { failure: terminalFailure }),
             });
           }

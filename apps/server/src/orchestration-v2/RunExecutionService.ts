@@ -823,7 +823,7 @@ export const layer: Layer.Layer<
           return false;
         }
         const reason =
-          input.terminal.status === "interrupted"
+          input.terminal.status === "interrupted" || input.terminal.status === "cancelled"
             ? ((input.loadRunInterruptReason === undefined
                 ? undefined
                 : yield* input.loadRunInterruptReason()) ?? input.terminal.reason)
@@ -855,6 +855,11 @@ export const layer: Layer.Layer<
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
+          ...(persistedStatus === "interrupted"
+            ? { interruptReason: reason ?? "Stopped by the provider" }
+            : persistedStatus === "cancelled" && reason !== undefined
+              ? { interruptReason: reason }
+              : {}),
           completedAt,
         };
         const finalizedRootNode: OrchestrationV2ExecutionNode = {
@@ -2093,6 +2098,7 @@ export const layer: Layer.Layer<
                         runOrdinal: input.run.ordinal,
                         status: "interrupted",
                         failure: null,
+                        reason: "Interrupted for workspace handoff.",
                         threadDisposition: "reusable",
                       },
                       rootProviderTurn === null ||

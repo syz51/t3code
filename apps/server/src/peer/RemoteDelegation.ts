@@ -540,6 +540,7 @@ const make = Effect.gen(function* () {
     stoppedThere: "ran-out" | "stopped" | undefined,
     stopCount?: number,
     executedModel?: string,
+    interruptReason?: string,
   ) {
     const attempt = yield* random.uuidV4();
     yield* threads
@@ -549,6 +550,7 @@ const make = Effect.gen(function* () {
         parentThreadId,
         taskId,
         status,
+        ...(interruptReason === undefined ? {} : { interruptReason }),
         result,
         ...(stoppedThere === undefined ? {} : { stoppedThere }),
         ...(stopCount === undefined ? {} : { stopCount }),
@@ -616,6 +618,7 @@ const make = Effect.gen(function* () {
     runId: RunId | null,
     failed = false,
     probeSuccess = true,
+    interruptedOrCancelled = false,
   ) {
     let reply: OrchestratorMcpThreadTimelineItem | undefined;
     let error: OrchestratorMcpThreadTimelineItem | undefined;
@@ -672,7 +675,10 @@ const make = Effect.gen(function* () {
     }
     reply = error ?? reply;
     const executedModel = run?.executedModel ?? undefined;
-    if (reply === undefined) return { text: undefined, executedModel };
+    const interruptReason = interruptedOrCancelled ? run?.interruptReason : undefined;
+    if (reply === undefined) {
+      return { text: interruptReason, executedModel, interruptReason };
+    }
     let text = reply.text ?? "";
     let textOffset = reply.textTruncated ? (reply.nextTextOffset ?? null) : null;
     while (textOffset !== null) {
@@ -687,9 +693,17 @@ const make = Effect.gen(function* () {
       text += part.text ?? "";
       textOffset = part.textTruncated ? (part.nextTextOffset ?? null) : null;
     }
+    const textWithReason =
+      interruptedOrCancelled && interruptReason !== undefined && !text.includes(interruptReason)
+        ? `${text}\n\n${interruptReason}`
+        : text;
     return {
-      text: run === undefined ? text : withExecutedModelNote(text, run.model, run.executedModel),
+      text:
+        run === undefined
+          ? textWithReason
+          : withExecutedModelNote(textWithReason, run.model, run.executedModel),
       executedModel,
+      interruptReason,
     };
   });
 
@@ -894,6 +908,7 @@ const make = Effect.gen(function* () {
       resultRun.runId,
       resultRun.status === "failed",
       resultRun.status === "completed",
+      resultRun.status === "interrupted" || resultRun.status === "cancelled",
     );
     yield* complete(
       parentThreadId,
@@ -903,6 +918,7 @@ const make = Effect.gen(function* () {
       "ran-out",
       undefined,
       result.executedModel,
+      result.interruptReason,
     );
     return yield* settled(parentThreadId, taskId);
   });
@@ -1008,6 +1024,8 @@ const make = Effect.gen(function* () {
           : `${cancelled} It could not be stopped in ${remote.label} and may still run there: ${unstopped}`,
         unstopped === undefined ? "stopped" : undefined,
         remote.stopCount,
+        undefined,
+        cancelled,
       ).pipe(
         Effect.tapError((cause) =>
           Effect.logWarning("remote-delegation.cancel-record-failed", { taskId: task.id, cause }),

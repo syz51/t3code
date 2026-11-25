@@ -1790,6 +1790,7 @@ interface ActiveAcpTurn {
   finalizedStatus: "completed" | "interrupted" | "failed" | "cancelled" | null;
   promptSettled: boolean;
   promptSettledStatus: "completed" | "interrupted" | "failed" | "cancelled" | null;
+  promptSettledReason: string | undefined;
   workAccepted: boolean;
   /** Settles with the turn's latest prompt; a prompt-steer replaces a settled one. */
   promptWireSettled: Deferred.Deferred<void, never>;
@@ -5824,6 +5825,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 ? "cancelled"
                 : "completed",
             failure,
+            failure === undefined && work.stopReason === "cancelled" && !context.interrupted
+              ? { reason: "The provider cancelled the turn." }
+              : undefined,
           );
         });
 
@@ -6288,7 +6292,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               yield* Ref.update(wakeBuffer, (current) => [...current, notification]);
               return;
             }
-            yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+            yield* finalizeTurn(
+              context,
+              context.promptSettledStatus ?? "completed",
+              undefined,
+              context.promptSettledReason === undefined
+                ? undefined
+                : { reason: context.promptSettledReason },
+            );
             const wake = yield* bufferPostSettleWake(notification);
             if (wake.offerContinuation) {
               yield* offerContinuationRun(notification.sessionId);
@@ -8848,6 +8859,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           options?: {
             readonly childTurnsContinue?: boolean;
             readonly threadDisposition?: "reusable" | "broken";
+            readonly reason?: string;
           },
         ): Effect.fn.Return<void> {
           if (context.finalized) return;
@@ -9002,6 +9014,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   runOrdinal: context.input.runOrdinal,
                   status: settledStatus,
                   failure: null,
+                  ...(options?.reason === undefined ? {} : { reason: options.reason }),
                   threadDisposition,
                 },
           );
@@ -9070,7 +9083,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               return;
             }
             const status = context.promptSettledStatus ?? "completed";
-            yield* finalizeTurn(context, status);
+            yield* finalizeTurn(
+              context,
+              status,
+              undefined,
+              context.promptSettledReason === undefined
+                ? undefined
+                : { reason: context.promptSettledReason },
+            );
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           yield* options.testHooks?.onDeferredFinalizeScheduled?.(debounce) ?? Effect.void;
         });
@@ -9098,7 +9118,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   context.tools.values().some(isRunningCommand) &&
                   !hasDeferredBackgroundWork(context, isRunningCommand)
                 ) {
-                  yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+                  yield* finalizeTurn(
+                    context,
+                    context.promptSettledStatus ?? "completed",
+                    undefined,
+                    context.promptSettledReason === undefined
+                      ? undefined
+                      : { reason: context.promptSettledReason },
+                  );
                   return;
                 }
                 // Something else still holds the turn; count silence again once it clears.
@@ -9604,9 +9631,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           ? "interrupted"
                           : "cancelled"
                         : "completed";
+                  const stopReasonMessage =
+                    failure === undefined &&
+                    result.stopReason === "cancelled" &&
+                    !context.interrupted
+                      ? "The provider cancelled the turn."
+                      : undefined;
                   if (defersFinalizeForBackgroundWork && !context.interrupted) {
                     context.promptSettled = true;
                     context.promptSettledStatus = status;
+                    context.promptSettledReason = stopReasonMessage;
                     for (const [taskId, completion] of context.backgroundCommands) {
                       if (completion === null) continue;
                       yield* finishRegisteredBackgroundTool({ taskId, ...completion });
@@ -9651,7 +9685,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     );
                     return;
                   }
-                  yield* finalizeTurn(context, status);
+                  yield* finalizeTurn(
+                    context,
+                    status,
+                    undefined,
+                    stopReasonMessage === undefined ? undefined : { reason: stopReasonMessage },
+                  );
                 }),
               ).pipe(
                 Effect.andThen(() => options.testHooks?.afterPromptCallback?.() ?? Effect.void),
@@ -9914,6 +9953,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               finalizedStatus: null,
               promptSettled: false,
               promptSettledStatus: null,
+              promptSettledReason: undefined,
               workAccepted: false,
               promptWireSettled,
               promptDispatched,

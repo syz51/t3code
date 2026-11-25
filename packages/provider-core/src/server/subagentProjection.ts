@@ -202,7 +202,7 @@ export const SUBAGENT_RESULT_TURN_ITEM_TYPES = [
   "run_interrupt_result",
 ] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
 
-/** The item carrying a provider's stop reason for a run, which its delegated result ends with. */
+/** The item carrying a provider's stop or recovery reason for a run, which its delegated result ends with. */
 export function subagentStopNotice(
   projection: Pick<OrchestrationV2ThreadProjection, "turnItems">,
   run: OrchestrationV2Run,
@@ -211,6 +211,7 @@ export function subagentStopNotice(
   const ids = [
     derive.runSignalTurnItem({ runId: run.id, signal: PROVIDER_STOP_REASON_SIGNAL }),
     derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-result" }),
+    derive.runSignalTurnItem({ runId: run.id, signal: "server-recovery" }),
   ];
   return projection.turnItems.find(
     (
@@ -224,13 +225,24 @@ export function subagentStopNotice(
   );
 }
 
+export function subagentInterruptReason(
+  projection: Pick<OrchestrationV2ThreadProjection, "turnItems">,
+  run: OrchestrationV2Run,
+): string | undefined {
+  return run.interruptReason ?? subagentStopNotice(projection, run)?.message;
+}
+
 function withStopNotice(
   projection: Pick<OrchestrationV2ThreadProjection, "turnItems">,
   run: OrchestrationV2Run,
   text: string,
 ): string {
-  const notice = subagentStopNotice(projection, run);
-  return notice === undefined ? text : `${text}\n\n${notice.message}`;
+  const notice = subagentStopNotice(projection, run)?.message;
+  const reason =
+    run.status === "interrupted" || run.status === "cancelled"
+      ? (run.interruptReason ?? notice)
+      : notice;
+  return reason === undefined ? text : `${text}\n\n${reason}`;
 }
 
 type MonitorNotice = Pick<OrchestrationV2ConversationMessage, "runId" | "notification">;

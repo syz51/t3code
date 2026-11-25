@@ -777,6 +777,7 @@ export type OrchestrationV2RestartCancelledBackgroundWork =
 export const OrchestrationV2RunBackgroundWorkCancelled = Schema.Struct({
   runId: RunId,
   restartCancelledBackgroundWork: Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
+  interruptReason: Schema.optional(Schema.String),
 });
 export type OrchestrationV2RunBackgroundWorkCancelled =
   typeof OrchestrationV2RunBackgroundWorkCancelled.Type;
@@ -829,6 +830,7 @@ export const OrchestrationV2Run = Schema.Struct({
   rootNodeId: Schema.NullOr(NodeId),
   activeAttemptId: Schema.NullOr(RunAttemptId),
   status: OrchestrationV2RunStatus,
+  interruptReason: Schema.optional(Schema.String),
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   steerWhenReadyRunId: Schema.optional(RunId),
@@ -1066,6 +1068,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   ]),
   progress: Schema.optional(Schema.String),
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
+  interruptReason: Schema.optional(Schema.String),
   result: Schema.NullOr(Schema.String),
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -3964,6 +3967,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     parentThreadId: ThreadId,
     taskId: NodeId,
     status: Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
+    interruptReason: Schema.optional(Schema.String),
     result: Schema.String,
     executedModel: Schema.optional(Schema.String),
     /**

@@ -336,10 +336,15 @@ export function applyOrchestrationV2ProjectionEvent(
       // Lifecycle updates carry the run as it was when the turn started. What the run returned
       // is written by its own event, and an update without it must not take it away.
       const known = base.runs.find((run) => run.id === event.payload.id);
-      const run =
-        event.payload.output === undefined && known?.output !== undefined
-          ? { ...event.payload, output: known.output }
-          : event.payload;
+      const run: OrchestrationV2Run = {
+        ...event.payload,
+        ...(event.payload.output === undefined && known?.output !== undefined
+          ? { output: known.output }
+          : {}),
+        ...(event.payload.interruptReason === undefined && known?.interruptReason !== undefined
+          ? { interruptReason: known.interruptReason }
+          : {}),
+      };
       const next = { ...base, runs: upsertEntity(base.runs, run) };
       const visible = { ...next, visibleTurnItems: activeVisibleTurnItems(next) };
       const wasQueued = known?.status === "queued";
@@ -355,6 +360,9 @@ export function applyOrchestrationV2ProjectionEvent(
             ? {
                 ...run,
                 restartCancelledBackgroundWork: event.payload.restartCancelledBackgroundWork,
+                ...(run.interruptReason === undefined && event.payload.interruptReason !== undefined
+                  ? { interruptReason: event.payload.interruptReason }
+                  : {}),
               }
             : run,
         ),
