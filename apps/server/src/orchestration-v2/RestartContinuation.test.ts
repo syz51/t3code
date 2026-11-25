@@ -465,6 +465,8 @@ it.effect.each(["running", "waiting"])(
               ? [{ kind: "shell" as const, label: "ls", id: "item:shell" }]
               : []),
           ],
+          interruptReason:
+            "Cancelled because the server restarted before the provider work completed.",
         },
       ]);
       assert.deepEqual(
@@ -762,6 +764,12 @@ it.effect.each([
         const note = events.find((event) => event.type === "run.background-work-cancelled");
         assert.equal(note?.runId, runId);
         assert.deepEqual(note?.payload.restartCancelledBackgroundWork, [background.work]);
+        assert.equal(
+          note?.payload.interruptReason,
+          wakes
+            ? `Cancelled because the server ${trigger === "startup" ? "restarted" : "shut down"} before the provider work completed.`
+            : undefined,
+        );
         if (status === "completed")
           assert.isFalse(
             events.some((event) => event.type === "run.updated" && event.runId === runId),
