@@ -2505,7 +2505,7 @@ const CLAUDE_BACKGROUND_WAIT_INSTRUCTIONS = `
 
 ### Background work you wait on
 
-To wait for a background command or Monitor you started (tests, a build), call \`t3_background_wait\` with its task ID before you end your turn. Do not mark work you leave running, or PRs. T3 MCP tools are deferred: load one with ToolSearch before you call it.
+To wait for a background command or Monitor you started (tests, a build), call \`t3_background_wait\` with \`taskIds: ["<id>"]\` before you end your turn. Do not mark work you leave running, or PRs. Background subagents (Agent) and delegates notify you when they end and need no \`t3_background_wait\` call. T3 MCP tools are deferred: load one with ToolSearch before you call it.
 `;
 
 // Claude 5.1+ returns text written before a tool call as a progress update, which the API

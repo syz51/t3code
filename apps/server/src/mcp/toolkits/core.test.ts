@@ -1376,6 +1376,67 @@ it.effect(
     ),
 );
 
+it.effect("t3_background_wait accepts a singular taskId string alias on the wire", () => {
+  const seen: Array<{ readonly taskIds: ReadonlyArray<string>; readonly awaited: boolean }> = [];
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (args: Record<string, unknown>) =>
+      server.callTool({ name: "t3_background_wait", arguments: args }).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, {
+          ...scope,
+          capabilities: new Set<McpInvocationContext.McpCapability>([
+            "orchestration",
+            "background-wait",
+          ]),
+        }),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    const addResult = yield* call({ taskId: "checks" });
+    expect(addResult.isError).not.toBe(true);
+    expect(addResult.structuredContent).toEqual({ matched: ["checks"], unmatched: [] });
+
+    const clearResult = yield* call({ taskId: "checks", waiting: false });
+    expect(clearResult.isError).not.toBe(true);
+    expect(clearResult.structuredContent).toEqual({ matched: ["checks"], unmatched: [] });
+
+    expect(seen).toEqual([
+      { taskIds: ["checks"], awaited: true },
+      { taskIds: ["checks"], awaited: false },
+    ]);
+
+    const blankExit = yield* Effect.exit(call({ taskId: "   " }));
+    expect(blankExit._tag).toBe("Failure");
+  }).pipe(
+    Effect.provide(
+      layerOrchestratorToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed(McpToolAccessTestkit.liveThreadShell(id, { activeRunId: null })),
+            awaitBackgroundTasks: ({ taskIds, awaited }) => {
+              seen.push({ taskIds, awaited });
+              return Effect.succeed({ matched: taskIds, unmatched: [] });
+            },
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
+        Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+        Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+        Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+        Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+        Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+        Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+      ),
+    ),
+  );
+});
+
 it.effect("discovers workflow stop targets and requires orchestration capability", () => {
   const threadId = ThreadId.make("workflow-parent");
   const shell = McpToolAccessTestkit.liveThreadShell(threadId);
