@@ -1,4 +1,11 @@
-import { linkOriginIsFenced, ProjectId, type ProjectScript, ThreadId } from "@t3tools/contracts";
+import {
+  linkOriginIsFenced,
+  MAX_SCRIPT_ID_LENGTH,
+  ProjectId,
+  type ProjectScript,
+  type T3ProjectFileScript,
+  ThreadId,
+} from "@t3tools/contracts";
 import { splitsSurrogatePair } from "@t3tools/shared/assistantCitations";
 import {
   projectScriptRuntimeEnv,
@@ -22,6 +29,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as ProjectService from "./ProjectService.ts";
+import * as T3ProjectFileLoader from "./T3ProjectFileLoader.ts";
 
 export interface ProjectSetupScriptRunnerResultNoScript {
   readonly status: "no-script";
@@ -258,9 +266,31 @@ function wrapCommandForCompletion(
   }
 }
 
+function projectFileSetupScript(fileScript: T3ProjectFileScript): ProjectScript {
+  const normalized = fileScript.name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const id =
+    normalized.length === 0
+      ? "t3-json-setup"
+      : normalized.slice(0, MAX_SCRIPT_ID_LENGTH).replace(/-+$/g, "") || "t3-json-setup";
+  return {
+    id,
+    name: fileScript.name,
+    command: fileScript.command,
+    icon: fileScript.icon ?? "configure",
+    runOnWorktreeCreate: true,
+    ...(fileScript.stopOnSettle === undefined ? {} : { stopOnSettle: fileScript.stopOnSettle }),
+    ...(fileScript.async === undefined ? {} : { async: fileScript.async }),
+  };
+}
+
 /** @public */
 export const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
+  const projectFiles = yield* T3ProjectFileLoader.T3ProjectFileLoader;
   const threads = yield* ProjectionStore.ProjectionStoreV2;
   const terminalManager = yield* TerminalManager.TerminalManager;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -494,8 +524,29 @@ export const make = Effect.gen(function* () {
     );
     const trigger = input.trigger ?? "setup";
     const scripts = resolveProjectScripts(settings, project);
-    const script =
-      trigger === "settle" ? settleProjectScript(scripts) : setupProjectScript(scripts);
+    const legacyOverride = settings.projectScriptOverrides[project.id];
+    const hasExplicitProjectOverride =
+      settings.projectSettingsOverrides[project.id]?.defaultProjectScripts !== undefined ||
+      (!settings.projectSettingsFolded &&
+        legacyOverride !== null &&
+        (legacyOverride !== undefined || project.scripts.length > 0));
+    let script = trigger === "settle" ? settleProjectScript(scripts) : setupProjectScript(scripts);
+    if (
+      !script &&
+      trigger === "setup" &&
+      !hasExplicitProjectOverride &&
+      // Require full-access so lower-mode threads cannot run shell commands by editing t3.json.
+      thread?.runtimeMode === "full-access"
+    ) {
+      // Read from the project checkout, not the worktree, so untrusted branches cannot inject setup commands.
+      const projectFile = yield* projectFiles.load(project.workspaceRoot);
+      const fileSetupScript = Option.getOrUndefined(projectFile)?.scripts?.find(
+        (candidate) => candidate.runOnWorktreeCreate === true,
+      );
+      if (fileSetupScript) {
+        script = projectFileSetupScript(fileSetupScript);
+      }
+    }
     if (!script) {
       return {
         status: "no-script",

@@ -1,10 +1,16 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  MessageId,
+  NodeId,
+  type OrchestrationV2Run,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
   ProviderInstanceId,
   ProviderInteractionMode,
+  ProviderThreadId,
+  RunAttemptId,
+  RunId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -23,7 +29,7 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
-import { liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const supervisedThreadId = ThreadId.make("thread:supervised");
 const planThreadId = ThreadId.make("thread:plan");
@@ -33,6 +39,8 @@ const backgroundThreadId = ThreadId.make("thread:background");
 const oldProviderThreadId = ThreadId.make("thread:old-provider-background");
 const archivedThreadId = ThreadId.make("thread:archived-background");
 const unknownOwnerThreadId = ThreadId.make("thread:unknown-background-owner");
+const queuedWakeThreadId = ThreadId.make("thread:queued-wake");
+const foreignQueuedThreadId = ThreadId.make("thread:foreign-queued");
 
 const backgroundShell = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) => ({
   ...liveThreadShell(threadId, { activeRunId: null }),
@@ -40,6 +48,63 @@ const backgroundShell = (threadId: ThreadId, providerInstanceId: ProviderInstanc
     { taskId: "task:background", kind: "subagent" as const, providerInstanceId },
   ],
 });
+
+const queuedShell = (threadId: ThreadId, runId: RunId) => {
+  const base = liveThreadShell(threadId, { activeRunId: null });
+  return {
+    ...base,
+    status: "queued" as const,
+    latestRunId: runId,
+    latestRunRequestedAt: base.updatedAt,
+    latestRunCompletedAt: null,
+  };
+};
+
+const queuedRun = (
+  threadId: ThreadId,
+  id: RunId,
+  providerInstanceId: ProviderInstanceId,
+): OrchestrationV2Run => ({
+  id,
+  threadId,
+  ordinal: 1,
+  providerInstanceId,
+  modelSelection: { instanceId: providerInstanceId, model: "gpt-5" },
+  providerThreadId: ProviderThreadId.make("provider-thread:queued"),
+  userMessageId: MessageId.make("message:queued"),
+  rootNodeId: NodeId.make("node:queued"),
+  activeAttemptId: RunAttemptId.make("attempt:queued"),
+  status: "queued",
+  queuePosition: 1,
+  requestedAt: liveThreadShell(threadId).updatedAt,
+  startedAt: null,
+  completedAt: null,
+  checkpointId: null,
+  contextHandoffId: null,
+});
+
+const queuedRuns = new Map<ThreadId, ReadonlyArray<OrchestrationV2Run>>([
+  [
+    queuedWakeThreadId,
+    [
+      queuedRun(
+        queuedWakeThreadId,
+        RunId.make("run:queued-wake"),
+        ProviderInstanceId.make("codex"),
+      ),
+    ],
+  ],
+  [
+    foreignQueuedThreadId,
+    [
+      queuedRun(
+        foreignQueuedThreadId,
+        RunId.make("run:foreign-queued"),
+        ProviderInstanceId.make("claude"),
+      ),
+    ],
+  ],
+]);
 
 const shells = new Map([
   [supervisedThreadId, liveThreadShell(supervisedThreadId, { runtimeMode: "approval-required" })],
@@ -65,6 +130,8 @@ const shells = new Map([
       pendingBackgroundTasks: [{ taskId: "task:unknown", kind: "subagent" as const }],
     },
   ],
+  [queuedWakeThreadId, queuedShell(queuedWakeThreadId, RunId.make("run:queued-wake"))],
+  [foreignQueuedThreadId, queuedShell(foreignQueuedThreadId, RunId.make("run:foreign-queued"))],
 ]);
 
 const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
@@ -137,6 +204,7 @@ const ProbeToolkit = Toolkit.make(
     }),
   }),
   Tool.make("writes_environment", probe),
+  Tool.make("writes_owner_work", probe),
 );
 const ran = Effect.succeed({ ran: "ran" });
 const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
@@ -155,6 +223,7 @@ const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
     "stamped",
   ),
   writes_environment: McpToolAccess.writesEnvironment(() => ran),
+  writes_owner_work: McpToolAccess.writesOwnerWork("drive owner work", () => ran),
 };
 const layerProbeHandlers = McpToolAccess.toLayer(ProbeToolkit, probeHandlers);
 
@@ -194,6 +263,7 @@ export const refusedAtCompileTime = () => {
       writes_threads: unchecked,
       starts_threads: unchecked,
       writes_environment: unchecked,
+      writes_owner_work: unchecked,
     }),
   );
 };
@@ -233,6 +303,8 @@ const background = threadCaller(backgroundThreadId);
 const oldProviderBackground = threadCaller(oldProviderThreadId);
 const archivedBackground = threadCaller(archivedThreadId);
 const unknownOwnerBackground = threadCaller(unknownOwnerThreadId);
+const queuedWake = threadCaller(queuedWakeThreadId);
+const foreignQueued = threadCaller(foreignQueuedThreadId);
 const mismatchedProvider = {
   ...background,
   thread: { ...background.thread!, providerInstanceId: ProviderInstanceId.make("claude") },
@@ -248,6 +320,15 @@ const linkedClient: McpInvocationContext.McpInvocationScope = {
 const fullAccessLinkedClient: McpInvocationContext.McpInvocationScope = {
   ...fullAccessClient,
   client: { ...fullAccessClient.client!, linked: true },
+};
+// An administrator's ceiling narrows every client to it.
+const atCeilingClient: McpInvocationContext.McpInvocationScope = {
+  ...fullAccessClient,
+  runtimeModeCeiling: "auto",
+  client: {
+    ...fullAccessClient.client!,
+    narrowedTo: { runtimeMode: "auto", interactionMode: "default" },
+  },
 };
 const previewOnly = { ...fullAccess, capabilities: new Set(["preview"] as const) };
 
@@ -269,11 +350,15 @@ it.effect.each([
   ["acts_as_caller", mismatchedProvider, {}, "parent_not_active"],
   ["acts_as_caller", archivedBackground, {}, "parent_not_active"],
   ["acts_as_caller", unknownOwnerBackground, {}, "parent_not_active"],
+  ["acts_as_caller", queuedWake, {}, "ran"],
+  ["acts_as_caller", foreignQueued, {}, "parent_not_active"],
 
   ["writes", supervised, {}, "ran"],
   ["writes", ended, {}, "parent_not_active"],
   ["writes", background, {}, "ran"],
   ["writes", oldProviderBackground, {}, "parent_not_active"],
+  ["writes", queuedWake, {}, "ran"],
+  ["writes", foreignQueued, {}, "parent_not_active"],
   ["writes", supervisedClient, {}, "ran"],
   ["writes", previewOnly, {}, "capability_denied"],
   ["writes_environment", previewOnly, {}, "capability_denied"],
@@ -321,6 +406,18 @@ it.effect.each([
   ["writes_environment", plan, {}, "capability_denied"],
   ["writes_environment", fullAccessClient, {}, "ran"],
   ["writes_environment", supervisedClient, {}, "capability_denied"],
+
+  ["writes_owner_work", fullAccess, {}, "ran"],
+  ["writes_owner_work", supervised, {}, "capability_denied"],
+  ["writes_owner_work", plan, {}, "capability_denied"],
+  ["writes_owner_work", ended, {}, "parent_not_active"],
+  ["writes_owner_work", fullAccessClient, {}, "ran"],
+  ["writes_owner_work", supervisedClient, {}, "capability_denied"],
+  ["writes_owner_work", readOnlyClient, {}, "capability_denied"],
+  ["writes_owner_work", linkedClient, {}, "capability_denied"],
+  ["writes_owner_work", fullAccessLinkedClient, {}, "ran"],
+  ["writes_owner_work", atCeilingClient, {}, "ran"],
+  ["writes_environment", atCeilingClient, {}, "capability_denied"],
 ] as const)("%s from %o with %o: %s", ([tool, scope, args, expected]) =>
   call(tool, scope, args).pipe(
     Effect.map((outcome) => expect(outcome).toBe(expected)),
@@ -328,6 +425,13 @@ it.effect.each([
       probeServer(
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+          getProjectThreadRecords: ({ threadId }) => {
+            const shell = shells.get(threadId) ?? liveThreadShell(threadId, { activeRunId: null });
+            return Effect.succeed({
+              ...idleThreadProjection(shell),
+              runs: queuedRuns.get(threadId) ?? [],
+            });
+          },
         }),
       ),
     ),

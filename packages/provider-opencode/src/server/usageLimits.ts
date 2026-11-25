@@ -1,5 +1,3 @@
-import * as NodeSqlite from "node:sqlite";
-
 import type { ServerProviderUsageWindow } from "@t3tools/contracts";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -8,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Hex from "effect/encoding/Hex";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
@@ -19,6 +18,7 @@ import {
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 const AuthFile = Schema.Struct({ "opencode-go": Schema.optionalKey(Schema.Unknown) });
 const ApiAuth = Schema.Struct({ type: Schema.Literal("api"), key: Schema.String });
@@ -52,36 +52,58 @@ class OpenCodeCredentialReadError extends Schema.TaggedError<OpenCodeCredentialR
   }
 }
 
-const readStoredApiKey = (databasePath: string, integrationId: "opencode" | "opencode-go") =>
-  Effect.try({
-    try: () => {
-      const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
-      try {
-        database.exec("PRAGMA busy_timeout = 100");
-        const row = database
-          .prepare(
-            `SELECT value FROM credential
-             WHERE integration_id = ? AND active IS NOT 0
-             ORDER BY active DESC, time_created DESC, id DESC LIMIT 1`,
-          )
-          .get(integrationId);
-        const stored =
-          typeof row?.value === "string"
-            ? Option.getOrUndefined(decodeStoredKey(row.value))
-            : undefined;
-        const server = stored?.metadata?.server;
-        if (typeof server === "string") {
-          const url = new URL(server);
-          if (`${url.origin}${url.pathname.replace(/\/+$/, "")}` !== "https://opencode.ai/console")
-            return undefined;
-        }
-        return stored?.key.trim();
-      } finally {
-        database.close();
+const isConsoleServerUrl = (server: string): boolean => {
+  try {
+    const url = new URL(server);
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}` === "https://opencode.ai/console";
+  } catch {
+    return false;
+  }
+};
+
+const readStoredApiKeys = Effect.fn("readStoredApiKeys")(function* (
+  databasePath: string,
+  integrationIds: ReadonlyArray<"opencode" | "opencode-go">,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  if (!(yield* fs.exists(databasePath).pipe(Effect.orElseSucceed(() => false)))) {
+    return [];
+  }
+  return yield* Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const keys: Array<string | undefined> = [];
+    for (const integrationId of integrationIds) {
+      const rows = yield* sql<{ readonly value: unknown }>`
+        SELECT value FROM credential
+        WHERE integration_id = ${integrationId} AND active IS NOT 0
+        ORDER BY active DESC, time_created DESC, id DESC LIMIT 1
+      `;
+      const row = rows[0];
+      const stored =
+        typeof row?.value === "string"
+          ? Option.getOrUndefined(decodeStoredKey(row.value))
+          : undefined;
+      const server = stored?.metadata?.server;
+      if (typeof server === "string" && !isConsoleServerUrl(server)) {
+        keys.push(undefined);
+        continue;
       }
-    },
-    catch: (cause) => new OpenCodeCredentialReadError({ databasePath, cause }),
-  }).pipe(Effect.orElseSucceed(() => undefined));
+      keys.push(stored?.key.trim());
+    }
+    return keys;
+  }).pipe(
+    Effect.provide(
+      NodeSqliteClient.layer({
+        filename: databasePath,
+        readonly: true,
+        writerWorker: true,
+        busyTimeoutMs: 100,
+      }),
+    ),
+    Effect.mapError((cause) => new OpenCodeCredentialReadError({ databasePath, cause })),
+    Effect.orElseSucceed((): Array<string | undefined> => []),
+  );
+});
 
 /** External OpenCode servers own their credentials; never read the host's account for them. */
 export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(function* (input: {
@@ -124,11 +146,8 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
     const storedKeys =
       env.OPENCODE_AUTH_CONTENT || databaseFile === ":memory:"
         ? []
-        : [
-            yield* readStoredApiKey(databasePath, "opencode"),
-            // OpenCode 2 imports auth.json once, so a replaced Go key only exists here.
-            yield* readStoredApiKey(databasePath, "opencode-go"),
-          ];
+        : // OpenCode 2 imports auth.json once, so a replaced Go key only exists in opencode-go.
+          yield* readStoredApiKeys(databasePath, ["opencode", "opencode-go"]);
     const keys = [...new Set([...storedKeys, goKey].filter((key): key is string => Boolean(key)))];
     let apiKey = keys[0];
     if (!apiKey) return unsupported;

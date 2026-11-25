@@ -824,4 +824,25 @@ describe("readAntigravityUsage", () => {
       );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("recovers its reader worker after a corrupt database and still reads later files", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* tempDir;
+      yield* fs.writeFileString(path.join(dir, "01-corrupt.db"), "not-a-sqlite-file");
+      yield* seedDatabase(path.join(dir, "02-valid.db"), (db) =>
+        Effect.gen(function* () {
+          yield* createTables(db);
+          yield* db.run("INSERT INTO steps VALUES (?, ?)", [0, stepUsage("after-corrupt")]);
+        }),
+      );
+      const result = yield* readAntigravityUsage(dir, 0);
+      assert.strictEqual(result.errors.length, 1);
+      assert.deepStrictEqual(
+        records(result).map((record) => record.dedupeKey),
+        ["antigravity:11:after-corrupt"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

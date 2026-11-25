@@ -5,6 +5,7 @@ import type {
 import {
   CommandId,
   type EnvironmentId,
+  isRuntimeModeAbove,
   OrchestratorMcpFailure,
   type ProjectId,
   type ProviderInstanceId,
@@ -188,11 +189,33 @@ export const assertTargetWithinLimits = (
     ),
   );
 
-/** Background subagents retain credentials until provider exit; archived threads and other instances cannot act. */
+const hasPendingQueuedRun = (
+  shell: Pick<
+    OrchestrationV2ThreadShell,
+    "status" | "latestRunId" | "latestRunRequestedAt" | "latestRunCompletedAt"
+  >,
+) =>
+  shell.status === "queued" &&
+  shell.latestRunId !== null &&
+  shell.latestRunRequestedAt != null &&
+  shell.latestRunCompletedAt === null;
+
+/**
+ * Shell-level liveness check for archived state, provider instance, active runs, background
+ * subagents, and unheld queued runs. A queued provider switch leaves `shell.providerInstanceId`
+ * on the previous owner until it starts, so callers enforcing access must use `assertLiveCallerShell`.
+ */
 export const isLiveCallerShell = (
   shell: Pick<
     OrchestrationV2ThreadShell,
-    "archivedAt" | "activeRunId" | "providerInstanceId" | "pendingBackgroundTasks"
+    | "archivedAt"
+    | "activeRunId"
+    | "providerInstanceId"
+    | "pendingBackgroundTasks"
+    | "status"
+    | "latestRunId"
+    | "latestRunRequestedAt"
+    | "latestRunCompletedAt"
   > | null,
   providerInstanceId: ProviderInstanceId | undefined,
 ) =>
@@ -200,25 +223,87 @@ export const isLiveCallerShell = (
   shell.archivedAt === null &&
   shell.providerInstanceId === providerInstanceId &&
   (shell.activeRunId !== null ||
+    hasPendingQueuedRun(shell) ||
     hasPendingBackgroundSubagent(shell.pendingBackgroundTasks, providerInstanceId));
 
-/** Thread callers need a live run or its background subagent in an unarchived thread. OAuth clients rely on their session and ceiling. */
-export function assertLiveCaller({ caller, scope }: Caller) {
+/**
+ * Verifies a thread shell owns a live run, a background subagent, or an unheld queued run
+ * for the calling provider. A queued provider switch leaves `shell.providerInstanceId` on
+ * the previous owner until the run starts, so the queued path checks the run records themselves.
+ */
+export const assertLiveCallerShell = (
+  threads: Pick<ThreadManagement.ThreadManagementService["Service"], "getProjectThreadRecords">,
+  shell: OrchestrationV2ThreadShell | null,
+  providerInstanceId: ProviderInstanceId | undefined,
+): Effect.Effect<void, OrchestratorMcpFailure> => {
+  const notActive = new OrchestratorMcpFailure({
+    code: "parent_not_active",
+    message: "The calling provider no longer owns an active thread run.",
+  });
+  if (
+    shell === null ||
+    shell.archivedAt !== null ||
+    shell.providerInstanceId !== providerInstanceId
+  ) {
+    return Effect.fail(notActive);
+  }
+  if (
+    shell.activeRunId !== null ||
+    hasPendingBackgroundSubagent(shell.pendingBackgroundTasks, providerInstanceId)
+  ) {
+    return Effect.void;
+  }
+  if (!hasPendingQueuedRun(shell)) {
+    return Effect.fail(notActive);
+  }
+  return threads
+    .getProjectThreadRecords({ projectId: shell.projectId, threadId: shell.id }, ["runs"], {
+      runStatuses: ["queued", ...ThreadManagement.ACTIVE_RUN_STATUSES],
+    })
+    .pipe(
+      Effect.mapError((error) =>
+        error._tag === "ThreadManagementThreadNotFoundError" ? notActive : unavailable(),
+      ),
+      Effect.flatMap(({ runs }) =>
+        runs.some(
+          (run) =>
+            run.providerInstanceId === providerInstanceId &&
+            (ThreadManagement.isActiveRun(run) ||
+              (run.status === "queued" && run.queueHeld !== true)),
+        )
+          ? Effect.void
+          : Effect.fail(notActive),
+      ),
+    );
+};
+
+/** Thread callers need a live run, an unheld queued run, or a background subagent in an unarchived thread. OAuth clients rely on their session and ceiling. */
+export function assertLiveCaller({ caller, scope, threads }: Caller) {
   if (caller === undefined) return Effect.void;
-  return isLiveCallerShell(caller, scope.thread?.providerInstanceId)
-    ? Effect.void
-    : Effect.fail(
-        new OrchestratorMcpFailure({
-          code: "parent_not_active",
-          message: "The calling provider no longer owns an active thread run.",
-        }),
-      );
+  return assertLiveCallerShell(threads, caller, scope.thread?.providerInstanceId);
 }
 
 export const assertFullAccess = (context: Caller, message: string) =>
   context.limits.runtimeMode === "full-access" && context.limits.interactionMode === "default"
     ? Effect.void
     : Effect.fail(new OrchestratorMcpFailure({ code: "capability_denied", message }));
+
+/**
+ * For work whose definition picks its own modes: the caller must hold the broadest modes a
+ * thread may run in here, full access or an administrator's ceiling below it.
+ */
+export const assertBroadestAccess = (context: Caller, what: string) => {
+  const broadest = context.scope.runtimeModeCeiling ?? "full-access";
+  return !isRuntimeModeAbove(broadest, context.limits.runtimeMode) &&
+    context.limits.interactionMode === "default"
+    ? Effect.void
+    : Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: `Only a caller with ${broadest}/default access can ${what}, because that work picks its own modes. This caller is limited to ${context.limits.runtimeMode}/${context.limits.interactionMode}.`,
+        }),
+      );
+};
 
 export const resolveProjectId = (context: Caller, projectId: ProjectId | undefined) =>
   projectId !== undefined

@@ -304,6 +304,7 @@ export const layerProjectSetupScriptRunner = ProjectSetupScriptRunner.layer.pipe
   Layer.provide(layerProjectService),
   // Whether a thread came from a linked environment, which skips setup.
   Layer.provide(ProjectionStore.layer),
+  Layer.provide(T3ProjectFileLoader.layer),
 );
 const layerManagedProjectFoldersProvided = ManagedProjectFolders.layer.pipe(
   Layer.provide(layerProjectService),

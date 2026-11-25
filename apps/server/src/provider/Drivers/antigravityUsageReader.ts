@@ -1,15 +1,14 @@
-// @effect-diagnostics-next-line nodeBuiltinImport:off - Effect's File.Info has no ctime, which the cache fingerprint needs.
+// @effect-diagnostics nodeBuiltinImport:off -- Effect's File.Info has no ctime, and worker threads keep SQLite off the event loop.
 import * as NodeFSP from "node:fs/promises";
+import * as NodeWorkerThreads from "node:worker_threads";
 import { pipe } from "effect/Function";
 
 import type { UsageRecord } from "@t3tools/provider-core/server/usage";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
 
 type FieldValue = number | bigint | Uint8Array;
 type Fields = Map<number, FieldValue[]>;
@@ -255,25 +254,182 @@ class AntigravityDatabaseDecodeError extends Schema.TaggedError<AntigravityDatab
   }
 }
 
-/** Generation rows can hold megabytes of context; read one at a time to bound blocking statement.all(). */
+/** Generation rows can hold megabytes of context; read one at a time to bound peak transfer size. */
 const GENERATION_PAGE_ROWS = 1;
 const STEP_PAGE_ROWS = 64;
 
+// Inline worker source runs from bundles and SEA builds without module files.
+const sqliteReaderWorkerSource = `
+const { parentPort } = require("node:worker_threads");
+const { DatabaseSync } = require("node:sqlite");
+let db;
+const closeDb = () => {
+  if (db === undefined) return;
+  const current = db;
+  db = undefined;
+  try { current.exec("COMMIT"); } catch {}
+  try { current.close(); } catch {}
+};
+parentPort.on("message", (request) => {
+  if (request.type === "shutdown") {
+    closeDb();
+    parentPort.close();
+    return;
+  }
+  const { id } = request;
+  try {
+    if (request.type === "open") {
+      closeDb();
+      const next = new DatabaseSync(request.filename, { readOnly: true, allowExtension: false });
+      try {
+        next.exec("PRAGMA busy_timeout = 100");
+        next.exec("BEGIN");
+      } catch (error) {
+        try { next.close(); } catch {}
+        throw error;
+      }
+      db = next;
+      parentPort.postMessage({ id, rows: [] });
+      return;
+    }
+    if (request.type === "close") {
+      closeDb();
+      parentPort.postMessage({ id, rows: [] });
+      return;
+    }
+    if (request.type === "all") {
+      if (db === undefined) throw new Error("SQLite reader has no open database");
+      const rows = db.prepare(request.sql).all(...(request.params ?? []));
+      parentPort.postMessage({ id, rows });
+      return;
+    }
+    throw new Error("Unsupported SQLite reader request");
+  } catch (error) {
+    parentPort.postMessage({ id, error: String(error && error.message ? error.message : error) });
+  }
+});
+`;
+
+interface SqliteReaderWorker {
+  readonly open: (filename: string) => Effect.Effect<void, AntigravityDatabaseDecodeError>;
+  readonly all: <Row>(
+    filename: string,
+    sql: string,
+    params?: ReadonlyArray<unknown>,
+  ) => Effect.Effect<ReadonlyArray<Row>, AntigravityDatabaseDecodeError>;
+  readonly close: (filename: string) => Effect.Effect<void>;
+}
+
+interface ActiveWorker {
+  readonly worker: NodeWorkerThreads.Worker;
+  readonly pending: Map<
+    number,
+    {
+      readonly resolve: (rows: ReadonlyArray<unknown>) => void;
+      readonly reject: (error: Error) => void;
+    }
+  >;
+}
+
+const makeSqliteReaderWorker = Effect.gen(function* () {
+  let current: ActiveWorker | undefined;
+  let nextId = 0;
+
+  const ensureWorker = (): ActiveWorker => {
+    if (current !== undefined) return current;
+    const worker = new NodeWorkerThreads.Worker(sqliteReaderWorkerSource, { eval: true });
+    const entry: ActiveWorker = { worker, pending: new Map() };
+    const fail = (message: string) => {
+      if (current === entry) current = undefined;
+      for (const request of entry.pending.values()) request.reject(new Error(message));
+      entry.pending.clear();
+    };
+    worker.unref();
+    worker.on(
+      "message",
+      (reply: {
+        readonly id: number;
+        readonly rows?: ReadonlyArray<unknown>;
+        readonly error?: string;
+      }) => {
+        const request = entry.pending.get(reply.id);
+        if (request === undefined) return;
+        entry.pending.delete(reply.id);
+        if (entry.pending.size === 0) worker.unref();
+        if (reply.error !== undefined) request.reject(new Error(reply.error));
+        else request.resolve(reply.rows ?? []);
+      },
+    );
+    worker.on("error", (cause) => {
+      fail(`Antigravity SQLite reader failed: ${cause.message}`);
+      void worker.terminate();
+    });
+    worker.on("exit", (code) => {
+      fail(`Antigravity SQLite reader exited with code ${code}`);
+    });
+    current = entry;
+    return entry;
+  };
+
+  yield* Effect.addFinalizer(() =>
+    Effect.promise(async () => {
+      const active = current;
+      current = undefined;
+      if (active === undefined) return;
+      try {
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        active.worker.postMessage({ type: "shutdown" });
+      } catch {}
+      await active.worker.terminate();
+    }),
+  );
+
+  const send = (filename: string, payload: Record<string, unknown>) =>
+    Effect.tryPromise({
+      try: () =>
+        new Promise<ReadonlyArray<unknown>>((resolve, reject) => {
+          const active = ensureWorker();
+          const id = ++nextId;
+          active.pending.set(id, { resolve, reject });
+          if (active.pending.size === 1) active.worker.ref();
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          active.worker.postMessage({ id, ...payload });
+        }),
+      catch: (cause) => new AntigravityDatabaseDecodeError({ path: filename, cause }),
+    });
+
+  return {
+    open: (filename) => send(filename, { type: "open", filename }).pipe(Effect.asVoid),
+    all: <Row>(filename: string, sql: string, params: ReadonlyArray<unknown> = []) =>
+      send(filename, { type: "all", sql, params }) as Effect.Effect<
+        ReadonlyArray<Row>,
+        AntigravityDatabaseDecodeError
+      >,
+    close: (filename) =>
+      Effect.suspend(() =>
+        current === undefined
+          ? Effect.void
+          : send(filename, { type: "close" }).pipe(Effect.asVoid, Effect.ignore),
+      ),
+  } satisfies SqliteReaderWorker;
+});
+
 const readDatabase = Effect.fn("readDatabase")(function* (
+  reader: SqliteReaderWorker,
   path: string,
   sessionId: string,
   fallbackTimestamp: number,
 ) {
-  const sql = yield* SqlClient.SqlClient;
   const decode = <A>(evaluate: () => A) =>
     Effect.try({
       try: evaluate,
       catch: (cause) => new AntigravityDatabaseDecodeError({ path, cause }),
     });
-  yield* sql.unsafe("PRAGMA busy_timeout = 100");
+  yield* reader.open(path);
   return yield* Effect.gen(function* () {
     const tables = new Set(
-      (yield* sql.unsafe<{ readonly name: unknown }>(
+      (yield* reader.all<{ readonly name: unknown }>(
+        path,
         "SELECT name FROM sqlite_master WHERE type = 'table'",
       )).map((row) => row.name),
     );
@@ -288,13 +444,11 @@ const readDatabase = Effect.fn("readDatabase")(function* (
       const entries: Array<{ idx: number; entry: Metadata }> = [];
       let after = -Infinity;
       while (true) {
-        const rows = yield* sql
-          .unsafe<{
-            readonly row_id: number;
-            readonly idx: unknown;
-            readonly data: unknown;
-          }>(query, [after, pageRows])
-          .pipe(Effect.withTracerEnabled(false));
+        const rows = yield* reader.all<{
+          readonly row_id: number;
+          readonly idx: unknown;
+          readonly data: unknown;
+        }>(path, query, [after, pageRows]);
         for (const row of rows) {
           // Filter outside SQL to bound scans to one page, including rows without metadata.
           if (step && row.data === null) continue;
@@ -319,7 +473,8 @@ const readDatabase = Effect.fn("readDatabase")(function* (
       : [];
     let trajectoryTimestamp: number | null = null;
     if (tables.has("trajectory_metadata_blob")) {
-      for (const row of yield* sql.unsafe<{ readonly data: unknown }>(
+      for (const row of yield* reader.all<{ readonly data: unknown }>(
+        path,
         "SELECT data FROM trajectory_metadata_blob",
       )) {
         trajectoryTimestamp ??= yield* decode(() =>
@@ -351,7 +506,7 @@ const readDatabase = Effect.fn("readDatabase")(function* (
         models,
       };
     });
-  }).pipe(sql.withTransaction);
+  }).pipe(Effect.ensuring(reader.close(path)));
 });
 
 function usageCandidates(
@@ -511,6 +666,7 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
     }
   };
   const visited = new Set<string>();
+  const reader = yield* makeSqliteReaderWorker;
   const readFile = Effect.fn("readAntigravityUsage.readFile")(function* (path: string) {
     const canonical = yield* fileSystem.realPath(path);
     if (visited.has(canonical)) return null;
@@ -527,9 +683,7 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
     const fingerprint = `${part}/${wal._tag === "Some" ? wal.value.part : "-"}`;
     const cached = cache?.get(canonical);
     if (cached?.fingerprint === fingerprint) return cached.data;
-    const data = yield* readDatabase(path, pathService.basename(path, ".db"), stat.mtimeMs).pipe(
-      Effect.provide(NodeSqliteClient.layer({ filename: path, readonly: true })),
-    );
+    const data = yield* readDatabase(reader, path, pathService.basename(path, ".db"), stat.mtimeMs);
     cache?.set(canonical, { fingerprint, data });
     return data;
   });
@@ -608,4 +762,4 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
     }
   }
   return { files, errors };
-});
+}, Effect.scoped);

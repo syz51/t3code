@@ -152,6 +152,7 @@ it.effect("upgrades an existing database on a read-write worker connection", () 
       requireWal: false,
       allowExtension: false,
       prepareCacheSize: 200,
+      busyTimeoutMs: 5000,
     });
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
