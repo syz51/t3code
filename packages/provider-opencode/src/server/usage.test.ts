@@ -22,25 +22,36 @@ import {
 } from "./usage.fixture.ts";
 import { openCodeUsageReader, readOpenCodeUsage } from "./usage.ts";
 
-const readerWorkers = vi.hoisted(() => ({ started: 0, enabled: false }));
+const workerSpy = vi.hoisted(() => ({
+  started: 0,
+  workerData: [] as Array<unknown>,
+  onStatement: undefined as ((sql: string) => void) | undefined,
+  onRows: undefined as ((rows: ReadonlyArray<Record<string, unknown>>) => void) | undefined,
+}));
 
-// Statement spies only see the main thread, so reader workers fail to start unless a test enables them.
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
-  class ReaderWorker extends actual.Worker {
+  class RecordedWorker extends actual.Worker {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
-      super(
-        ...((readerWorkers.enabled
-          ? args
-          : [
-              "throw new Error('reader workers disabled');",
-              { eval: true },
-            ]) as ConstructorParameters<typeof actual.Worker>),
-      );
-      readerWorkers.started++;
+      super(...args);
+      workerSpy.started++;
+      workerSpy.workerData.push(args[1]?.workerData);
+      this.prependListener("message", (reply: { readonly rows?: unknown }) => {
+        if (Array.isArray(reply?.rows)) {
+          workerSpy.onRows?.(reply.rows as ReadonlyArray<Record<string, unknown>>);
+        }
+      });
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const value = args[0];
+      if (typeof value === "object" && value !== null && "sql" in value) {
+        const sql = (value as { readonly sql?: unknown }).sql;
+        if (typeof sql === "string") workerSpy.onStatement?.(sql);
+      }
+      return super.postMessage(...args);
     }
   }
-  return { ...actual, Worker: ReaderWorker };
+  return { ...actual, Worker: RecordedWorker };
 });
 
 const openDatabase = (filename: string) =>
@@ -148,14 +159,9 @@ describe("readOpenCodeUsage", () => {
       );
       let changed = false;
       let largestRawResult = 0;
-      const originalAll = NodeSqlite.StatementSync.prototype.all;
       yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
-            this: NodeSqlite.StatementSync,
-            ...params
-          ) {
-            const rows = originalAll.apply(this, params);
+        Effect.sync(() => {
+          workerSpy.onRows = (rows) => {
             const rawSize = rows.reduce(
               (size, row) => size + (typeof row.data === "string" ? row.data.length : 0),
               0,
@@ -167,10 +173,12 @@ describe("readOpenCodeUsage", () => {
                 .prepare("UPDATE message SET data = ? WHERE id = ?")
                 .run(JSON.stringify({ ...message, tokens: { input: 900, output: 20 } }), "msg-129");
             }
-            return rows;
+          };
+        }),
+        () =>
+          Effect.sync(() => {
+            workerSpy.onRows = undefined;
           }),
-        ),
-        (spy) => Effect.sync(() => spy.mockRestore()),
       );
       const result = yield* readOpenCodeUsage(dir, sinceMs);
       assert.isFalse(result.error);
@@ -223,19 +231,28 @@ describe("readOpenCodeUsage", () => {
       }
       let statements = 0;
       let bodyReads = 0;
+      let mainThreadReads = 0;
+      const workersBefore = workerSpy.started;
       const originalAll = NodeSqlite.StatementSync.prototype.all;
       yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+        Effect.sync(() => {
+          workerSpy.onStatement = (sql) => {
+            statements++;
+            if (sql.includes("data ->")) bodyReads++;
+          };
+          return vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
             this: NodeSqlite.StatementSync,
             ...params
           ) {
-            statements++;
-            if (this.sourceSQL.includes("data ->")) bodyReads++;
+            mainThreadReads++;
             return originalAll.apply(this, params);
+          });
+        }),
+        (spy) =>
+          Effect.sync(() => {
+            workerSpy.onStatement = undefined;
+            spy.mockRestore();
           }),
-        ),
-        (spy) => Effect.sync(() => spy.mockRestore()),
       );
       const result = yield* readOpenCodeUsage(dir, sinceMs);
       assert.isFalse(result.error);
@@ -244,6 +261,9 @@ describe("readOpenCodeUsage", () => {
         ["opencode:a", "opencode:b", "opencode:c"],
       );
       assert.isBelow(statements, 10);
+      // Even a non-WAL database runs its open and scan off the event loop.
+      assert.isAbove(workerSpy.started, workersBefore);
+      assert.strictEqual(mainThreadReads, 0);
 
       bodyReads = 0;
       const repeated = yield* readOpenCodeUsage(dir, sinceMs);
@@ -316,13 +336,7 @@ describe("readOpenCodeUsage", () => {
       const legacy = path.join(dir, "storage", "message", message.sessionID);
       yield* fileSystem.makeDirectory(legacy, { recursive: true });
       yield* fileSystem.writeFileString(path.join(legacy, "msg-1.json"), JSON.stringify(message));
-      yield* Effect.acquireRelease(
-        Effect.sync(() => {
-          readerWorkers.enabled = true;
-          readerWorkers.started = 0;
-        }),
-        () => Effect.sync(() => (readerWorkers.enabled = false)),
-      );
+      const workersBefore = workerSpy.started;
       let mainThreadBodyReads = 0;
       const originalAll = NodeSqlite.StatementSync.prototype.all;
       yield* Effect.acquireRelease(
@@ -362,7 +376,15 @@ describe("readOpenCodeUsage", () => {
       );
       assert.isAbove(Number((yield* fileSystem.stat(path.join(dir, "opencode.db-wal"))).size), 0);
       // A large database must not be read on the server's event loop.
-      assert.isAbove(readerWorkers.started, 0);
+      assert.isAbove(workerSpy.started, workersBefore);
+      assert.deepInclude(workerSpy.workerData.slice(workersBefore), {
+        filename: path.join(dir, "opencode.db"),
+        readOnly: true,
+        requireWal: false,
+        allowExtension: false,
+        prepareCacheSize: 200,
+        busyTimeoutMs: 100,
+      });
       assert.strictEqual(mainThreadBodyReads, 0);
     }).pipe(Effect.provide(NodeServices.layer)),
   );

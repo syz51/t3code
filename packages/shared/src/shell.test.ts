@@ -1533,6 +1533,37 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
       }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
     );
 
+    it.effect("awaits and deduplicates concurrent asynchronous Xcode git lookups", () =>
+      Effect.gen(function* () {
+        let releaseLookup: ((value: string | undefined) => void) | undefined;
+        let calls = 0;
+        const lookupPromise = new Promise<string | undefined>((resolve) => {
+          releaseLookup = resolve;
+        });
+        const files = new Set(["/usr/bin/git", XCODE_GIT]);
+        const resolve = resolveSpawnCommand("git", ["status"], {
+          env: { PATH: "/fake/bin" },
+        }).pipe(
+          Effect.map((resolved) => resolved.command),
+          Effect.provideService(HostProcess.Platform, "darwin"),
+          Effect.provideService(SpawnExecutableResolution, (command) =>
+            command === "git" ? "/usr/bin/git" : files.has(command) ? command : undefined,
+          ),
+          Effect.provideService(XcodeGitLocation, () => {
+            calls += 1;
+            return lookupPromise;
+          }),
+        );
+        const first = yield* Effect.forkChild(resolve);
+        const second = yield* Effect.forkChild(resolve);
+        yield* Effect.yieldNow;
+        releaseLookup!(XCODE_GIT);
+        expect(yield* Fiber.join(first)).toBe(XCODE_GIT);
+        expect(yield* Fiber.join(second)).toBe(XCODE_GIT);
+        expect(calls).toBe(1);
+      }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
     it.effect("keeps git when PATH has another git or the host is not macOS", () =>
       Effect.gen(function* () {
         const homebrew = setup({ gitOnPath: "/opt/homebrew/bin/git", xcrunGit: XCODE_GIT });

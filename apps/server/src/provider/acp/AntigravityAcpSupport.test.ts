@@ -43,16 +43,17 @@ function makeModelRuntime(
     if (failure) return yield* failure;
     selections.push(model);
   });
-  const setConfigOption = Effect.fn("AntigravityAcpSupportTest.setConfigOption")(function* (
+  const setConfigOption = (
     configId: string,
     value: string | boolean,
     options?: { readonly allowUnlistedValue?: boolean },
-  ) {
-    selections.push(
-      `${configId}=${String(value)}${options?.allowUnlistedValue === true ? " (unlisted)" : ""}`,
-    );
-    return { configOptions };
-  });
+  ) =>
+    Effect.sync(() => {
+      selections.push(
+        `${configId}=${String(value)}${options?.allowUnlistedValue === true ? " (unlisted)" : ""}`,
+      );
+      return { configOptions };
+    });
   return {
     runtime: { getConfigOptions: Effect.succeed(configOptions), setModel, setConfigOption },
     selections,
@@ -208,6 +209,14 @@ describe("Antigravity Auto", () => {
         request("Run mcp_t3-code_preview_status", {
           CommandLine: "Run mcp_t3-code_preview_status",
         }),
+        // A directly called tool's rawInput is its own arguments, whatever their names.
+        request("Run mcp_github_create_issue", {
+          ServerName: "t3-code",
+          ToolName: "delegate_task",
+        }),
+        request("Running create_issue", { ServerName: "t3-code", ToolName: "delegate_task" }),
+        // call_mcp_tool is titled for the tool it calls.
+        request("MCP Tool create_issue", { ServerName: "t3-code", ToolName: "delegate_task" }),
       ]) {
         expect(antigravityPermissionDisposition(policy, otherCall)).toBe("ask");
       }

@@ -337,6 +337,34 @@ it.effect("commits on the worker writer after a returning write timed out on a l
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect("applies busyTimeoutMs to writer and reader workers at startup", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepEqual(yield* sql`PRAGMA busy_timeout`.values, [[123]]);
+      assert.deepEqual(yield* sql`PRAGMA busy_timeout`.values.pipe(SqliteClient.readOnly), [[123]]);
+    }).pipe(
+      Effect.provide(
+        SqliteClient.layer({
+          filename,
+          writerWorker: true,
+          readerWorker: true,
+          busyTimeoutMs: 123,
+        }),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* Effect.sync(() => other.exec("BEGIN IMMEDIATE"));
+      const error = yield* sql`UPDATE counters SET value = 1 WHERE id = 1`.pipe(Effect.flip);
+      assert.equal(error.reason._tag, "LockTimeoutError");
+      yield* Effect.sync(() => other.exec("COMMIT"));
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true, busyTimeoutMs: 0 })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("keeps another connection from committing between a transaction's read and write", () =>
   Effect.gen(function* () {
     const { filename, other } = yield* makeTempDatabase;

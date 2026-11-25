@@ -3,7 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodePerfHooks from "node:perf_hooks";
 
 import type { ServerEventLoopStall } from "@t3tools/contracts";
-import { RotatingFileSink, RotatingFileSinkError } from "@t3tools/shared/logging";
+import { makeAsyncRotatingFileSink } from "@t3tools/shared/logging";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -17,6 +17,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import * as Metrics from "./Metrics.ts";
+import * as StallTraceCapture from "./StallTraceCapture.ts";
 
 // Subtract the histogram's timer resolution; this can undercount stalls by up to RESOLUTION_MS.
 const RESOLUTION_MS = 1000;
@@ -144,26 +145,18 @@ const layerWith = (
     EventLoopMonitor,
     Effect.gen(function* () {
       const sample = yield* makeSampler;
+      const stallTraceCapture = yield* StallTraceCapture.StallTraceCapture;
+      const scope = yield* Effect.scope;
       // Clients sample on connect as well as the timer, and the sampler resets shared state.
       const sampling = yield* Semaphore.make(1);
       const warmedUp = yield* Ref.make(false);
       const latestNoticeableStall = yield* Ref.make<
         { readonly stall: ServerEventLoopStall; readonly detectedAtMs: number } | undefined
       >(undefined);
-      const stallSink = yield* Effect.try({
-        try: () =>
-          new RotatingFileSink({
-            filePath: stallLog.filePath,
-            maxBytes: stallLog.maxBytes,
-            maxFiles: 1,
-            throwOnError: true,
-          }),
-        catch: (cause) =>
-          new RotatingFileSinkError({
-            operation: "initialize",
-            filePath: stallLog.filePath,
-            cause,
-          }),
+      const stallSink = yield* makeAsyncRotatingFileSink({
+        filePath: stallLog.filePath,
+        maxBytes: stallLog.maxBytes,
+        maxFiles: 1,
       }).pipe(
         Effect.catch(() =>
           Effect.logWarning("event loop stall log unavailable", {
@@ -192,6 +185,8 @@ const layerWith = (
             },
           });
         }
+        const windowMs = Math.max(readings.elapsedMs, 30_000);
+        const stallTrace = stallTraceCapture.attribute({ detectedAt: now, delayMaxMs, windowMs });
         const attributes = {
           delayMaxMs,
           utilization: Math.round(utilization * 100) / 100,
@@ -201,23 +196,30 @@ const layerWith = (
           minorPageFaults: usage.minorPageFault,
           involuntaryContextSwitches: usage.involuntaryContextSwitches,
           rssMb: Math.round(rssBytes / 1024 / 1024),
+          ...(stallTrace.activeSpans.length > 0 ? { activeSpans: stallTrace.activeSpans } : {}),
+          ...(stallTrace.slowSpans.length > 0 ? { slowSpans: stallTrace.slowSpans } : {}),
         };
         yield* Effect.logWarning(`event loop stalled for ${delayMaxMs} ms`).pipe(
           Effect.withSpan("server.eventLoop.stall", { root: true, level: "Warn", attributes }),
         );
+        // Preserve the trace window in the monitor's scope so reconnecting clients never block or cancel it.
+        yield* Effect.forkIn(
+          stallTraceCapture.saveSnapshot({ detectedAt: now, delayMaxMs, windowMs }).pipe(
+            Effect.flatMap((traceSnapshotPath) =>
+              traceSnapshotPath === undefined
+                ? Effect.void
+                : Effect.logInfo("Preserved event-loop stall trace snapshot", {
+                    detectedAt,
+                    delayMaxMs,
+                    traceSnapshotPath,
+                  }),
+            ),
+          ),
+          scope,
+        );
         if (stallSink !== undefined) {
           yield* encodeStallLine({ time: detectedAt, ...attributes }).pipe(
-            Effect.flatMap((line) =>
-              Effect.try({
-                try: () => stallSink.write(`${line}\n`),
-                catch: (cause) =>
-                  new RotatingFileSinkError({
-                    operation: "write",
-                    filePath: stallLog.filePath,
-                    cause,
-                  }),
-              }),
-            ),
+            Effect.flatMap((line) => stallSink.write(`${line}\n`)),
             Effect.catch(() =>
               Effect.logWarning("event loop stall log write failed", {
                 filePath: stallLog.filePath,
@@ -225,7 +227,11 @@ const layerWith = (
             ),
           );
         }
-      }).pipe(sampling.withPermits(1));
+      }).pipe(
+        // Resetting the histogram consumes the sample, so finish recording even if a client disconnects.
+        Effect.uninterruptible,
+        sampling.withPermits(1),
+      );
       const wait = Effect.sleep(SAMPLE_INTERVAL);
       // The first sample includes migrations and bootstrap; skip expected startup stalls.
       yield* wait.pipe(

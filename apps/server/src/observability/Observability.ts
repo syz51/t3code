@@ -5,6 +5,7 @@ import * as SharedObservability from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Tracer from "effect/Tracer";
 import * as OtlpExporter from "effect/observability/OtlpExporter";
@@ -18,6 +19,7 @@ import * as ServerLogger from "../serverLogger.ts";
 import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
 import * as HeapAttribution from "./HeapAttribution.ts";
 import * as OtlpExportFailures from "./OtlpExportFailures.ts";
+import * as StallTraceCapture from "./StallTraceCapture.ts";
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
@@ -73,11 +75,19 @@ export const layer = Layer.unwrap(
           ...(delegate ? { delegate } : {}),
         });
 
+        const path = yield* Path.Path;
         const heapAttribution = yield* HeapAttribution.make(tracer);
         yield* heapAttribution.run;
 
+        const stallTraceCapture = yield* StallTraceCapture.make({
+          tracer: heapAttribution.tracer,
+          sink,
+          snapshotDir: path.join(config.logsDir, "event-loop-stall-traces"),
+        });
+
         return Layer.mergeAll(
-          Layer.succeed(Tracer.Tracer, heapAttribution.tracer),
+          Layer.succeed(Tracer.Tracer, stallTraceCapture.tracer),
+          Layer.succeed(StallTraceCapture.StallTraceCapture, stallTraceCapture.service),
           BrowserTraceCollector.layer(sink),
         );
       }),

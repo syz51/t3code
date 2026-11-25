@@ -1,5 +1,4 @@
 import * as NodeOS from "node:os";
-import * as NodeSqlite from "node:sqlite";
 import * as NodeZlib from "node:zlib";
 
 import {
@@ -27,11 +26,13 @@ import * as Path from "effect/Path";
 import * as Pull from "effect/Pull";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import { splitsSurrogatePair } from "@t3tools/shared/assistantCitations";
 import { isBareGitConfig, parseOriginUrlFromGitConfig } from "@t3tools/shared/git";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { repositoryPathFromRemoteUrl } from "@t3tools/source-control-core/server/SourceControlProvider";
 
@@ -921,8 +922,17 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-  const baseDir = path.resolve(serverConfig.baseDir);
-  const worktreesDir = path.resolve(serverConfig.worktreesDir);
+  const configuredT3Dirs = {
+    baseDir: path.resolve(serverConfig.baseDir),
+    worktreesDir: path.resolve(serverConfig.worktreesDir),
+  };
+  // Resolved candidates are compared with T3's folders as resolved too, so a symlinked base still matches.
+  const realPathOf = (directory: string) =>
+    fileSystem.realPath(directory).pipe(Effect.orElseSucceed(() => directory));
+  const realT3Dirs = {
+    baseDir: yield* realPathOf(configuredT3Dirs.baseDir),
+    worktreesDir: yield* realPathOf(configuredT3Dirs.worktreesDir),
+  };
   const platform = yield* HostProcess.Platform;
   const isWindows = platform === "win32";
   const foldWorktreeCase = isWindows;
@@ -939,17 +949,19 @@ export const make = Effect.gen(function* () {
     path.join(homeDir, "Documents", "Codex"),
   ];
 
-  const isExcludedProjectPath = (candidatePath: string) =>
+  const isScratchPath = (candidatePath: string) =>
     excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
     excludedProjectAncestors.some((ancestor) =>
       normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
         normalizeForWorktreeMatch(ancestor, foldWorktreeCase),
       ),
-    ) ||
+    );
+  const isT3OwnedPath = (candidatePath: string, t3Dirs = configuredT3Dirs) =>
     normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
-      normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
-    ) ||
-    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+      normalizeForWorktreeMatch(t3Dirs.baseDir, foldWorktreeCase),
+    ) || isT3ManagedWorktree(candidatePath, t3Dirs.worktreesDir, foldWorktreeCase);
+  const isExcludedProjectPath = (candidatePath: string, t3Dirs = configuredT3Dirs) =>
+    isScratchPath(candidatePath) || isT3OwnedPath(candidatePath, t3Dirs);
 
   const listDirectory = (directory: string) =>
     fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
@@ -1010,7 +1022,7 @@ export const make = Effect.gen(function* () {
       .realPath(directory)
       .pipe(Effect.orElseSucceed(() => directory));
     // Symlinks can disguise excluded worktree paths; re-check their targets.
-    return isExcludedProjectPath(realPath) ? Option.none() : stats;
+    return isExcludedProjectPath(realPath, realT3Dirs) ? Option.none() : stats;
   });
 
   // Paths whose own read outlived the deadline, mapped to when they may be read
@@ -1585,41 +1597,50 @@ export const make = Effect.gen(function* () {
   ) {
     const rootsByThread = new Map<string, Array<string>>();
     const databasePath = path.join(homePath, CODEX_STATE_DATABASE);
-    return yield* Effect.try({
-      try: () => {
-        const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
-        try {
-          database.exec("PRAGMA busy_timeout = 100");
-          const rows = database
-            .prepare(
-              `SELECT threads.id AS id, project_roots.path AS path
-               FROM threads JOIN project_roots ON project_roots.project_id = threads.project_id
-               ORDER BY threads.rowid DESC, project_roots.position LIMIT ?`,
-            )
-            .all(MAX_CODEX_PROJECT_ROOT_ROWS);
-          for (const { id, path: root } of rows) {
-            if (typeof id !== "string" || typeof root !== "string" || root.trim().length === 0) {
-              continue;
-            }
-            const roots = rootsByThread.get(id);
-            if (roots === undefined) rootsByThread.set(id, [root]);
-            else roots.push(root);
-          }
-          return rootsByThread;
-        } finally {
-          database.close();
+    if (!(yield* fileSystem.exists(databasePath).pipe(Effect.orElseSucceed(() => false)))) {
+      return rootsByThread;
+    }
+    return yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly id: unknown; readonly path: unknown }>`
+        SELECT threads.id AS id, project_roots.path AS path
+        FROM threads JOIN project_roots ON project_roots.project_id = threads.project_id
+        ORDER BY threads.rowid DESC, project_roots.position LIMIT ${MAX_CODEX_PROJECT_ROOT_ROWS}
+      `;
+      for (const { id, path: root } of rows) {
+        if (typeof id !== "string" || typeof root !== "string" || root.trim().length === 0) {
+          continue;
         }
-      },
-      catch: (cause) => new CodexStateReadError({ databasePath, cause }),
-    }).pipe(Effect.orElseSucceed((): ReadonlyMap<string, ReadonlyArray<string>> => new Map()));
+        const roots = rootsByThread.get(id);
+        if (roots === undefined) rootsByThread.set(id, [root]);
+        else roots.push(root);
+      }
+      return rootsByThread;
+    }).pipe(
+      Effect.provide(
+        NodeSqliteClient.layer({
+          filename: databasePath,
+          readonly: true,
+          writerWorker: true,
+          busyTimeoutMs: 100,
+        }),
+      ),
+      Effect.mapError((cause) => new CodexStateReadError({ databasePath, cause })),
+      Effect.orElseSucceed((): ReadonlyMap<string, ReadonlyArray<string>> => new Map()),
+    );
   });
 
-  // Only chats left in an excluded folder, such as Codex's scratch folder, take their project's root.
-  const projectCwd = (cwd: string, projectRoots: ReadonlyArray<string> | undefined) =>
-    projectRoots !== undefined &&
-    isExcludedProjectPath(path.resolve(expandHomePath(cwd.trim(), homeDir)))
-      ? projectRoots[0]!
-      : cwd;
+  // Only chats left in a scratch folder, such as Codex's, take their project's root; T3's own stay excluded.
+  const projectCwd = Effect.fnUntraced(function* (
+    cwd: string,
+    projectRoots: ReadonlyArray<string> | undefined,
+  ) {
+    if (projectRoots === undefined) return cwd;
+    const resolved = path.resolve(expandHomePath(cwd.trim(), homeDir));
+    if (!isScratchPath(resolved) || isT3OwnedPath(resolved)) return cwd;
+    const realCwd = yield* realPathOf(resolved);
+    return isT3OwnedPath(realCwd, realT3Dirs) ? cwd : projectRoots[0]!;
+  });
 
   const discoverCodexTranscripts = Effect.fn("AgentSessionScanner.discoverCodexTranscripts")(
     function* (homePath: string, providerInstanceId: ProviderInstanceId, operationBudget: number) {
@@ -1788,7 +1809,7 @@ export const make = Effect.gen(function* () {
             sameTranscriptIdentity(imported.source, transcript.identity),
         )?.cwd ?? (yield* readCwd(source, transcript, budget));
       if (rolloutCwd === null || rolloutCwd === false) continue;
-      const cwd = projectCwd(rolloutCwd, transcript.projectRoots);
+      const cwd = yield* projectCwd(rolloutCwd, transcript.projectRoots);
       const key = `${transcript.providerInstanceId}\0${cwd}`;
       const existing = byOwnerAndCwd.get(key);
       if (existing) {
@@ -2097,7 +2118,9 @@ export const make = Effect.gen(function* () {
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
+    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot, realT3Dirs)) {
+      return Stream.empty;
+    }
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
@@ -2283,7 +2306,7 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const expandedCwd = expandHomePath(
-            projectCwd(snapshot.cwd.value, transcript.projectRoots).trim(),
+            (yield* projectCwd(snapshot.cwd.value, transcript.projectRoots)).trim(),
             homeDir,
           );
           if (!path.isAbsolute(expandedCwd) || !(yield* belongsToRoot(path.resolve(expandedCwd)))) {

@@ -16,6 +16,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -1064,12 +1065,14 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           getProjectThreadRecords: (input) =>
             input.threadId === foreignThreadId && input.projectId === foreignProjectId
               ? Effect.succeed(foreignProjection(input.threadId))
-              : Effect.fail(
-                  new ThreadManagementService.ThreadManagementThreadNotFoundError({
-                    projectId: input.projectId,
-                    threadId: input.threadId,
-                  }),
-                ),
+              : input.threadId === parentThreadId && input.projectId === parentShell?.projectId
+                ? Effect.succeed(parentProjection)
+                : Effect.fail(
+                    new ThreadManagementService.ThreadManagementThreadNotFoundError({
+                      projectId: input.projectId,
+                      threadId: input.threadId,
+                    }),
+                  ),
           sendToThread: () =>
             Effect.succeed({
               run: { id: "run-foreign", status: "queued" },
@@ -1214,6 +1217,43 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       .sendToThread(makeScope(), { threadId: foreignThreadId, message: "after stop" })
       .pipe(Effect.flip);
     expect(stopped.code).toBe("parent_not_active");
+
+    const queuedRunId = RunId.make("run-parent-queued-wake");
+    parentRuns = [
+      {
+        ...makeRun({ id: queuedRunId, ordinal: 2, status: "queued" }),
+        rootNodeId: taskId,
+      },
+    ];
+    parentShell = {
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      status: "queued",
+      latestRunId: queuedRunId,
+      latestRunRequestedAt: now,
+      latestRunCompletedAt: null,
+    };
+    const queuedSent = yield* service.sendToThread(makeScope(), {
+      threadId: foreignThreadId,
+      message: "queued wake",
+    });
+    expect(queuedSent.threadId).toBe(foreignThreadId);
+    // Queued wakes do not satisfy backgroundSubagentRun when no background subagent is pending.
+    const queuedDelegate = yield* service
+      .delegateTask(makeScope(), { task: "requires an active run" })
+      .pipe(Effect.flip);
+    expect(queuedDelegate.code).toBe("parent_not_active");
+
+    parentRuns = [
+      {
+        ...makeRun({ id: queuedRunId, ordinal: 2, status: "queued" }),
+        providerInstanceId: customCodexInstanceId,
+        rootNodeId: taskId,
+      },
+    ];
+    const foreignQueuedSent = yield* service
+      .sendToThread(makeScope(), { threadId: foreignThreadId, message: "foreign queued" })
+      .pipe(Effect.flip);
+    expect(foreignQueuedSent.code).toBe("parent_not_active");
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
@@ -1331,7 +1371,11 @@ it("requestSecret saves a pasted value to a file without opening a card", async 
 it("requestSecret returns the unsaved note for a declined, cancelled or timed-out card", async () => {
   const outcomes = ["declined", "cancelled", "pending"] as const;
   const results = await Effect.forEach(outcomes, (outcome) => {
-    const dispatched: Array<{ readonly type: string; readonly turnItemId?: string }> = [];
+    const dispatched: Array<{
+      readonly type: string;
+      readonly turnItemId?: string;
+      readonly secretStatus?: string;
+    }> = [];
     const projection = () => {
       const card = dispatched.find((command) => command.type === "secret_request.record");
       return {
@@ -1390,14 +1434,24 @@ it("requestSecret returns the unsaved note for a declined, cancelled or timed-ou
         })
         .pipe(Effect.forkChild({ startImmediately: true }));
       yield* TestClock.adjust("2 seconds");
-      return yield* Fiber.join(request);
+      const result = yield* Fiber.join(request);
+      return { result, recorded: dispatched.map((command) => command.secretStatus) };
     }).pipe(Effect.provide(Layer.merge(layer, TestClock.layer())));
   }).pipe(Effect.runPromise);
 
   expect(results).toEqual([
-    { status: "declined", note: SECRET_REQUEST_UNSAVED_NOTE.declined },
-    { status: "cancelled", note: SECRET_REQUEST_UNSAVED_NOTE.cancelled },
-    { status: "timed_out", note: SECRET_REQUEST_UNSAVED_NOTE.timed_out },
+    {
+      result: { status: "declined", note: SECRET_REQUEST_UNSAVED_NOTE.declined },
+      recorded: ["pending"],
+    },
+    {
+      result: { status: "cancelled", note: SECRET_REQUEST_UNSAVED_NOTE.cancelled },
+      recorded: ["pending"],
+    },
+    {
+      result: { status: "timed_out", note: SECRET_REQUEST_UNSAVED_NOTE.timed_out },
+      recorded: ["pending", "cancelled"],
+    },
   ]);
 });
 
@@ -1487,6 +1541,84 @@ it("requestSecret cancels its card when a steering restart supersedes the reques
     expect(records.map((command) => command.secretStatus)).toEqual(["pending", "cancelled"]);
     expect(records.every((command) => command.nodeId === originalRoot)).toBe(true);
   }).pipe(Effect.provide(layer), Effect.runPromise);
+});
+
+it("requestSecret closes its card when the call is aborted while the card is being recorded", async () => {
+  const statuses: Array<string> = [];
+  const projection = () =>
+    ({
+      thread: baseThread({
+        threadId: parentThreadId,
+        title: "Parent",
+        instanceId: parentInstanceId,
+        model: "gpt-5.4",
+      }),
+      runs: [
+        { ...makeRun({ id: activeRunId, ordinal: 1, status: "running" }), rootNodeId: taskId },
+      ],
+      visibleTurnItems: [],
+      turnItems: [],
+      providerTurns: [],
+      runtimeRequests: [],
+      messages: [],
+      contextTransfers: [],
+      subagents: [],
+      updatedAt: now,
+    }) as unknown as OrchestrationV2ThreadProjection;
+
+  await Effect.gen(function* () {
+    const recorded = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = layerOrchestratorService.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.sync(projection),
+            getThreadShell: () =>
+              Effect.sync(() => projection().thread as unknown as OrchestrationV2ThreadShell),
+            // The pending card is stored before the dispatch returns to the caller.
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                if (command.type !== "secret_request.record") return {} as never;
+                statuses.push(command.secretStatus);
+                if (command.secretStatus === "pending") {
+                  yield* Deferred.succeed(recorded, undefined);
+                  yield* Deferred.await(release);
+                }
+                return {} as never;
+              }),
+          } satisfies Partial<ThreadManagementService.ThreadManagementService["Service"]>),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([]),
+          } satisfies Partial<ProviderRegistry.ProviderRegistry["Service"]>),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const request = yield* service
+        .requestSecret(makeScope(), {
+          label: "Staging password",
+          reason: "Signs in the QA account.",
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(recorded);
+      const abort = yield* Fiber.interrupt(request).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(abort);
+    }).pipe(Effect.provide(Layer.merge(layer, TestClock.layer())));
+  }).pipe(Effect.runPromise);
+
+  expect(statuses).toEqual(["pending", "cancelled"]);
 });
 
 it("requestSecret delivers a fields card as one file per field", async () => {
