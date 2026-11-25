@@ -1360,11 +1360,23 @@ const withAgentWire = Effect.fn("McpHttpServer.withAgentWire")(function* <A, E, 
             // A transfer's target is in the environment the call goes to; a link to a
             // thread in any other stays as written, and is refused as a thread id.
             const target = linkRef(routed?.targetThreadId);
-            const params =
+            const routedParams =
               target !== undefined &&
               target.environmentId === (routed.environmentId ?? caller.environmentId)
                 ? { ...routed, targetThreadId: target.threadId }
                 : routed;
+            // Deferred callers occasionally send singular `taskId` before loading t3_background_wait's schema.
+            let params = routedParams;
+            if (
+              name === "t3_background_wait" &&
+              typeof routedParams === "object" &&
+              routedParams !== null &&
+              routedParams.taskIds === undefined &&
+              typeof routedParams.taskId === "string"
+            ) {
+              const { taskId, ...rest } = routedParams;
+              params = { ...rest, taskIds: [taskId] };
+            }
             const call = options.handle(params);
             // A linked environment decodes the result itself, maybe with a schema that needs every field.
             if (caller.client?.linked === true) return call;

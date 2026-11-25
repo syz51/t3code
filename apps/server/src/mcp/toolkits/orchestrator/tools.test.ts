@@ -27,3 +27,18 @@ it("refuses a t3_thread_update whose fields do not fit its action", () => {
     true,
   );
 });
+
+it("describes t3_background_wait's taskIds key and immediate non-blocking return", () => {
+  const tool = OrchestratorToolkit.tools.t3_background_wait;
+  const description = tool.description ?? "";
+  expect(description).toContain('`taskIds: ["<id>"]`');
+  expect(description).toContain("Returns at once");
+  expect(description).toContain("`matched`");
+  expect(description).toContain("end your turn");
+  const schema = Tool.getJsonSchema(tool) as {
+    readonly properties: Readonly<Record<string, unknown>>;
+    readonly required?: ReadonlyArray<string>;
+  };
+  expect(schema.required).toContain("taskIds");
+  expect(schema.properties).not.toHaveProperty("taskId");
+});
