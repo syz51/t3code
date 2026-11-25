@@ -158,6 +158,7 @@ export const T3_CLI_COMMANDS: ReadonlyArray<string> = [
   "t3 thread start",
   "t3 thread send",
   "t3 thread show",
+  "t3 thread interrupt",
   "t3 feedback",
   "t3 feedback list",
   "t3 workflow",

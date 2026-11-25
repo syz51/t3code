@@ -1,5 +1,6 @@
 import {
   OrchestratorMcpFailure,
+  OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadToolResult,
   OrchestratorMcpThreadSendResult,
@@ -1125,12 +1126,55 @@ const threadShowCommand = Command.make("show", {
   ),
 );
 
+const formatInterruptResult = (result: OrchestratorMcpThreadInterruptResult): string => {
+  switch (result.status) {
+    case "interrupt_requested":
+      return "Interrupt requested.";
+    case "no_active_run":
+      return "No active run.";
+    case "completed":
+    case "failed":
+    case "cancelled":
+    case "interrupted":
+    case "rolled_back":
+      return `Already ${result.status}.`;
+  }
+};
+
+const threadInterruptCommand = Command.make("interrupt", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription("Interrupt a thread's running turn."),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const threadId = yield* decodeThreadId(flags.thread);
+      yield* withThreadTools(
+        flags,
+        Effect.fn("cli.thread.interrupt")(function* (tools) {
+          const interrupted = yield* tools.call(
+            "t3_thread_interrupt",
+            { threadId },
+            OrchestratorMcpThreadInterruptResult,
+          );
+          if (flags.json) {
+            return yield* printJson(interrupted);
+          }
+          yield* Console.log(formatInterruptResult(interrupted));
+        }),
+      );
+    }).pipe(reportThreadErrors),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
-  Command.withDescription("Start, message, and read threads on the running server."),
+  Command.withDescription("Start, message, interrupt, and read threads on the running server."),
   Command.withSubcommands([
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
     threadShowCommand,
+    threadInterruptCommand,
   ]),
 );
