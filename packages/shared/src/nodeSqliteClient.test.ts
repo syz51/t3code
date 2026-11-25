@@ -1076,3 +1076,42 @@ it.effect("keeps writes moving while an outside reader pins the WAL, then trims 
     }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it.effect("closes reader and checkpoint workers cleanly and checkpoints the WAL on shutdown", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-clean-close-" });
+    const filename = path.join(directory, "state.sqlite");
+    const seed = new NodeSqlite.DatabaseSync(filename);
+    seed.exec("PRAGMA journal_mode = WAL; CREATE TABLE entries(name TEXT NOT NULL)");
+    seed.close();
+
+    const startedBefore = startedWorkers.length;
+    const exitCodes = new Map<NodeWorkerThreads.Worker, Promise<number>>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO entries VALUES ('written')`;
+        assert.deepEqual(yield* sql`SELECT name FROM entries`.values.pipe(SqliteClient.readOnly), [
+          ["written"],
+        ]);
+        for (const worker of startedWorkers.slice(startedBefore)) {
+          exitCodes.set(
+            worker,
+            new Promise((resolve) => worker.once("exit", (code) => resolve(code))),
+          );
+        }
+      }).pipe(
+        Effect.provide(SqliteClient.layer({ filename, writerWorker: true, readerWorker: true })),
+      ),
+    );
+
+    assert.isAtLeast(exitCodes.size, 3);
+    for (const exitPromise of exitCodes.values()) {
+      assert.equal(yield* Effect.promise(() => exitPromise), 0);
+    }
+    assert.isFalse(yield* fs.exists(`${filename}-wal`));
+    assert.isFalse(yield* fs.exists(`${filename}-shm`));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

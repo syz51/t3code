@@ -46,10 +46,16 @@ main_pids() {
     $2 == 1 { cmd = $0; sub(/^ *[0-9]+ +[0-9]+ /, "", cmd); if (index(cmd, prefix) == 1) print $1 }'
 }
 is_app_pid() { ps -p "$1" -o command= | grep -qF "$app/Contents/MacOS/"; }
+db_open_pids() {
+  local db_files=("$db")
+  [[ -e "$db-wal" ]] && db_files+=("$db-wal")
+  [[ -e "$db-shm" ]] && db_files+=("$db-shm")
+  lsof -t "${db_files[@]}" 2>/dev/null || true
+}
 # shellcheck disable=SC2009
 busy() {
   ps -axo command= | grep -F "$app/Contents/" | grep -v grep >/dev/null && return 0
-  [[ -n "$(lsof -t "$db" 2>/dev/null)" ]]
+  [[ -n "$(db_open_pids)" ]]
 }
 wait_free() {
   for _ in $(seq "$1"); do
@@ -124,7 +130,7 @@ else
       log "still busy; nothing changed"
       # shellcheck disable=SC2009
       ps -axo pid=,command= | grep -F "$app/Contents/" | grep -v grep
-      lsof -t "$db"
+      db_open_pids
       exit 1
     fi
   fi
@@ -134,16 +140,18 @@ fi
 backup_db="$backup/statev2.sqlite"
 old_app="$backup/$(basename "$app")"
 echo "+ mkdir -p '$backup'"
-echo "+ sqlite3 'file:$db?mode=ro&immutable=1' \"VACUUM INTO '$backup_db'\""
+echo "+ sqlite3 '$db' \"PRAGMA busy_timeout = 5000; VACUUM INTO '$backup_db'\""
 if [[ $dry_run -eq 0 ]]; then
   mkdir -p "$backup" || {
     reopen
     exit 1
   }
-  # WAL database with no -shm once the app quits: a plain mode=ro open fails, and nothing holds it now.
-  if ! sqlite3 "file:$db?mode=ro&immutable=1" "VACUUM INTO '${backup_db//\'/\'\'}'" ||
+  # Open normally (never immutable=1) so any uncheckpointed -wal frames are replayed into the backup.
+  if ! sqlite3 "$db" "PRAGMA busy_timeout = 5000; VACUUM INTO '${backup_db//\'/\'\'}'" ||
     [[ "$(sqlite3 "file:$backup_db?mode=ro" "PRAGMA quick_check")" != "ok" ]]; then
     log "database backup failed; nothing else changed"
+    rm -f "$backup_db" "$backup_db-wal" "$backup_db-shm"
+    rmdir "$backup" 2>/dev/null || true
     reopen
     exit 1
   fi
