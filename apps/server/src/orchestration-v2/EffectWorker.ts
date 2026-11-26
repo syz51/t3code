@@ -24,6 +24,7 @@ import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as AntigravitySessionRetention from "../provider/acp/AntigravitySessionRetention.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -119,6 +120,7 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const projectionMaintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const antigravityRetention = yield* AntigravitySessionRetention.AntigravitySessionRetention;
     const settings = yield* ServerSettings.ServerSettingsService;
     const startRun = (
       effect: EffectOutbox.OrchestrationEffectV2,
@@ -684,6 +686,23 @@ export const layerExecutor: Layer.Layer<
           }
           case "thread-content.purge":
             return projectionMaintenance.purgeDeletedThread(effect.threadId).pipe(
+              Effect.andThen(
+                antigravityRetention
+                  .purgeDeletedThread(effect.threadId, {
+                    isSessionLive: providerSessions.isLive,
+                  })
+                  .pipe(
+                    Effect.catch((cause) =>
+                      Effect.logWarning(
+                        "Could not purge Antigravity session files for deleted thread",
+                        {
+                          threadId: effect.threadId,
+                          cause,
+                        },
+                      ),
+                    ),
+                  ),
+              ),
               Effect.asVoid,
               Effect.mapError(
                 (cause) =>

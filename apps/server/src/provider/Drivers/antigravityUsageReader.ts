@@ -594,21 +594,14 @@ interface CachedDatabase {
 /** Fingerprint canonical DB/WAL paths by size, mtime and ctime; WAL holds new rows, and ctime catches restored mtimes. */
 export const makeAntigravityUsageCache = () => new Map<string, CachedDatabase>();
 
-export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* (
-  conversationsDirectories: string | readonly string[],
+const resolveAntigravityUsageCandidates = Effect.fnUntraced(function* <
+  Entry extends { records: UsageRecord[] },
+>(
+  files: ReadonlyArray<Entry>,
+  pending: ReadonlyArray<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }>,
+  models: ReadonlyMap<number, string | null>,
   sinceMs: number,
-  cache?: Map<string, CachedDatabase>,
 ) {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const pathService = yield* Path.Path;
-  const roots =
-    typeof conversationsDirectories === "string"
-      ? [conversationsDirectories]
-      : conversationsDirectories;
-  const files: Array<{ root: string; path: string; records: UsageRecord[] }> = [];
-  const errors: string[] = [];
-  const models = new Map<number, string | null>();
-  const pending: Array<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }> = [];
   const identities = new Map<string, number>();
   const groups: Array<
     UsageCandidate & { parent: number; size: number; owner: number; fileIndex: number }
@@ -674,6 +667,132 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
       identities.set(key, index);
     }
   };
+  for (const { data, fileIndex } of pending) {
+    for (const [index, candidate] of data.candidates.entries()) {
+      const learned = models.get(candidate.modelId);
+      const fallback = learned === null ? undefined : MODEL_IDS[candidate.modelId];
+      const model =
+        (candidate.modelQuality === 4 ? candidate.record.model : "") ||
+        learned ||
+        fallback ||
+        candidate.record.model ||
+        (candidate.modelId > 0 ? `antigravity-model-${candidate.modelId}` : "antigravity-unknown");
+      append(
+        {
+          ...candidate,
+          record: { ...candidate.record, model },
+          modelQuality:
+            candidate.modelQuality === 4 ? 4 : learned ? 3 : fallback ? 2 : candidate.modelQuality,
+        },
+        fileIndex,
+      );
+      if (index % 256 === 255) yield* Effect.yieldNow;
+    }
+  }
+  for (const [index, group] of groups.entries()) {
+    if (group.parent === index && group.record.timestampMs >= sinceMs) {
+      files[group.fileIndex]!.records.push(withRateModel(group.record));
+    }
+  }
+});
+
+export interface AntigravityUsageFileEntry {
+  readonly path: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly records: readonly UsageRecord[];
+}
+
+/** Reads usage records for an explicit list of Antigravity `.db` files off the event loop. */
+export const readAntigravityUsageFiles = Effect.fn("readAntigravityUsageFiles")(function* (
+  dbPaths: readonly string[],
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const pathService = yield* Path.Path;
+  const files: Array<{ path: string; size: number; mtimeMs: number; records: UsageRecord[] }> = [];
+  const errors: string[] = [];
+  const models = new Map<number, string | null>();
+  const pending: Array<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }> = [];
+  const visited = new Set<string>();
+  const reader = yield* makeSqliteReaderWorker;
+
+  for (const dbPath of dbPaths) {
+    const canonical = yield* fileSystem.realPath(dbPath).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) => {
+          if (cause.reason._tag !== "NotFound") errors.push(dbPath);
+          return Effect.succeed(null);
+        },
+      }),
+    );
+    if (canonical === null || visited.has(canonical)) continue;
+    visited.add(canonical);
+    const stat = yield* Effect.tryPromise({
+      try: () => NodeFSP.stat(canonical),
+      catch: (cause) => new AntigravityDatabaseDecodeError({ path: canonical, cause }),
+    }).pipe(
+      Effect.catch(() => {
+        errors.push(canonical);
+        return Effect.succeed(null);
+      }),
+    );
+    if (stat === null) continue;
+    const walStat = yield* Effect.tryPromise({
+      try: () => NodeFSP.stat(`${canonical}-wal`),
+      catch: () => undefined,
+    }).pipe(Effect.orElseSucceed(() => undefined));
+    const mtimeMs = Math.max(stat.mtimeMs, walStat?.mtimeMs ?? 0);
+    const data = yield* readDatabase(
+      reader,
+      canonical,
+      pathService.basename(canonical, ".db"),
+      mtimeMs,
+    ).pipe(
+      Effect.catch(() => {
+        errors.push(canonical);
+        return Effect.succeed("failed" as const);
+      }),
+    );
+    if (data === "failed") continue;
+    const fileIndex = files.length;
+    files.push({ path: canonical, size: stat.size, mtimeMs, records: [] });
+    if (data !== null) {
+      for (const [id, model] of data.models) {
+        rememberModel(models, id, model);
+      }
+      pending.push({ data, fileIndex });
+    }
+  }
+
+  yield* resolveAntigravityUsageCandidates(files, pending, models, 0);
+  const finalized: ReadonlyArray<AntigravityUsageFileEntry> = files.map((file) => {
+    const latestRecordMs = file.records.reduce(
+      (max, record) => Math.max(max, record.timestampMs),
+      0,
+    );
+    return {
+      ...file,
+      mtimeMs: Math.max(file.mtimeMs, latestRecordMs),
+    };
+  });
+  return { files: finalized, errors };
+}, Effect.scoped);
+
+export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* (
+  conversationsDirectories: string | readonly string[],
+  sinceMs: number,
+  cache?: Map<string, CachedDatabase>,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const pathService = yield* Path.Path;
+  const roots =
+    typeof conversationsDirectories === "string"
+      ? [conversationsDirectories]
+      : conversationsDirectories;
+  const files: Array<{ root: string; path: string; records: UsageRecord[] }> = [];
+  const errors: string[] = [];
+  const models = new Map<number, string | null>();
+  const pending: Array<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }> = [];
   const visited = new Set<string>();
   const reader = yield* makeSqliteReaderWorker;
   const readFile = Effect.fn("readAntigravityUsage.readFile")(function* (path: string) {
@@ -743,32 +862,6 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
   if (cache !== undefined) {
     for (const key of cache.keys()) if (!visited.has(key)) cache.delete(key);
   }
-  for (const { data, fileIndex } of pending) {
-    for (const [index, candidate] of data.candidates.entries()) {
-      const learned = models.get(candidate.modelId);
-      const fallback = learned === null ? undefined : MODEL_IDS[candidate.modelId];
-      const model =
-        (candidate.modelQuality === 4 ? candidate.record.model : "") ||
-        learned ||
-        fallback ||
-        candidate.record.model ||
-        (candidate.modelId > 0 ? `antigravity-model-${candidate.modelId}` : "antigravity-unknown");
-      append(
-        {
-          ...candidate,
-          record: { ...candidate.record, model },
-          modelQuality:
-            candidate.modelQuality === 4 ? 4 : learned ? 3 : fallback ? 2 : candidate.modelQuality,
-        },
-        fileIndex,
-      );
-      if (index % 256 === 255) yield* Effect.yieldNow;
-    }
-  }
-  for (const [index, group] of groups.entries()) {
-    if (group.parent === index && group.record.timestampMs >= sinceMs) {
-      files[group.fileIndex]!.records.push(withRateModel(group.record));
-    }
-  }
+  yield* resolveAntigravityUsageCandidates(files, pending, models, sinceMs);
   return { files, errors };
 }, Effect.scoped);

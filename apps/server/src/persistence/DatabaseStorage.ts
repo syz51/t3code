@@ -16,6 +16,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { resolveHostCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
+import * as AntigravitySessionRetention from "../provider/acp/AntigravitySessionRetention.ts";
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import { forkParked } from "../serverActivation.ts";
 
@@ -46,6 +47,7 @@ const formatGiB = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+  const antigravityRetention = yield* AntigravitySessionRetention.AntigravitySessionRetention;
   const config = yield* ServerConfig.ServerConfig;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -151,6 +153,15 @@ const make = Effect.gen(function* () {
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
     const result = yield* maintenance.pruneEventStore(betweenPages);
+    const antigravityResult = yield* antigravityRetention
+      .pruneSessions(betweenPages)
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Antigravity session retention failed", { cause }).pipe(
+            Effect.as(AntigravitySessionRetention.EMPTY_RETENTION_RESULT),
+          ),
+        ),
+      );
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
     if (
@@ -160,6 +171,14 @@ const make = Effect.gen(function* () {
       result.purgedRowCount > 0
     ) {
       yield* Effect.logInfo("Compacted orchestration history", result);
+    }
+    if (
+      antigravityResult.deletedSessions > 0 ||
+      antigravityResult.prunedSettledSessions > 0 ||
+      antigravityResult.removedSubagentSessions > 0 ||
+      antigravityResult.removedOrphanSessions > 0
+    ) {
+      yield* Effect.logInfo("Pruned Antigravity ACP session files", antigravityResult);
     }
   }).pipe(
     Effect.catch((cause) =>

@@ -177,6 +177,7 @@ function isRecordArray(value: unknown): value is readonly unknown[] {
 export function decodeScanCache(
   document: unknown,
   formats: ReadonlyMap<UsageProviderKind, TranscriptUsageFormat<unknown>>,
+  scanProviders?: ReadonlySet<UsageProviderKind>,
 ): ScanCache {
   const cache: ScanCache = new Map();
   const isValidState = makeStateValidators(formats);
@@ -288,7 +289,8 @@ export function decodeScanCache(
     if (typeof entry.s !== "number" || typeof entry.m !== "number") continue;
     if (entry.p === undefined) continue;
     const format = formats.get(entry.p);
-    if (format === undefined) continue;
+    const isScanProvider = format === undefined && scanProviders?.has(entry.p) === true;
+    if (format === undefined && !isScanProvider) continue;
     if (!isRecordArray(entry.r) || !isRecordArray(entry.t)) continue;
     const malformedCount = entry.mr === undefined ? 0 : entry.mr;
     if (!Number.isSafeInteger(malformedCount) || malformedCount < 0) continue;
@@ -325,14 +327,19 @@ export function decodeScanCache(
     // v15 repairs skipped Codex requests whose counters rewound; clean v14 entries stay served.
     // v17 keys Grok turns by time, restoring turns previously dropped as repeats.
     const legacy =
-      (entry.p === "claude" && version < 13) ||
-      (entry.p === "grok" && version < 17) ||
-      (format.state !== undefined &&
-        (version < 6 ||
-          (entry.p === "codex" && (version < 14 || (version < 15 && malformedCount > 0)))));
+      !isScanProvider &&
+      ((entry.p === "claude" && version < 13) ||
+        (entry.p === "grok" && version < 17) ||
+        (format?.state !== undefined &&
+          (version < 6 ||
+            (entry.p === "codex" && (version < 14 || (version < 15 && malformedCount > 0))))));
     // A corrupt state disqualifies the entry: resuming with it would attach
     // appended usage to the wrong model or replay fork-copied history.
-    if (!legacy && !isValidState.get(entry.p)?.(entry.cs)) continue;
+    if (isScanProvider) {
+      if (entry.cs !== null) continue;
+    } else if (!legacy && !isValidState.get(entry.p)?.(entry.cs)) {
+      continue;
+    }
     // Before v16 a Codex baseline can lack the time of its latest move, or carry an older one,
     // and that time keeps a re-emitted older snapshot from billing twice. A grown file re-parses
     // whole instead of resuming.

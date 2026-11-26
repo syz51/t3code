@@ -10,6 +10,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -3565,5 +3566,98 @@ describe("AntigravityAdapterV2 update_steps checklist", () => {
         ["Create b.txt", "running"],
       ]);
     }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "falls back cleanly to a fresh session when reopening a pruned Antigravity session whose .db was removed",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const profileDirectory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-agy-pruned-reopen-",
+        });
+        const conversationsDir = path.join(profileDirectory, "antigravity-acp", "conversations");
+        yield* fs.makeDirectory(conversationsDir, { recursive: true });
+        const prunedSessionId = "11111111-1111-4111-8111-111111111111";
+        const requestedResumeIds: Array<string | undefined> = [];
+
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId: ProviderInstanceId.make("antigravity"),
+          selfInvocation: yield* resolveSelfInvocation(),
+          profileDirectory,
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.succeed("gemini-test-low"),
+          makeRuntime: (runtimeInput) =>
+            Effect.sync(() => {
+              requestedResumeIds.push(runtimeInput.resumeSessionId);
+            }).pipe(
+              Effect.andThen(
+                makeAntigravityAcpRuntime({
+                  ...runtimeInput,
+                  childProcessSpawner,
+                  spawn: {
+                    command: process.execPath,
+                    args: [mockAgentPath],
+                    cwd: runtimeInput.cwd,
+                    env: { T3_ACP_ANTIGRAVITY: "1" },
+                  },
+                }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+              ),
+            ),
+        });
+
+        const threadId = ThreadId.make("thread-pruned-reopen");
+        const modelSelection = {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "gemini-test-low",
+        } as const;
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-pruned-reopen"),
+          modelSelection,
+          runtimePolicy,
+          initialNativeThreadId: prunedSessionId,
+        });
+
+        // First call fails resume so ProviderTurnStartService triggers portable context handoff.
+        const freshProviderThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.isNotNull(freshProviderThread.nativeThreadRef?.nativeId);
+        assert.notEqual(freshProviderThread.nativeThreadRef?.nativeId, prunedSessionId);
+        // Never spawned a doomed runtime for the pruned session ID.
+        assert.deepEqual(requestedResumeIds, [undefined]);
+
+        const resumeFailure = yield* session
+          .resumeThread({
+            providerThread: {
+              ...freshProviderThread,
+              id: ProviderThreadId.make("pt-pruned-reopen"),
+              nativeThreadRef: {
+                driver: ProviderDriverKind.make("antigravity"),
+                nativeId: prunedSessionId,
+                strength: "strong",
+              },
+            },
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.flip);
+        assert.equal(resumeFailure._tag, "ProviderAdapterResumeThreadError");
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
