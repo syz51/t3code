@@ -68,6 +68,42 @@ reopen() {
   log "reopening the unchanged app"
   env -u ELECTRON_RUN_AS_NODE open "$app"
 }
+# Self-contained signature check: this script is rsynced standalone to the Pro without helper scripts.
+verify_signed_build() {
+  local target="$1"
+  local expected_id="$2"
+  local verify_out dvvv req_out designated authority
+  if ! verify_out="$(codesign --verify --deep --strict "$target" 2>&1)"; then
+    fail "$target failed codesign --verify --deep --strict (refusing to install): $verify_out"
+  fi
+  if ! dvvv="$(codesign -dvvv "$target" 2>&1)"; then
+    fail "cannot inspect signature of $target: $dvvv"
+  fi
+  if printf '%s\n' "$dvvv" | grep -qE '^Signature=adhoc$|^CodeDirectory .*adhoc'; then
+    fail "$target is ad-hoc signed; sign it on the build host before installing"
+  fi
+  authority="$(printf '%s\n' "$dvvv" | sed -n 's/^Authority=//p' | head -1)"
+  [[ -n "$authority" ]] || fail "$target has no signing Authority; refusing to install"
+  printf '%s\n' "$dvvv" | grep -qxF "Identifier=$expected_id" ||
+    fail "$target signature Identifier does not match $expected_id"
+  printf '%s\n' "$dvvv" | grep -qE '^Info\.plist entries=[0-9]+' ||
+    fail "$target Info.plist is not bound by its signature"
+  printf '%s\n' "$dvvv" | grep -qE '^Sealed Resources version=' ||
+    fail "$target has no sealed resources in its signature"
+  if ! req_out="$(codesign -d -r- "$target" 2>&1)"; then
+    fail "cannot read designated requirement of $target: $req_out"
+  fi
+  designated="$(printf '%s\n' "$req_out" | sed -n 's/^designated => //p' | head -1)"
+  [[ -n "$designated" ]] || fail "$target has no designated requirement (ad-hoc or unsigned)"
+  if printf '%s\n' "$designated" | grep -qE '\bcdhash\b'; then
+    fail "$target designated requirement pins a cdhash instead of a certificate ($designated)"
+  fi
+  if ! printf '%s\n' "$designated" | grep -qF "identifier \"$expected_id\"" ||
+    ! printf '%s\n' "$designated" | grep -qE '\bcertificate\b'; then
+    fail "$target designated requirement does not pin identifier \"$expected_id\" and certificate ($designated)"
+  fi
+  build_authority="$authority"
+}
 
 [[ -d "$new" ]] || fail "no new build at $new; build it first"
 [[ -d "$app" ]] || fail "no installed app at $app; use scripts/fork-app-swap.sh for the first install"
@@ -75,8 +111,12 @@ reopen() {
 new_version="$(plist "$new" CFBundleShortVersionString)" || fail "cannot read the version of $new"
 old_version="$(plist "$app" CFBundleShortVersionString)" || fail "cannot read the version of $app"
 [[ "$new_version" == *-fork.* ]] || fail "$new is version $new_version, not a fork build"
-[[ "$(plist "$new" CFBundleIdentifier)" == "$(plist "$app" CFBundleIdentifier)" ]] ||
+new_bundle_id="$(plist "$new" CFBundleIdentifier)" || fail "cannot read the bundle id of $new"
+old_bundle_id="$(plist "$app" CFBundleIdentifier)" || fail "cannot read the bundle id of $app"
+[[ "$new_bundle_id" == "$old_bundle_id" ]] ||
   fail "the new build and the installed app have different bundle ids"
+build_authority=""
+verify_signed_build "$new" "$new_bundle_id"
 
 if [[ -n "$app_pid" ]]; then
   is_app_pid "$app_pid" || fail "pid $app_pid is not a process of $app"
@@ -91,6 +131,7 @@ free_kib="$(df -k "$HOME" | awk 'NR == 2 { print $4 }')"
 
 if [[ $dry_run -eq 1 ]]; then
   echo "New build: $new ($new_version)"
+  echo "Signed by: $build_authority"
   echo "Installed: $app ($old_version)"
   echo "Main pid:  ${app_pid:-none, the app is not running}"
   echo "Database:  $db"

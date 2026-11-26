@@ -10,25 +10,150 @@ import { assert, describe, it } from "vite-plus/test";
 
 const repoRoot = NodePath.resolve(import.meta.dirname, "..");
 const updateScript = NodePath.join(repoRoot, "scripts", "fork-app-update.sh");
+const signScript = NodePath.join(repoRoot, "scripts", "fork-app-sign.sh");
+
+const runChecked = (command: string, args: ReadonlyArray<string>) => {
+  const result = NodeChildProcess.spawnSync(command, args, { encoding: "utf8" });
+  assert.equal(
+    result.status,
+    0,
+    `${command} ${args.join(" ")} failed:\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  return result;
+};
+
+const createTempSigningKeychain = (dir: string) => {
+  const keychainPath = NodePath.join(dir, "update-test.keychain-db");
+  const password = "test-keychain-password";
+  const extPath = NodePath.join(dir, "ext.cnf");
+  const keyPath = NodePath.join(dir, "key.pem");
+  const certPath = NodePath.join(dir, "cert.pem");
+  const p12Path = NodePath.join(dir, "id.p12");
+  NodeFS.writeFileSync(
+    extPath,
+    `[req]
+distinguished_name = dn
+x509_extensions = codesign
+prompt = no
+[dn]
+CN = T3 Code Fork Test
+[codesign]
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+basicConstraints = critical, CA:FALSE
+`,
+  );
+  runChecked("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-nodes",
+    "-keyout",
+    keyPath,
+    "-out",
+    certPath,
+    "-days",
+    "30",
+    "-config",
+    extPath,
+  ]);
+  const legacyExport = NodeChildProcess.spawnSync(
+    "openssl",
+    [
+      "pkcs12",
+      "-export",
+      "-legacy",
+      "-inkey",
+      keyPath,
+      "-in",
+      certPath,
+      "-out",
+      p12Path,
+      "-passout",
+      `pass:${password}`,
+    ],
+    { encoding: "utf8" },
+  );
+  if (legacyExport.status !== 0) {
+    runChecked("openssl", [
+      "pkcs12",
+      "-export",
+      "-inkey",
+      keyPath,
+      "-in",
+      certPath,
+      "-out",
+      p12Path,
+      "-passout",
+      `pass:${password}`,
+    ]);
+  }
+  runChecked("security", ["create-keychain", "-p", password, keychainPath]);
+  runChecked("security", ["unlock-keychain", "-p", password, keychainPath]);
+  runChecked("security", [
+    "import",
+    p12Path,
+    "-k",
+    keychainPath,
+    "-P",
+    password,
+    "-T",
+    "/usr/bin/codesign",
+  ]);
+  runChecked("security", [
+    "set-key-partition-list",
+    "-S",
+    "apple-tool:,apple:,codesign:",
+    "-s",
+    "-k",
+    password,
+    keychainPath,
+  ]);
+  return {
+    keychainPath,
+    identity: "T3 Code Fork Test",
+    cleanup: () => {
+      NodeChildProcess.spawnSync("security", ["delete-keychain", keychainPath], {
+        encoding: "utf8",
+      });
+    },
+  };
+};
 
 const makeFakeApp = (dir: string, version: string) => {
   const contents = NodePath.join(dir, "Contents");
   const macos = NodePath.join(contents, "MacOS");
+  const resources = NodePath.join(contents, "Resources");
   NodeFS.mkdirSync(macos, { recursive: true });
+  NodeFS.mkdirSync(resources, { recursive: true });
+  NodeFS.copyFileSync("/usr/bin/true", NodePath.join(macos, "T3 Code (Beta)"));
+  NodeFS.chmodSync(NodePath.join(macos, "T3 Code (Beta)"), 0o755);
+  NodeFS.writeFileSync(NodePath.join(resources, "version.txt"), `${version}\n`);
   NodeFS.writeFileSync(
     NodePath.join(contents, "Info.plist"),
     `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleExecutable</key>
+  <string>T3 Code (Beta)</string>
   <key>CFBundleIdentifier</key>
   <string>com.t3tools.t3code</string>
+  <key>CFBundleName</key>
+  <string>T3 Code (Beta)</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
   <key>CFBundleShortVersionString</key>
   <string>${version}</string>
 </dict>
 </plist>
 `,
   );
+};
+
+const signFakeApp = (appDir: string, keychainPath: string, identity: string) => {
+  runChecked("bash", [signScript, "--identity", identity, "--keychain", keychainPath, appDir]);
 };
 
 const makeStubBin = (dir: string) => {
@@ -118,6 +243,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
     "backs up an uncheckpointed WAL database ($label) and installs the new build",
     ({ keepShm, partialCheckpoint, expectedCount }) => {
       const workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-update-test-"));
+      const kc = createTempSigningKeychain(workDir);
       try {
         const installedApp = NodePath.join(workDir, "apps", "T3 Code (Beta).app");
         const newBuild = NodePath.join(workDir, "build", "T3 Code (Beta).app");
@@ -127,6 +253,9 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
         NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
         makeFakeApp(installedApp, "0.1.12-fork.20261125");
         makeFakeApp(newBuild, "0.1.12-fork.20261126");
+        signFakeApp(newBuild, kc.keychainPath, kc.identity);
+        // Remove the signing keychain before running the update script to match the Pro host.
+        kc.cleanup();
         seedUncheckpointedWalDb(dbPath, { keepShm, partialCheckpoint });
 
         assert.isTrue(NodeFS.existsSync(`${dbPath}-wal`));
@@ -164,6 +293,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
           verify.close();
         }
       } finally {
+        kc.cleanup();
         NodeFS.rmSync(workDir, { recursive: true, force: true });
       }
     },
@@ -171,6 +301,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
 
   it("cleans up the empty backup directory and reopens the unchanged app when backup fails", () => {
     const workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-update-fail-"));
+    const kc = createTempSigningKeychain(workDir);
     try {
       const installedApp = NodePath.join(workDir, "apps", "T3 Code (Beta).app");
       const newBuild = NodePath.join(workDir, "build", "T3 Code (Beta).app");
@@ -179,6 +310,8 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
       NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
       makeFakeApp(installedApp, "0.1.12-fork.20261125");
       makeFakeApp(newBuild, "0.1.12-fork.20261126");
+      signFakeApp(newBuild, kc.keychainPath, kc.identity);
+      kc.cleanup();
       NodeFS.writeFileSync(dbPath, "not a sqlite database");
 
       const { binDir, openLog } = makeStubBin(workDir);
@@ -198,6 +331,77 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "darwin")("fork-app-upda
       assert.include(result.stdout, "database backup failed; nothing else changed");
       assert.equal(NodeFS.existsSync(backupRoot) ? NodeFS.readdirSync(backupRoot).length : 0, 0);
       assert.include(NodeFS.readFileSync(openLog, "utf8"), installedApp);
+    } finally {
+      kc.cleanup();
+      NodeFS.rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an ad-hoc signed build before swapping and leaves the installed app in place", () => {
+    const workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-update-adhoc-"));
+    try {
+      const installedApp = NodePath.join(workDir, "apps", "T3 Code (Beta).app");
+      const newBuild = NodePath.join(workDir, "build", "T3 Code (Beta).app");
+      const backupRoot = NodePath.join(workDir, "backups");
+      const dbPath = NodePath.join(workDir, "userdata", "statev2.sqlite");
+      NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
+      makeFakeApp(installedApp, "0.1.12-fork.20261125");
+      makeFakeApp(newBuild, "0.1.12-fork.20261126");
+      runChecked("codesign", ["--force", "--deep", "--sign", "-", newBuild]);
+      NodeFS.writeFileSync(dbPath, "placeholder");
+
+      const { binDir, openLog } = makeStubBin(workDir);
+      const result = NodeChildProcess.spawnSync("bash", [updateScript], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          T3_UPDATE_APP: installedApp,
+          T3_UPDATE_BUILD: newBuild,
+          T3_UPDATE_STATE_DB: dbPath,
+          T3_UPDATE_BACKUP_ROOT: backupRoot,
+        },
+      });
+
+      assert.equal(result.status, 1);
+      assert.include(result.stderr, "ad-hoc signed");
+      assert.equal(
+        NodeFS.readFileSync(
+          NodePath.join(installedApp, "Contents", "Resources", "version.txt"),
+          "utf8",
+        ).trim(),
+        "0.1.12-fork.20261125",
+      );
+      assert.isFalse(NodeFS.existsSync(backupRoot));
+      assert.isFalse(NodeFS.existsSync(openLog));
+    } finally {
+      NodeFS.rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an unsigned build in --dry-run mode too", () => {
+    const workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-update-unsigned-"));
+    try {
+      const installedApp = NodePath.join(workDir, "apps", "T3 Code (Beta).app");
+      const newBuild = NodePath.join(workDir, "build", "T3 Code (Beta).app");
+      const dbPath = NodePath.join(workDir, "userdata", "statev2.sqlite");
+      NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
+      makeFakeApp(installedApp, "0.1.12-fork.20261125");
+      makeFakeApp(newBuild, "0.1.12-fork.20261126");
+      NodeFS.writeFileSync(dbPath, "placeholder");
+
+      const result = NodeChildProcess.spawnSync("bash", [updateScript, "--dry-run"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          T3_UPDATE_APP: installedApp,
+          T3_UPDATE_BUILD: newBuild,
+          T3_UPDATE_STATE_DB: dbPath,
+        },
+      });
+
+      assert.equal(result.status, 1);
+      assert.include(result.stderr, "failed codesign --verify --deep --strict");
     } finally {
       NodeFS.rmSync(workDir, { recursive: true, force: true });
     }

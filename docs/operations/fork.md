@@ -152,8 +152,11 @@ After the sync PR merges, update the installed app on both Macs with
 running thread on that Mac, the sync's own thread on the Air included.
 
 1. On the Air, check out the merged `origin/fork` and build the app as in
-   [Desktop app](#desktop-app).
-2. Update the Pro first. It has no checkout, so copy the build and the script:
+   [Desktop app](#desktop-app). On macOS, a `-fork.` build automatically signs the `.app` with the
+   Air's [`T3 Code Fork` identity](#signing-identity) (`scripts/fork-app-sign.sh`) before writing
+   `~/.t3-fork/build/mac-arm64/` and fails loudly when that identity is missing.
+2. Update the Pro first. It has no checkout and needs no signing identity of its own, so copy the
+   already-signed build and the update script:
 
    ```sh
    rsync -a --delete ~/.t3-fork/build/mac-arm64/ roy-macbook-pro:.t3-fork/build/mac-arm64/
@@ -161,9 +164,11 @@ running thread on that Mac, the sync's own thread on the Air included.
    ssh roy-macbook-pro '~/.t3-fork/fork-app-update.sh --dry-run && ~/.t3-fork/fork-app-update.sh --detach'
    ```
 
-   About three minutes later, `ssh roy-macbook-pro 'tail -3 ~/.t3-fork/update.log'` must end with
-   `finished` and the new version. When the Pro is asleep or the update fails there, file a board
-   task and continue with the Air.
+   `scripts/fork-app-update.sh` verifies the signature on either Mac and refuses unsigned or
+   ad-hoc builds before stopping the running app. About three minutes later,
+   `ssh roy-macbook-pro 'tail -3 ~/.t3-fork/update.log'` must end with `finished` and the new
+   version. When the Pro is asleep or the update fails there, file a board task and continue with
+   the Air.
 
 3. Finish everything else: the board task, the report and the final reply.
 4. Update the Air last, as the last command of the turn: `scripts/fork-app-update.sh --detach`.
@@ -291,10 +296,13 @@ T3CODE_DESKTOP_VERSION=0.1.8-fork.$(date +%Y%m%d) \
 never loads a T3 Connect sign-in and every relay environment shows "still loading its T3 Connect
 sign-in". A fork version refuses to build without it.
 
-It builds an unsigned (ad-hoc signed) app at `~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` in
-about a minute. Do not open it from Finder while Nightly runs. To try it beside Nightly, give it
-its own home folder, so it uses its own Electron data folder, single-instance lock and state.
-That home has no provider logins, so it suits a launch check, not agent turns:
+On macOS, a `-fork.` build checks for the local `T3 Code Fork` signing identity up front and runs
+`scripts/fork-app-sign.sh` on the packaged `.app` before writing
+`~/.t3-fork/build/mac-arm64/T3 Code (Beta).app` (about a minute total). The build fails loudly
+when the identity is missing. Do not open the built app from Finder while Nightly runs. To try it
+beside Nightly, give it its own home folder, so it uses its own Electron data folder,
+single-instance lock and state. That home has no provider logins, so it suits a launch check, not
+agent turns:
 
 ```sh
 mkdir -p /tmp/t3-fork-home
@@ -324,7 +332,7 @@ Apart from its version, it has the same identity as Nightly:
 | ------------- | ----------------------------------------- | -------------------------------- |
 | Name          | T3 Code (Beta), 0.1.8-fork.YYYYMMDD       | T3 Code (Nightly), 0.1.8-nightly |
 | Bundle id     | `com.t3tools.t3code`                      | `com.t3tools.t3code`             |
-| Signature     | ad-hoc                                    | Developer ID, team ARK85ZXQ4Z    |
+| Signature     | Self-signed (`T3 Code Fork`, Air only)    | Developer ID, team ARK85ZXQ4Z    |
 | URL schemes   | `t3code`, `t3code-dev`, `http`, `https`   | same                             |
 | Update feed   | none (no `app-update.yml`)                | T3's nightly channel             |
 | State         | `~/.t3` unless `T3CODE_HOME` is set       | `~/.t3`                          |
@@ -332,6 +340,89 @@ Apart from its version, it has the same identity as Nightly:
 
 The single-instance lock lives in the Electron data folder, so a second app with this identity
 quits or hands off to the one already running.
+
+### Signing identity
+
+macOS keys Accessibility and Screen Recording grants (TCC) to an app's designated requirement.
+Ad-hoc builds pin a per-build `cdhash`, so every rebuild drops those grants. Signing fork builds
+with one stable self-signed identity produces a designated requirement of
+`identifier "com.t3tools.t3code" and certificate leaf = H"<sha1>"`, which stays identical across
+rebuilds on both Macs.
+
+- **Single build host:** The signing identity (`T3 Code Fork`, overridable via
+  `T3CODE_FORK_SIGNING_IDENTITY`) lives only in the Air's login keychain
+  (`~/Library/Keychains/login.keychain-db`). Keep the private key on the Air only: never commit
+  it, and never copy it to CI, the Pro, or shared storage.
+- **Pro needs no identity:** The Air signs the `.app` before the `rsync` in
+  [Deliver the build](#deliver-the-build). The embedded certificate satisfies
+  `codesign --verify --deep --strict` and TCC on the Pro with no keychain setup there.
+- **Create or recreate the identity on the Air (one time):**
+
+  ```sh
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  cat >"$tmp/ext.cnf" <<'EOF'
+  [req]
+  distinguished_name = dn
+  x509_extensions = codesign
+  prompt = no
+  [dn]
+  CN = T3 Code Fork
+  [codesign]
+  keyUsage = critical, digitalSignature
+  extendedKeyUsage = critical, codeSigning
+  basicConstraints = critical, CA:FALSE
+  EOF
+  /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -config "$tmp/ext.cnf"
+  /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+    -out "$tmp/id.p12" -passout pass:temp-import
+  security import "$tmp/id.p12" -k ~/Library/Keychains/login.keychain-db \
+    -P temp-import -T /usr/bin/codesign
+  # Allow unattended signing by /usr/bin/codesign with no GUI prompt (requires login keychain password once).
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+    -k "$LOGIN_KEYCHAIN_PASSWORD" ~/Library/Keychains/login.keychain-db
+  scripts/fork-app-sign.sh --check-identity
+  ```
+
+  Recreating the identity creates a new certificate fingerprint, so you must re-grant the one-time
+  macOS permissions below once per Mac after installing a build signed by the new identity. Remove
+  any old `T3 Code Fork` identity from the login keychain first so `scripts/fork-app-sign.sh` does
+  not refuse an ambiguous match.
+
+- **Verify a signed build or installed app:**
+
+  ```sh
+  codesign --verify --deep --strict "/Applications/T3 Code (Beta).app"
+  codesign -dvvv "/Applications/T3 Code (Beta).app"
+  codesign -d -r- "/Applications/T3 Code (Beta).app"
+  ```
+
+  Expect `Authority=T3 Code Fork` (not `Signature=adhoc`), `Identifier=com.t3tools.t3code`,
+  `Info.plist entries=...`, `Sealed Resources version=...`, and
+  `designated => identifier "com.t3tools.t3code" and certificate leaf = H"..."`.
+
+### One-time macOS privacy grants
+
+After installing the first build signed with `T3 Code Fork` (or after recreating the identity),
+grant permissions once on each Mac (Air and Pro):
+
+1. Open **System Settings > Privacy & Security > Accessibility** and **Screen Recording**.
+2. **Remove any stale `T3 Code` (`com.t3tools.t3code`) entry left by Nightly or an ad-hoc build**
+   (select it and click `-`, or run `tccutil reset Accessibility com.t3tools.t3code` and
+   `tccutil reset ScreenCapture com.t3tools.t3code`). Keeping a Nightly entry leaves macOS
+   checking the old Developer ID requirement even when the toggle looks enabled.
+3. Add `/Applications/T3 Code (Beta).app` to both **Accessibility** and **Screen Recording**,
+   toggle both on, and quit and reopen the app.
+4. From a T3 Code terminal session on that Mac, verify that the desktop helper sees both grants:
+
+   ```sh
+   state="${DESKTOP_MCP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/desktop-mcp}"
+   "$(ls -t "$state"/desktop-helper-* | grep -v '\.tmp$' | head -1)" permissions
+   ```
+
+   Both `accessibility` and `screenRecording` must print `true` and remain `true` across future
+   fork updates with no new grant.
 
 There are two ways to use a fork build daily:
 
@@ -356,8 +447,10 @@ an agent inside Nightly.
 4. Run `scripts/fork-app-swap.sh`. It refuses while Nightly runs or anything holds
    `statev2.sqlite` open. It backs up `statev2.sqlite` with `VACUUM INTO` to
    `~/.t3-swap-backup/<time>/`, moves Nightly there, and copies the fork app into `/Applications`.
-5. Open `/Applications/T3 Code (Beta).app`. The new signature makes macOS ask again for privacy
-   permissions and keychain access.
+5. Open `/Applications/T3 Code (Beta).app`. Switching from Nightly's Developer ID signature to
+   the fork signing identity requires the one-time
+   [macOS privacy grants](#one-time-macos-privacy-grants) and keychain approval once per Mac;
+   subsequent fork updates signed with the same identity keep those grants.
 
 To update an installed fork app, see [Update the fork app](#update-the-fork-app).
 
@@ -380,9 +473,11 @@ version from upstream releases. No such release exists, so roll back instead.
 `scripts/fork-app-update.sh` replaces the installed fork app with a newer fork build. An agent
 inside the app may run it, because the script does its work after the app has quit.
 
-1. Build the app as in [Desktop app](#desktop-app).
-2. Run `scripts/fork-app-update.sh --dry-run`. It runs while the app is open, checks the build and
-   lists the steps without changing anything.
+1. Build the app as in [Desktop app](#desktop-app) (on macOS this signs the `.app` with the
+   `T3 Code Fork` identity before writing `~/.t3-fork/build/mac-arm64/`).
+2. Run `scripts/fork-app-update.sh --dry-run`. It runs while the app is open, verifies the new
+   build's signature (refusing unsigned or ad-hoc builds) and lists the steps without changing
+   anything.
 3. Run `scripts/fork-app-update.sh --detach`. It returns at once and logs to
    `~/.t3-fork/update.log`.
 
@@ -399,5 +494,6 @@ When a step fails, it reopens the old app and the log says which step.
 
 To go back to the previous build, quit the app and move the old app from that backup folder to
 `/Applications`. Restore the database backup only when the newer build ran migrations the older
-one does not know. Ad-hoc signed builds fail `codesign --verify --deep` ("code has no
-resources"), so that command does not check a copy.
+one does not know. Verify an installed or copied fork build with
+`codesign --verify --deep --strict "/Applications/T3 Code (Beta).app"` (or
+`scripts/fork-app-sign.sh --verify`).
