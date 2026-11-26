@@ -22,10 +22,12 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   attachAntigravityCliUsageLimits,
+  getSharedAntigravityCliUsageCache,
   isAntigravityCliAuthPrompt,
   makeAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
   parseAntigravityCliUsageOutput,
+  resolveAntigravityCliUsageTokenPath,
   type AntigravityCliUsageProbe,
 } from "./antigravityCliUsageLimits.ts";
 
@@ -329,7 +331,11 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
           scriptPath,
           [
             "#!/bin/sh",
-            'printf "%s" "renewed" > "$GEMINI_HOME/marker.txt"',
+            'if [ ! -f "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then',
+            '  echo "Authentication required. Please visit the URL to log in:"',
+            "  exit 1",
+            "fi",
+            'printf "%s" "renewed" > "$HOME/.gemini/antigravity-cli/marker.txt"',
             `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
             "",
           ].join("\n"),
@@ -360,7 +366,9 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
                 },
               },
               onAfterExit: Effect.gen(function* () {
-                const exists = yield* fs.exists(path.join(isolatedProfileDirectory, "marker.txt"));
+                const exists = yield* fs.exists(
+                  path.join(isolatedProfileDirectory, ".gemini", "antigravity-cli", "marker.txt"),
+                );
                 if (exists && profile === profileA) {
                   markerSeenOnAfterExit = true;
                 }
@@ -401,8 +409,12 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         expect(yield* probeB.probe()).toEqual(first);
         expect(spawnCount).toBe(1);
 
-        // force: true bypasses fresh cache.
-        yield* probeA.probe({ force: true });
+        // Concurrent force: true refreshes across same-account instances bypass cache but share one spawn.
+        const [forcedA, forcedB] = yield* Effect.all(
+          [probeA.probe({ force: true }), probeB.probe({ force: true })],
+          { concurrency: "unbounded" },
+        );
+        expect(forcedB).toEqual(forcedA);
         expect(spawnCount).toBe(2);
 
         // Expires after 5 minutes.
@@ -542,6 +554,114 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         expect(spawnCount).toBe(2);
       }),
   );
+
+  it.effect.skipIf(windowsHost)(
+    "seeds isolated HOME/.gemini/antigravity-cli from isolated ACP credentials and isolates HOME/XDG env",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseEnv = yield* HostProcess.Environment;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-clihome-" });
+        const profileAcpDir = path.join(root, "profile", "antigravity-acp");
+        yield* fs.makeDirectory(profileAcpDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(profileAcpDir, "antigravity-oauth-token"),
+          '{"token":{"access_token":"from-profile"}}',
+        );
+        yield* fs.writeFileString(path.join(profileAcpDir, "installation_id"), "install-uuid-1");
+
+        const dumpPath = path.join(root, "dump.txt");
+        const scriptPath = path.join(root, "inspect-agy.sh");
+        yield* fs.writeFileString(
+          scriptPath,
+          [
+            "#!/bin/sh",
+            `{`,
+            '  printf "HOME=%s\\n" "$HOME"',
+            '  printf "GEMINI_HOME=%s\\n" "$GEMINI_HOME"',
+            '  printf "XDG_CONFIG_HOME=%s\\n" "${XDG_CONFIG_HOME:-}"',
+            '  printf "XDG_CACHE_HOME=%s\\n" "${XDG_CACHE_HOME:-}"',
+            '  printf "XDG_DATA_HOME=%s\\n" "${XDG_DATA_HOME:-}"',
+            '  printf "TOKEN=%s\\n" "$(cat "$HOME/.gemini/antigravity-cli/antigravity-oauth-token")"',
+            '  printf "INSTALL=%s\\n" "$(cat "$HOME/.gemini/antigravity-cli/installation_id")"',
+            '  printf "SETTINGS=%s\\n" "$(cat "$HOME/.gemini/antigravity-cli/settings.json")"',
+            `} > ${JSON.stringify(dumpPath)}`,
+            `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(scriptPath, 0o755);
+
+        let capturedHome = "";
+        const probe = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: path.join(root, "profile"),
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.succeed("cli-home@example.com"),
+          prepareIsolatedSpawn: () =>
+            Effect.gen(function* () {
+              const isolatedHomeDirectory = yield* fs.makeTempDirectoryScoped({
+                prefix: "t3-ag-home-",
+              });
+              capturedHome = isolatedHomeDirectory;
+              const isolatedProfileDirectory = path.join(isolatedHomeDirectory, ".gemini");
+              const isolatedAcpDir = path.join(isolatedProfileDirectory, "antigravity-acp");
+              yield* fs.makeDirectory(isolatedAcpDir, { recursive: true });
+              yield* fs.writeFileString(
+                path.join(isolatedAcpDir, "antigravity-oauth-token"),
+                '{"token":{"access_token":"from-isolated"}}',
+              );
+              yield* fs.writeFileString(
+                path.join(isolatedAcpDir, "settings.json"),
+                '{"auth":{"type":"oauth-personal"}}',
+              );
+              expect(resolveAntigravityCliUsageTokenPath(path, isolatedHomeDirectory)).toBe(
+                path.join(
+                  isolatedHomeDirectory,
+                  ".gemini",
+                  "antigravity-cli",
+                  "antigravity-oauth-token",
+                ),
+              );
+              return {
+                isolatedHomeDirectory,
+                isolatedProfileDirectory,
+                spawn: {
+                  command: scriptPath,
+                  env: {
+                    PATH: baseEnv.PATH ?? "/usr/bin:/bin",
+                    HOME: "/real/user/home",
+                    GEMINI_HOME: "/wrong/gemini/home",
+                    XDG_CONFIG_HOME: "/real/xdg/config",
+                    XDG_CACHE_HOME: "/real/xdg/cache",
+                    XDG_DATA_HOME: "/real/xdg/data",
+                  },
+                },
+              };
+            }),
+        });
+
+        const result = yield* probe.probe();
+        expect(result?.windows).toHaveLength(4);
+        const dump = yield* fs.readFileString(dumpPath);
+        expect(dump).toContain(`HOME=${capturedHome}\n`);
+        expect(dump).toContain(`GEMINI_HOME=${path.join(capturedHome, ".gemini")}\n`);
+        expect(dump).toContain("XDG_CONFIG_HOME=\n");
+        expect(dump).toContain("XDG_CACHE_HOME=\n");
+        expect(dump).toContain("XDG_DATA_HOME=\n");
+        expect(dump).toContain('TOKEN={"token":{"access_token":"from-isolated"}}\n');
+        expect(dump).toContain("INSTALL=install-uuid-1\n");
+        expect(dump).toContain('SETTINGS={"auth":{"type":"oauth-personal"}}\n');
+      }),
+  );
+
+  it("shares cache instances per stateDir via getSharedAntigravityCliUsageCache", () => {
+    const first = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-a");
+    const second = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-a");
+    const other = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-b");
+    expect(second).toBe(first);
+    expect(other).not.toBe(first);
+  });
 });
 
 describe("attachAntigravityCliUsageLimits", () => {

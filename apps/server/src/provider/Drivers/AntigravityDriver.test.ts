@@ -132,14 +132,20 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       [
         "#!/bin/sh",
         'if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then',
+        '  cli_token="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"',
+        '  if [ ! -f "$cli_token" ]; then',
+        '    echo "Authentication required. Please visit the URL to log in:"',
+        '    echo "  https://accounts.google.com/o/oauth2/auth?client_id=test"',
+        "    exit 1",
+        "  fi",
         ...(options.usageJson === undefined
           ? ["  exit 1"]
           : [
               ...(options.writeCliTokenOnLaunch === undefined
                 ? []
                 : [
-                    '  mkdir -p "$GEMINI_HOME/antigravity-acp"',
-                    `  printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+                    '  mkdir -p "$HOME/.gemini/antigravity-cli"',
+                    `  printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$cli_token"`,
                   ]),
               `  printf '%s\\n' ${shellQuote(options.usageJson)}`,
               "  exit 0",
@@ -1048,6 +1054,8 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           environment: [
             { name: "DISPLAY", value: ":99" },
             { name: "WAYLAND_DISPLAY", value: "wayland-1" },
+            { name: "XDG_CONFIG_HOME", value: "/tmp/should-be-stripped-config" },
+            { name: "XDG_CACHE_HOME", value: "/tmp/should-be-stripped-cache" },
           ],
         });
         const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
@@ -1157,14 +1165,20 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         ]);
         expect(usageLaunch?.profileDirectory).toContain("usage-profile-");
         expect(usageLaunch?.profileDirectory).not.toBe(h.profileDirectory);
+        expect(usageLaunch?.environment.HOME).toContain("usage-profile-");
+        expect(usageLaunch?.profileDirectory).toBe(
+          h.path.join(usageLaunch?.environment.HOME ?? "", ".gemini"),
+        );
         expect(usageLaunch?.forceFileStorage).toBe("1");
         expect(usageLaunch?.credentialKeys).toEqual([]);
         expect(usageLaunch?.environment.DISPLAY).toBeUndefined();
         expect(usageLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
+        expect(usageLaunch?.environment.XDG_CONFIG_HOME).toBeUndefined();
+        expect(usageLaunch?.environment.XDG_CACHE_HOME).toBeUndefined();
         expect(usageLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 1 127.0.0.1 22");
         expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
-        if (usageLaunch?.profileDirectory) {
-          expect(yield* h.fs.exists(usageLaunch.profileDirectory)).toBe(false);
+        if (usageLaunch?.environment.HOME) {
+          expect(yield* h.fs.exists(usageLaunch.environment.HOME)).toBe(false);
         }
         expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
         yield* h.assertClosed;

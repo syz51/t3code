@@ -268,6 +268,43 @@ export function makeAntigravityCliUsageCache(): AntigravityCliUsageCache {
   };
 }
 
+const sharedCachesByStateDir = new Map<string, AntigravityCliUsageCache>();
+
+export function getSharedAntigravityCliUsageCache(stateDir: string): AntigravityCliUsageCache {
+  const existing = sharedCachesByStateDir.get(stateDir);
+  if (existing !== undefined) return existing;
+  const created = makeAntigravityCliUsageCache();
+  sharedCachesByStateDir.set(stateDir, created);
+  return created;
+}
+
+export function resolveAntigravityCliUsageTokenPath(
+  path: Path.Path,
+  isolatedHomeDirectory: string,
+): string {
+  return path.join(isolatedHomeDirectory, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+}
+
+const CLI_HOME_FILES = [
+  "antigravity-oauth-token",
+  "acp_token.json",
+  "installation_id",
+  "settings.json",
+] as const;
+
+const STRIPPED_CLI_ENV_KEYS = new Set([
+  "DISPLAY",
+  "WAYLAND_DISPLAY",
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "GEMINI_HOME",
+]);
+
 export interface AntigravityCliUsageProbe {
   readonly probe: (options?: {
     readonly force?: boolean;
@@ -293,6 +330,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
     {
       readonly spawn: Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">;
       readonly isolatedProfileDirectory: string;
+      readonly isolatedHomeDirectory?: string | undefined;
       readonly onAfterExit?: Effect.Effect<void> | undefined;
     },
     E,
@@ -333,6 +371,42 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
     return yield* fs.exists(legacyTokenPath).pipe(Effect.orElseSucceed(() => false));
   });
 
+  const seedIsolatedCliHome = Effect.fnUntraced(function* (
+    isolatedHome: string,
+    isolatedProfileDirectory: string,
+  ) {
+    // `antigravity -p /usage` runs in CLI mode, which ignores GEMINI_HOME and --app-data-dir and
+    // always resolves its app data dir at <os.UserHomeDir()>/.gemini/antigravity-cli.
+    const geminiDir = path.join(isolatedHome, ".gemini");
+    const cliDir = path.join(geminiDir, "antigravity-cli");
+    const posix = path.sep !== "\\";
+    yield* fs.makeDirectory(cliDir, { recursive: true, mode: 0o700 });
+    if (posix) {
+      yield* fs.chmod(geminiDir, 0o700).pipe(Effect.ignore);
+      yield* fs.chmod(cliDir, 0o700).pipe(Effect.ignore);
+    }
+    const sourceDirs = [
+      path.join(isolatedProfileDirectory, "antigravity-acp"),
+      path.join(input.profileDirectory, "antigravity-acp"),
+    ];
+    for (const fileName of CLI_HOME_FILES) {
+      let data: Uint8Array | undefined;
+      for (const sourceDir of sourceDirs) {
+        data = yield* fs
+          .readFile(path.join(sourceDir, fileName))
+          .pipe(Effect.catch(() => Effect.undefined));
+        if (data !== undefined) break;
+      }
+      if (data === undefined) continue;
+      const targetPath = path.join(cliDir, fileName);
+      yield* fs.writeFile(targetPath, data);
+      if (posix) {
+        yield* fs.chmod(targetPath, 0o600).pipe(Effect.ignore);
+      }
+    }
+    return geminiDir;
+  });
+
   const runCliOnce = (credentialFingerprint: string | undefined) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -346,13 +420,25 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
             message: "Could not start the Antigravity CLI to read usage limits.",
           });
         }
-        const { spawn, onAfterExit } = prepared.value;
+        const { spawn, isolatedProfileDirectory, isolatedHomeDirectory, onAfterExit } =
+          prepared.value;
         // LIFO finalizer runs after the child process exits and before the isolated profile is deleted.
         if (onAfterExit) {
           yield* Effect.addFinalizer(() => onAfterExit.pipe(Effect.ignore));
         }
 
-        const { DISPLAY: _display, WAYLAND_DISPLAY: _wayland, ...headlessEnv } = spawn.env ?? {};
+        const isolatedHome = isolatedHomeDirectory ?? isolatedProfileDirectory;
+        const isolatedGeminiDir = yield* seedIsolatedCliHome(
+          isolatedHome,
+          isolatedProfileDirectory,
+        );
+
+        const headlessEnv: Record<string, string | undefined> = {};
+        for (const [key, value] of Object.entries(spawn.env ?? {})) {
+          if (!STRIPPED_CLI_ENV_KEYS.has(key.toUpperCase())) {
+            headlessEnv[key] = value;
+          }
+        }
         const child = yield* spawner.spawn(
           ChildProcess.make(
             spawn.command,
@@ -368,6 +454,11 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               cwd,
               env: {
                 ...headlessEnv,
+                HOME: isolatedHome,
+                ...(path.sep === "\\" ? { USERPROFILE: isolatedHome } : {}),
+                GEMINI_HOME: isolatedGeminiDir,
+                AGY_ACP_FORCE_FILE_STORAGE: "1",
+                AGY_CLI_DISABLE_AUTO_UPDATE: "true",
                 AGENT_BOARD_HOOKS: "off",
                 SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 22",
               },
@@ -492,13 +583,13 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               return cached.limits;
             }
           }
-          const existing = cache.inFlight.get(key);
-          if (existing !== undefined) {
-            const awaited = yield* Deferred.await(existing);
-            if (awaited !== undefined) return awaited;
-            // Owner probe was interrupted before finishing; re-check cache or run a fresh probe.
-            continue;
-          }
+        }
+        const existing = cache.inFlight.get(key);
+        if (existing !== undefined) {
+          const awaited = yield* Deferred.await(existing);
+          if (awaited !== undefined) return awaited;
+          // Owner probe was interrupted before finishing; re-check cache or run a fresh probe.
+          continue;
         }
 
         const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
