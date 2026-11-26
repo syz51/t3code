@@ -41,6 +41,7 @@ import {
   antigravityAuthUsesBrowser,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
+  prepareAntigravityCliUsageEnv,
   prepareAntigravityProfile,
   resolveAntigravityInstanceDirectories,
   type AntigravityAuthConfig,
@@ -71,7 +72,6 @@ import {
   attachAntigravityCliUsageLimits,
   getSharedAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
-  resolveAntigravityCliUsageTokenPath,
 } from "../antigravityCliUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
@@ -95,17 +95,6 @@ const RememberedRuntimeModes = Schema.fromJsonString(
 );
 const decodeRememberedRuntimeModes = Schema.decodeUnknownOption(RememberedRuntimeModes);
 const encodeRememberedRuntimeModes = Schema.encodeSync(RememberedRuntimeModes);
-const CliOAuthTokenFile = Schema.fromJsonString(
-  Schema.Struct({
-    token: Schema.Struct({
-      access_token: Schema.NonEmptyString,
-      refresh_token: Schema.optional(Schema.String),
-      expiry: Schema.optional(Schema.String),
-    }),
-    id_token_email: Schema.optional(Schema.String),
-  }),
-);
-const decodeCliOAuthTokenFile = Schema.decodeUnknownOption(CliOAuthTokenFile);
 const REFRESH_FAILED =
   "Could not refresh Antigravity models. The previous model list is unchanged.";
 const PYTHON_SOCKS_REQUIRED = "python-socks is required to use a SOCKS proxy";
@@ -272,9 +261,7 @@ export const AntigravityDriver: ProviderDriver<
         auth,
         userHome,
         tempDirectory: directories.runtimeTemp,
-        ...(isolatedProfileDirectory === undefined
-          ? {}
-          : { isolatedSourceProfileDirectory: profileDirectory }),
+        ...(isolatedProfileDirectory === undefined ? {} : { skipUserConfigLinks: true }),
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -596,84 +583,6 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
-    const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
-    const cliTokenPath = path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token");
-    const readAccountEmail = Effect.gen(function* () {
-      if (auth.authMethod !== "oauth-personal" && auth.authMethod !== "oauth-business") {
-        return undefined;
-      }
-      if (yield* fileSystem.exists(tokenPath)) return undefined;
-      if (!(yield* fileSystem.exists(cliTokenPath))) return undefined;
-      const contents = yield* fileSystem.readFileString(cliTokenPath);
-      const email = Option.getOrUndefined(
-        decodeCliOAuthTokenFile(contents),
-      )?.id_token_email?.trim();
-      return email && email.length > 0 ? email : undefined;
-    }).pipe(Effect.orElseSucceed(() => undefined));
-
-    const readCliTokenRecord = (filePath: string) =>
-      fileSystem.readFileString(filePath).pipe(
-        Effect.map((contents) =>
-          decodeCliOAuthTokenFile(contents).pipe(
-            Option.map((decoded) => ({
-              contents,
-              refreshToken: decoded.token.refresh_token?.trim() || undefined,
-              expiryMs: Date.parse(decoded.token.expiry ?? ""),
-              email: decoded.id_token_email?.trim().toLowerCase() || undefined,
-            })),
-            Option.getOrUndefined,
-          ),
-        ),
-        Effect.orElseSucceed(() => undefined),
-      );
-
-    const syncRenewedCliToken = Effect.fn("AntigravityDriver.syncRenewedCliToken")(
-      function* (input: {
-        readonly sourceTokenPath: string;
-        readonly isolatedTokenPath: string;
-        readonly originalSource:
-          | {
-              readonly refreshToken: string | undefined;
-              readonly email: string | undefined;
-            }
-          | undefined;
-      }) {
-        if (input.originalSource === undefined) return false;
-        const isolated = yield* readCliTokenRecord(input.isolatedTokenPath);
-        if (isolated === undefined || !Number.isFinite(isolated.expiryMs)) return false;
-        const currentSource = yield* readCliTokenRecord(input.sourceTokenPath);
-        if (currentSource === undefined) return false;
-        if (
-          (input.originalSource.refreshToken !== undefined &&
-            currentSource.refreshToken !== input.originalSource.refreshToken) ||
-          (input.originalSource.email !== undefined &&
-            currentSource.email !== input.originalSource.email) ||
-          (isolated.email !== undefined &&
-            currentSource.email !== undefined &&
-            isolated.email !== currentSource.email)
-        ) {
-          return false;
-        }
-        if (
-          Number.isFinite(currentSource.expiryMs) &&
-          isolated.expiryMs <= currentSource.expiryMs
-        ) {
-          return false;
-        }
-        yield* writeFileStringAtomically({
-          filePath: input.sourceTokenPath,
-          contents: isolated.contents,
-        }).pipe(
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, path),
-        );
-        if ((yield* HostProcess.Platform) !== "win32") {
-          yield* fileSystem.chmod(input.sourceTokenPath, 0o600).pipe(Effect.ignore);
-        }
-        return true;
-      },
-    );
-
     const makeIsolatedProfileDirectory = Effect.fn(
       "AntigravityDriver.makeIsolatedProfileDirectory",
     )(function* (prefix: string, detail: string) {
@@ -713,7 +622,6 @@ export const AntigravityDriver: ProviderDriver<
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
-      readAccountEmail,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>
@@ -737,36 +645,85 @@ export const AntigravityDriver: ProviderDriver<
           }),
       ),
     );
+    const hostPlatform = yield* HostProcess.Platform;
     const cliUsage = yield* makeAntigravityCliUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
-      readAccountEmail,
+      readAccountEmail: baseProvider.snapshot.getSnapshot.pipe(
+        Effect.map((snapshot) => snapshot.auth.email),
+      ),
       cache: getSharedAntigravityCliUsageCache(installation),
-      prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
-        cwd: string,
-      ) {
-        const isolatedHomeDirectory = yield* makeIsolatedProfileDirectory(
-          "usage-profile-",
-          "Could not create an isolated Antigravity usage profile.",
+      platform: hostPlatform,
+      prepareSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* () {
+        if (authConfigIssue !== null) {
+          return yield* new ProviderSetupError({
+            instanceId,
+            operation: "configure",
+            detail: authConfigIssue,
+          });
+        }
+        const executable = yield* installation
+          .acquire(settings.binaryPath, processEnvironment)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "resolve",
+                  detail: cause.detail,
+                  cause,
+                }),
+            ),
+          );
+        yield* fileSystem
+          .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          );
+        const runtimeTempDirectory = yield* Effect.acquireRelease(
+          fileSystem.makeTempDirectory({ directory: directories.runtimeTemp, prefix: "run-" }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          ),
+          (directory) =>
+            fileSystem
+              .remove(directory, { recursive: true, force: true })
+              .pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("Could not remove an Antigravity runtime temp directory."),
+                ),
+              ),
         );
-        const isolatedProfileDirectory = path.join(isolatedHomeDirectory, ".gemini");
-        const isolatedTokenPath = resolveAntigravityCliUsageTokenPath(path, isolatedHomeDirectory);
-        const originalSource = yield* readCliTokenRecord(cliTokenPath);
-        const { spawn } = yield* prepareSpawn(cwd, processEnvironment, isolatedProfileDirectory);
+        const env = yield* prepareAntigravityCliUsageEnv({
+          baseEnv: processEnvironment,
+          runtimeTempDirectory,
+          platform: hostPlatform,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
         return {
-          spawn,
-          isolatedProfileDirectory,
-          isolatedHomeDirectory,
-          onAfterExit: syncRenewedCliToken({
-            sourceTokenPath: cliTokenPath,
-            isolatedTokenPath,
-            originalSource,
-          }).pipe(Effect.ignore),
+          command: executable.executablePath,
+          env,
         };
       }),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.provideService(Digest.Digest, digest),
     );
@@ -818,23 +775,6 @@ export const AntigravityDriver: ProviderDriver<
         const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
           "text-profile-",
           "Could not create an isolated Antigravity text generation profile.",
-        );
-        const isolatedTokenPath = path.join(
-          isolatedProfileDirectory,
-          "antigravity-acp",
-          "antigravity-oauth-token",
-        );
-        const originalSource = yield* readCliTokenRecord(cliTokenPath);
-        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
-        yield* Effect.addFinalizer(() =>
-          syncRenewedCliToken({
-            sourceTokenPath: cliTokenPath,
-            isolatedTokenPath,
-            originalSource,
-          }).pipe(
-            Effect.flatMap((synced) => (synced ? provider.onTokenRefreshed : Effect.void)),
-            Effect.ignore,
-          ),
         );
         return yield* makeRuntime({
           cwd,

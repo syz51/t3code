@@ -132,24 +132,9 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       [
         "#!/bin/sh",
         'if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then',
-        '  cli_token="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"',
-        '  if [ ! -f "$cli_token" ]; then',
-        '    echo "Authentication required. Please visit the URL to log in:"',
-        '    echo "  https://accounts.google.com/o/oauth2/auth?client_id=test"',
-        "    exit 1",
-        "  fi",
         ...(options.usageJson === undefined
           ? ["  exit 1"]
-          : [
-              ...(options.writeCliTokenOnLaunch === undefined
-                ? []
-                : [
-                    '  mkdir -p "$HOME/.gemini/antigravity-cli"',
-                    `  printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$cli_token"`,
-                  ]),
-              `  printf '%s\\n' ${shellQuote(options.usageJson)}`,
-              "  exit 0",
-            ]),
+          : [`  printf '%s\\n' ${shellQuote(options.usageJson)}`, "  exit 0"]),
         "fi",
         ...(options.writeCliTokenOnLaunch === undefined
           ? []
@@ -398,7 +383,8 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
             "antigravity-acp",
           ]);
           expect(launch.profileDirectory).toBe(h.profileDirectory);
-          expect(launch.forceFileStorage).toBe("1");
+          expect(launch.forceFileStorage).toBeUndefined();
+          expect(launch.environment.SSH_CONNECTION).toBeUndefined();
           expect(launch.extendEnv).toBe(false);
         }
         for (const launch of h.launches) expect(launch.credentialKeys).toEqual([]);
@@ -822,22 +808,23 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
-    "syncs a renewed CLI token back from isolated text generation and reads auth.email from local token",
+    "uses native OS keyring auth for isolated text generation without cloning or syncing OAuth token files",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness();
         const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
         const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
         yield* h.fs.makeDirectory(acpDir, { recursive: true });
-        const expiredToken = JSON.stringify({
+        const staleToken = JSON.stringify({
           token: {
-            access_token: "expired-access",
+            access_token: "stale-access",
             token_type: "Bearer",
             refresh_token: "refresh-a",
             expiry: "2020-01-01T00:00:00Z",
           },
           id_token_email: "user@example.com",
         });
+        yield* h.fs.writeFileString(tokenPath, staleToken);
         const renewedToken = JSON.stringify({
           token: {
             access_token: "renewed-access",
@@ -851,12 +838,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           writeCliTokenOnLaunch: renewedToken,
         });
 
-        // 1. Explicit snapshot.refresh populates auth.email from the local CLI token file.
-        yield* h.fs.writeFileString(tokenPath, expiredToken);
-        const refreshed = yield* h.instance.snapshot.refresh;
-        expect(refreshed.auth.email).toBe("user@example.com");
-
-        // 2. Isolated text generation syncs its renewed token back to the owning profile on scope exit.
+        const launchesBefore = h.launches.length;
         yield* h.instance.textGeneration
           .generateThreadTitle({
             cwd: h.profileDirectory,
@@ -864,27 +846,14 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
             modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
           })
           .pipe(Effect.ignore);
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
-
-        // 3. Isolated text generation never overwrites a newer token already on disk.
-        const evenNewerToken = JSON.stringify({
-          token: {
-            access_token: "even-newer-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-a",
-            expiry: "2099-06-01T00:00:00Z",
-          },
-          id_token_email: "user@example.com",
-        });
-        yield* h.fs.writeFileString(tokenPath, evenNewerToken);
-        yield* h.instance.textGeneration
-          .generateThreadTitle({
-            cwd: h.profileDirectory,
-            message: "Name another thread",
-            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
-          })
-          .pipe(Effect.ignore);
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(evenNewerToken);
+        const helperLaunch = h.launches
+          .slice(launchesBefore)
+          .find((launch) => launch.tempDirectory !== undefined);
+        expect(helperLaunch).toBeDefined();
+        expect(helperLaunch?.forceFileStorage).toBeUndefined();
+        expect(helperLaunch?.environment.SSH_CONNECTION).toBeUndefined();
+        // Never syncs plaintext OAuth tokens back to disk.
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(staleToken);
         yield* h.assertClosed;
       }),
   );
@@ -1047,37 +1016,17 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
-    "reads usage limits via isolated `agy -p /usage --output-format json` and syncs renewed tokens back",
+    "reads usage limits via native-keyring `agy -p /usage --output-format json` without SSH spoofing or token files",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness({
           environment: [
             { name: "DISPLAY", value: ":99" },
             { name: "WAYLAND_DISPLAY", value: "wayland-1" },
-            { name: "XDG_CONFIG_HOME", value: "/tmp/should-be-stripped-config" },
-            { name: "XDG_CACHE_HOME", value: "/tmp/should-be-stripped-cache" },
+            { name: "SSH_CONNECTION", value: "10.0.0.1 50000 10.0.0.2 22" },
+            { name: "AGY_ACP_FORCE_FILE_STORAGE", value: "1" },
+            { name: "GEMINI_API_KEY", value: "should-be-stripped" },
           ],
-        });
-        const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
-        const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
-        yield* h.fs.makeDirectory(acpDir, { recursive: true });
-        const initialToken = JSON.stringify({
-          token: {
-            access_token: "initial-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-usage",
-            expiry: "2020-01-01T00:00:00Z",
-          },
-          id_token_email: "usage-probe@example.com",
-        });
-        const renewedToken = JSON.stringify({
-          token: {
-            access_token: "renewed-usage-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-usage",
-            expiry: "2099-01-01T00:00:00Z",
-          },
-          id_token_email: "usage-probe@example.com",
         });
         const usageJson = JSON.stringify({
           status: "SUCCESS",
@@ -1119,12 +1068,9 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         });
         h.controls.selected = yield* h.makeExecutable("runtime usage", {
           usageJson,
-          writeCliTokenOnLaunch: renewedToken,
         });
-        yield* h.fs.writeFileString(tokenPath, initialToken);
 
         const refreshed = yield* h.instance.snapshot.refresh;
-        expect(refreshed.usageLimits?.credentialFingerprint).toMatch(/^email:[0-9a-f]{64}$/);
         expect(refreshed.usageLimits?.windows).toEqual([
           {
             id: "3p-5h",
@@ -1163,24 +1109,22 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           "--print-timeout",
           "15s",
         ]);
-        expect(usageLaunch?.profileDirectory).toContain("usage-profile-");
-        expect(usageLaunch?.profileDirectory).not.toBe(h.profileDirectory);
-        expect(usageLaunch?.environment.HOME).toContain("usage-profile-");
-        expect(usageLaunch?.profileDirectory).toBe(
-          h.path.join(usageLaunch?.environment.HOME ?? "", ".gemini"),
-        );
-        expect(usageLaunch?.forceFileStorage).toBe("1");
+        expect(usageLaunch?.profileDirectory).toBeUndefined();
+        expect(usageLaunch?.forceFileStorage).toBeUndefined();
         expect(usageLaunch?.credentialKeys).toEqual([]);
         expect(usageLaunch?.environment.DISPLAY).toBeUndefined();
         expect(usageLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
-        expect(usageLaunch?.environment.XDG_CONFIG_HOME).toBeUndefined();
-        expect(usageLaunch?.environment.XDG_CACHE_HOME).toBeUndefined();
-        expect(usageLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 1 127.0.0.1 22");
-        expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
-        if (usageLaunch?.environment.HOME) {
-          expect(yield* h.fs.exists(usageLaunch.environment.HOME)).toBe(false);
+        if (HostProcess.Platform.defaultValue() === "darwin") {
+          expect(usageLaunch?.environment.SSH_CONNECTION).toBeUndefined();
         }
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
+        expect(usageLaunch?.environment.GEMINI_API_KEY).toBeUndefined();
+        expect(usageLaunch?.environment.BROWSER).toBe("");
+        expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
+        expect(usageLaunch?.environment.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+        expect(
+          usageLaunch?.tempDirectory?.startsWith(`${h.directories.runtimeTemp}${h.path.sep}`),
+        ).toBe(true);
+        expect(refreshed.usageLimits?.credentialFingerprint).toBe("keyring:oauth-personal");
         yield* h.assertClosed;
       }),
   );

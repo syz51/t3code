@@ -173,19 +173,25 @@ running thread on that Mac, the sync's own thread on the Air included.
 3. Finish everything else: the board task, the report and the final reply.
 4. Update the Air last, as the last command of the turn: `scripts/fork-app-update.sh --detach`.
 
-## Antigravity CLI usage limits
+## Antigravity native keyring auth & CLI usage limits
+
+The fork lets the official first-party `agy` CLI use its native OS keyring authentication without
+spoofing `SSH_CONNECTION`, setting `AGY_ACP_FORCE_FILE_STORAGE=1`, or cloning plaintext
+`antigravity-oauth-token` files into temporary profile directories. `GEMINI_HOME` remains isolated
+per T3 profile for sessions, brain artifacts, hooks, MCP config, and skills, and isolated helper
+profiles (`text-profile-*`) skip user hooks/MCP/rules links without copying credentials.
 
 Upstream removed direct HTTP calls to Google's internal Antigravity quota APIs (`#43026`). The
 fork keeps **Usage → Limits** working for Antigravity via the official first-party CLI's
 `-p /usage --output-format json --print-timeout 15s` command in the fork-only module
 [antigravityCliUsageLimits.ts](../../apps/server/src/provider/antigravityCliUsageLimits.ts),
 attached in [AntigravityDriver.ts](../../apps/server/src/provider/Drivers/AntigravityDriver.ts)
-without modifying `AntigravityProvider.ts`. It runs in an isolated temp `HOME` (seeding
-`.gemini/antigravity-cli` from the profile's `antigravity-acp` credentials, since CLI mode ignores
-`GEMINI_HOME` and `--app-data-dir`) with a 5-minute shared per-account cache (never on the 1-minute
-health check) and automatically yields if
-upstream later re-adds native `usageLimits` to `AntigravityProvider`. If upstream does, remove the
-wrapper call in `AntigravityDriver.ts` and delete `antigravityCliUsageLimits.ts` and its test.
+without modifying `AntigravityProvider.ts`. It runs with the user's real `HOME` and native OS
+keyring (stripping `SSH_*`, `GEMINI_HOME`, `AGY_ACP_FORCE_FILE_STORAGE`, `DISPLAY`/`WAYLAND_DISPLAY`,
+and ambient API-key variables, with `AGENT_BOARD_HOOKS=off`) under a 5-minute shared cache (never on
+the 1-minute health check) and automatically yields if upstream later re-adds native `usageLimits`
+to `AntigravityProvider`. If upstream does, remove the wrapper call in `AntigravityDriver.ts` and
+delete `antigravityCliUsageLimits.ts` and its test.
 
 ## State retention
 

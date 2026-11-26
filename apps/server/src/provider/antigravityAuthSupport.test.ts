@@ -74,6 +74,9 @@ describe("Antigravity process environment", () => {
       gemini_home: "/alias-shared-home",
       AGY_ACP_FORCE_FILE_STORAGE: "0",
       agy_cli_disable_auto_update: "0",
+      SSH_CONNECTION: "10.0.0.1 50000 10.0.0.2 22",
+      SSH_CLIENT: "10.0.0.1 50000 22",
+      SSH_TTY: "/dev/pts/0",
       BROWSER: "open-real-browser",
       browser: "another-real-browser",
       PYTHONUNBUFFERED: "0",
@@ -102,9 +105,10 @@ describe("Antigravity process environment", () => {
         HOME: "/home/developer",
         PATH: "/usr/bin",
         CUSTOM_SETTING: "keep-this",
-        SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 0",
+        SSH_CONNECTION: "10.0.0.1 50000 10.0.0.2 22",
+        SSH_CLIENT: "10.0.0.1 50000 22",
+        SSH_TTY: "/dev/pts/0",
         GEMINI_HOME: profile.geminiHome,
-        AGY_ACP_FORCE_FILE_STORAGE: "1",
         AGY_CLI_DISABLE_AUTO_UPDATE: "true",
         BROWSER: profile.browserCommand,
         PYTHONUNBUFFERED: "1",
@@ -112,6 +116,19 @@ describe("Antigravity process environment", () => {
       },
     });
     expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
+    expect("AGY_ACP_FORCE_FILE_STORAGE" in (spawn.env ?? {})).toBe(false);
+
+    // On macOS, inherited SSH_* variables are stripped so `agy` stays on macOS Keychain.
+    const darwinSpawn = buildAntigravityAcpSpawnInput({
+      installation: { executablePath: "/usr/bin/agy" },
+      profile: { ...profile, platform: "darwin" },
+      cwd: "/project",
+      baseEnv,
+    });
+    expect("SSH_CONNECTION" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("SSH_CLIENT" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("SSH_TTY" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("AGY_ACP_FORCE_FILE_STORAGE" in (darwinSpawn.env ?? {})).toBe(false);
     expect(
       buildAntigravityAcpSpawnInput({
         installation: { executablePath: "/usr/bin/agy" },
@@ -169,12 +186,17 @@ describe("Antigravity process environment", () => {
     expect(business.GEMINI_API_KEY).toBeUndefined();
     expect(business.GOOGLE_API_KEY).toBeUndefined();
 
-    // Only the Google account method has the `--login` sign-in that works without the keyring.
-    for (const env of [geminiKey, vertexKey, business]) expect(env.SSH_CONNECTION).toBeUndefined();
-    expect(
-      spawnFor({ authMethod: "oauth-personal", apiKey: "", gcpProject: "", gcpLocation: "" })
-        .SSH_CONNECTION,
-    ).toBe("127.0.0.1 0 127.0.0.1 0");
+    // Fork uses native OS keyring auth without SSH_CONNECTION spoofing or AGY_ACP_FORCE_FILE_STORAGE.
+    const personal = spawnFor({
+      authMethod: "oauth-personal",
+      apiKey: "",
+      gcpProject: "",
+      gcpLocation: "",
+    });
+    for (const env of [geminiKey, vertexKey, business, personal]) {
+      expect(env.SSH_CONNECTION).toBeUndefined();
+      expect(env.AGY_ACP_FORCE_FILE_STORAGE).toBeUndefined();
+    }
   });
 
   it("isolates TEMP and TMP to the profile directory on Windows", () => {
@@ -1213,19 +1235,17 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         const helper = preflightHelper(Effect.void);
         const profile = yield* prepareAntigravityProfile({
           profileDirectory: isolatedProfile,
-          isolatedSourceProfileDirectory: sourceProfile,
+          skipUserConfigLinks: true,
           userHome,
           runtimeExecutablePath: "/fake/node",
           platform: "linux",
           baseEnv: {},
         }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, helper.spawner));
 
-        expect(
-          yield* fs.readFileString(path.join(profile.acpDirectory, "antigravity-oauth-token")),
-        ).toBe('{"token":{"access_token":"tok"}}');
-        expect(yield* fs.readFileString(path.join(profile.acpDirectory, "installation_id"))).toBe(
-          "install-123",
+        expect(yield* fs.exists(path.join(profile.acpDirectory, "antigravity-oauth-token"))).toBe(
+          false,
         );
+        expect(yield* fs.exists(path.join(profile.acpDirectory, "installation_id"))).toBe(false);
         expect(yield* fs.exists(path.join(profile.geminiHome, "config"))).toBe(false);
         expect(yield* fs.exists(path.join(profile.geminiHome, "GEMINI.md"))).toBe(false);
         expect(yield* fs.exists(path.join(profile.geminiHome, "skills"))).toBe(false);
