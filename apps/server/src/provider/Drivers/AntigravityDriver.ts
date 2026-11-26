@@ -741,7 +741,7 @@ export const AntigravityDriver: ProviderDriver<
       profileDirectory,
       authMethod: auth.authMethod,
       readAccountEmail,
-      cache: getSharedAntigravityCliUsageCache(path.resolve(host.paths.stateDir)),
+      cache: getSharedAntigravityCliUsageCache(installation),
       prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
         cwd: string,
       ) {

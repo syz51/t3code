@@ -409,12 +409,8 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         expect(yield* probeB.probe()).toEqual(first);
         expect(spawnCount).toBe(1);
 
-        // Concurrent force: true refreshes across same-account instances bypass cache but share one spawn.
-        const [forcedA, forcedB] = yield* Effect.all(
-          [probeA.probe({ force: true }), probeB.probe({ force: true })],
-          { concurrency: "unbounded" },
-        );
-        expect(forcedB).toEqual(forcedA);
+        // force: true bypasses fresh cache.
+        yield* probeA.probe({ force: true });
         expect(spawnCount).toBe(2);
 
         // Expires after 5 minutes.
@@ -655,13 +651,104 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
       }),
   );
 
-  it("shares cache instances per stateDir via getSharedAntigravityCliUsageCache", () => {
-    const first = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-a");
-    const second = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-a");
-    const other = getSharedAntigravityCliUsageCache("/tmp/t3-cache-test-b");
+  it("shares cache instances per runtime handle via getSharedAntigravityCliUsageCache", () => {
+    const runtimeA = {};
+    const runtimeB = {};
+    const first = getSharedAntigravityCliUsageCache(runtimeA);
+    const second = getSharedAntigravityCliUsageCache(runtimeA);
+    const other = getSharedAntigravityCliUsageCache(runtimeB);
     expect(second).toBe(first);
     expect(other).not.toBe(first);
   });
+
+  it.effect.skipIf(windowsHost)(
+    "separates shared cache entries by authMethod and tracks ownedKeys on cache hits for logout eviction",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseEnv = yield* HostProcess.Environment;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-authkey-" });
+        const profilePersonalA = path.join(root, "personal-a");
+        const profilePersonalB = path.join(root, "personal-b");
+        const profileBusiness = path.join(root, "business");
+        for (const profile of [profilePersonalA, profilePersonalB, profileBusiness]) {
+          const acpDir = path.join(profile, "antigravity-acp");
+          yield* fs.makeDirectory(acpDir, { recursive: true });
+          yield* fs.writeFileString(path.join(acpDir, "antigravity-oauth-token"), "{}");
+        }
+
+        const scriptPath = path.join(root, "ok-agy.sh");
+        yield* fs.writeFileString(
+          scriptPath,
+          [
+            "#!/bin/sh",
+            `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(scriptPath, 0o755);
+
+        const cache = makeAntigravityCliUsageCache();
+        let spawnCount = 0;
+        const makePrepare = () =>
+          Effect.gen(function* () {
+            spawnCount += 1;
+            const isolatedHomeDirectory = yield* fs.makeTempDirectoryScoped({
+              prefix: "t3-ag-iso-authkey-",
+            });
+            return {
+              isolatedHomeDirectory,
+              isolatedProfileDirectory: path.join(isolatedHomeDirectory, ".gemini"),
+              spawn: {
+                command: scriptPath,
+                env: { PATH: baseEnv.PATH ?? "/usr/bin:/bin" },
+              },
+            };
+          });
+
+        let emailB: string | undefined = "shared@example.com";
+        const probePersonalA = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profilePersonalA,
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.succeed("shared@example.com"),
+          prepareIsolatedSpawn: makePrepare,
+          cache,
+        });
+        const probePersonalB = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profilePersonalB,
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.sync(() => emailB),
+          prepareIsolatedSpawn: makePrepare,
+          cache,
+        });
+        const probeBusiness = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profileBusiness,
+          authMethod: "oauth-business",
+          readAccountEmail: Effect.succeed("shared@example.com"),
+          prepareIsolatedSpawn: makePrepare,
+          cache,
+        });
+
+        // Personal A populates cache; Personal B hits cache; Business does not collide with Personal.
+        expect((yield* probePersonalA.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(1);
+        expect((yield* probePersonalB.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(1);
+        expect((yield* probeBusiness.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(2);
+
+        // Personal B signs out (email becomes undefined); clearAccount must still evict the shared personal entry
+        // it only observed via cache hit, without evicting Business.
+        emailB = undefined;
+        yield* probePersonalB.clearAccount;
+        expect((yield* probeBusiness.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(2);
+        emailB = "shared@example.com";
+        expect((yield* probePersonalB.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(3);
+      }),
+  );
 });
 
 describe("attachAntigravityCliUsageLimits", () => {

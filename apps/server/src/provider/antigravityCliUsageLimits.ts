@@ -268,13 +268,15 @@ export function makeAntigravityCliUsageCache(): AntigravityCliUsageCache {
   };
 }
 
-const sharedCachesByStateDir = new Map<string, AntigravityCliUsageCache>();
+// Scoped to the runtime's service handle so same-runtime instances share a cache without
+// adding a fork-only service to upstream AntigravityDriverEnv or leaking across tests/restarts.
+const sharedCachesByRuntime = new WeakMap<object, AntigravityCliUsageCache>();
 
-export function getSharedAntigravityCliUsageCache(stateDir: string): AntigravityCliUsageCache {
-  const existing = sharedCachesByStateDir.get(stateDir);
+export function getSharedAntigravityCliUsageCache(runtimeHandle: object): AntigravityCliUsageCache {
+  const existing = sharedCachesByRuntime.get(runtimeHandle);
   if (existing !== undefined) return existing;
   const created = makeAntigravityCliUsageCache();
-  sharedCachesByStateDir.set(stateDir, created);
+  sharedCachesByRuntime.set(runtimeHandle, created);
   return created;
 }
 
@@ -355,7 +357,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
     const email = yield* input.readAccountEmail;
     if (!email) {
       return {
-        key: `profile:${input.profileDirectory}`,
+        key: `${input.authMethod}:profile:${input.profileDirectory}`,
         credentialFingerprint: undefined,
       } as const;
     }
@@ -363,7 +365,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       yield* digest.digest(Digest.sha256, new TextEncoder().encode(email.trim().toLowerCase())),
     );
     const credentialFingerprint = `email:${hash}`;
-    return { key: credentialFingerprint, credentialFingerprint } as const;
+    return { key: `${input.authMethod}:${credentialFingerprint}`, credentialFingerprint } as const;
   });
 
   const hasSavedToken = Effect.gen(function* () {
@@ -394,7 +396,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       for (const sourceDir of sourceDirs) {
         data = yield* fs
           .readFile(path.join(sourceDir, fileName))
-          .pipe(Effect.catch(() => Effect.undefined));
+          .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined));
         if (data !== undefined) break;
       }
       if (data === undefined) continue;
@@ -568,6 +570,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       if (!(yield* hasSavedToken)) return undefined;
 
       const { key, credentialFingerprint } = yield* accountKeyAndFingerprint;
+      ownedKeys.add(key);
       const force = options?.force === true;
 
       while (true) {
@@ -583,18 +586,17 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               return cached.limits;
             }
           }
-        }
-        const existing = cache.inFlight.get(key);
-        if (existing !== undefined) {
-          const awaited = yield* Deferred.await(existing);
-          if (awaited !== undefined) return awaited;
-          // Owner probe was interrupted before finishing; re-check cache or run a fresh probe.
-          continue;
+          const existing = cache.inFlight.get(key);
+          if (existing !== undefined) {
+            const awaited = yield* Deferred.await(existing);
+            if (awaited !== undefined) return awaited;
+            // Owner probe was interrupted before finishing; re-check cache or run a fresh probe.
+            continue;
+          }
         }
 
         const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
         cache.inFlight.set(key, pending);
-        ownedKeys.add(key);
         if (force) cache.entries.delete(key);
 
         let result: ServerProviderUsageLimits | undefined;
