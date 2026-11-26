@@ -168,6 +168,18 @@ running thread on that Mac, the sync's own thread on the Air included.
 3. Finish everything else: the board task, the report and the final reply.
 4. Update the Air last, as the last command of the turn: `scripts/fork-app-update.sh --detach`.
 
+## Antigravity CLI usage limits
+
+Upstream removed direct HTTP calls to Google's internal Antigravity quota APIs (`#43026`). The
+fork keeps **Usage → Limits** working for Antigravity via the official first-party CLI's
+`-p /usage --output-format json --print-timeout 15s` command in the fork-only module
+[antigravityCliUsageLimits.ts](../../apps/server/src/provider/antigravityCliUsageLimits.ts),
+attached in [AntigravityDriver.ts](../../apps/server/src/provider/Drivers/AntigravityDriver.ts)
+without modifying `AntigravityProvider.ts`. It runs in an isolated temp `GEMINI_HOME` with a
+5-minute shared per-account cache (never on the 1-minute health check) and automatically yields if
+upstream later re-adds native `usageLimits` to `AntigravityProvider`. If upstream does, remove the
+wrapper call in `AntigravityDriver.ts` and delete `antigravityCliUsageLimits.ts` and its test.
+
 ## State retention
 
 The fork adds two rules to the 6-hourly history compaction in
