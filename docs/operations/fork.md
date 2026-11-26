@@ -379,9 +379,9 @@ rebuilds on both Macs.
     -out "$tmp/id.p12" -passout pass:temp-import
   security import "$tmp/id.p12" -k ~/Library/Keychains/login.keychain-db \
     -P temp-import -T /usr/bin/codesign
-  # Allow unattended signing by /usr/bin/codesign with no GUI prompt (requires login keychain password once).
+  # Allow unattended signing by /usr/bin/codesign with no GUI prompt (prompts for the Air login keychain password once).
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-    -k "$LOGIN_KEYCHAIN_PASSWORD" ~/Library/Keychains/login.keychain-db
+    ~/Library/Keychains/login.keychain-db
   scripts/fork-app-sign.sh --check-identity
   ```
 
