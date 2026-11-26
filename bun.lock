@@ -15,7 +15,7 @@
     },
     "apps/desktop": {
       "name": "@t3tools/desktop",
-      "version": "0.1.11",
+      "version": "0.1.12",
       "dependencies": {
         "@clerk/electron": "catalog:",
         "@clerk/electron-passkeys": "catalog:",
@@ -73,6 +73,7 @@
         "@clerk/expo": "catalog:",
         "@clerk/expo-native-components": "0.4.8",
         "@effect/atom-react": "catalog:",
+        "@exodus/bytes": "1.15.1",
         "@expo-google-fonts/dm-sans": "^0.4.2",
         "@expo/metro-runtime": "~58.0.17",
         "@expo/ui": "58.0.29",
@@ -142,18 +143,18 @@
         "react": "catalog:",
         "react-dom": "catalog:",
         "react-native": "0.88.1",
-        "react-native-enriched-markdown": "file:deps/react-native-enriched-markdown-1.2.0-t3.18-16db4c75.tgz",
+        "react-native-enriched-markdown": "file:deps/react-native-enriched-markdown-1.2.0-t3.19-3757a449.tgz",
         "react-native-gesture-handler": "~3.5.0",
         "react-native-image-viewing": "^0.2.2",
         "react-native-keyboard-controller": "1.23.0",
         "react-native-nitro-modules": "0.37.2",
         "react-native-pdf-jsi": "6.1.0",
-        "react-native-reanimated": "4.7.1",
+        "react-native-reanimated": "4.8.0",
         "react-native-safe-area-context": "~5.11.1",
-        "react-native-screens": "file:deps/react-native-screens-5.0.0-t3.62.tgz",
+        "react-native-screens": "file:deps/react-native-screens-5.0.0-t3.63.tgz",
         "react-native-svg": "15.16.1",
         "react-native-webview": "14.0.1",
-        "react-native-worklets": "0.13.1",
+        "react-native-worklets": "0.14.0",
         "remark-gfm": "catalog:",
         "remark-parse": "catalog:",
         "tailwind-merge": "^3.5.0",
@@ -162,7 +163,6 @@
       },
       "devDependencies": {
         "@babel/core": "^7.29.7",
-        "@effect/platform-node": "catalog:",
         "@effect/vitest": "catalog:",
         "@pierre/trees": "catalog:",
         "@types/mdast": "^4.0.4",
@@ -178,7 +178,7 @@
     },
     "apps/server": {
       "name": "t3",
-      "version": "0.1.11",
+      "version": "0.1.12",
       "bin": {
         "t3": "./dist/bin.mjs",
       },
@@ -189,7 +189,6 @@
         "@effect/platform-node-shared": "catalog:",
         "@ff-labs/fff-node": "0.11.0",
         "@muse-code/sdk": "1.4.6",
-        "@napi-rs/keyring": "^1.3.0",
         "@t3tools/issue-tracker-linear": "workspace:*",
         "@t3tools/provider-acp": "workspace:*",
         "@t3tools/provider-acp-registry": "workspace:*",
@@ -253,7 +252,7 @@
     },
     "apps/web": {
       "name": "@t3tools/web",
-      "version": "0.1.11",
+      "version": "0.1.12",
       "dependencies": {
         "@base-ui/react": "^1.9.0",
         "@betteroffice/docx": "0.5.1",
@@ -466,7 +465,7 @@
     },
     "packages/contracts": {
       "name": "@t3tools/contracts",
-      "version": "0.1.11",
+      "version": "0.1.12",
       "dependencies": {
         "effect": "catalog:",
       },
@@ -989,6 +988,7 @@
         "@electron/asar": "^4.3.0",
         "@electron/osx-sign": "2.7.0",
         "@t3tools/contracts": "workspace:*",
+        "@t3tools/provider-testing": "workspace:*",
         "@t3tools/shared": "workspace:*",
         "@t3tools/tailscale": "workspace:*",
         "agent-device": "0.21.41",
@@ -1034,9 +1034,11 @@
     "micromark-extension-gfm-table@2.1.1": "patches/micromark-extension-gfm-table@2.1.1.patch",
     "@pierre/diffs@1.7.0-beta.4": "patches/@pierre__diffs@1.7.0-beta.4.patch",
     "@react-native-menu/menu@2.0.0": "patches/@react-native-menu__menu@2.0.0.patch",
+    "@legendapp/list@3.9.0": "patches/@legendapp__list@3.9.0.patch",
+    "@generaltranslation/format@0.1.9": "patches/@generaltranslation__format@0.1.9.patch",
     "react-native-svg@15.16.1": "patches/react-native-svg@15.16.1.patch",
     "react-native-gesture-handler@3.5.0": "patches/react-native-gesture-handler@3.5.0.patch",
-    "react-native-reanimated@4.7.1": "patches/react-native-reanimated@4.7.1.patch",
+    "gt-i18n@1.0.40": "patches/gt-i18n@1.0.40.patch",
     "mdast-util-to-hast@13.2.1": "patches/mdast-util-to-hast@13.2.1.patch",
     "@alchemy.run/test@2.0.0-beta.85": "patches/@alchemy.run__test@2.0.0-beta.85.patch",
     "micromark@4.0.2": "patches/micromark@4.0.2.patch",
@@ -1046,10 +1048,11 @@
     "expo-network@58.0.5": "patches/expo-network@58.0.5.patch",
     "expo-audio@58.0.12": "patches/expo-audio@58.0.12.patch",
     "micromark-extension-llm-math@3.1.0": "patches/micromark-extension-llm-math@3.1.0.patch",
+    "react-native-reanimated@4.8.0": "patches/react-native-reanimated@4.8.0.patch",
     "dbus-next@0.10.2": "patches/dbus-next@0.10.2.patch",
-    "@legendapp/list@3.7.3": "patches/@legendapp__list@3.7.3.patch",
     "@react-navigation/native-stack@7.21.0": "patches/@react-navigation%2Fnative-stack@7.21.0.patch",
     "app-builder-lib@26.16.1": "patches/app-builder-lib@26.16.1.patch",
+    "@exodus/bytes@1.15.1": "patches/@exodus__bytes@1.15.1.patch",
     "@muse-code/sdk@1.4.6": "patches/@muse-code__sdk@1.4.6.patch",
     "mdast-util-math@3.0.0": "patches/mdast-util-math@3.0.0.patch",
     "@effect/vitest@4.1.5": "patches/@effect__vitest@4.1.5.patch",
@@ -1076,11 +1079,12 @@
       "objc-js": "catalog:",
     },
     "@exodus/bytes": {
+      ".": "1.15.1",
       "@noble/hashes": "1.8.0",
     },
     "@expo/dom-webview": "58.0.2",
     "@ff-labs/fff-node": "0.11.0",
-    "@legendapp/list": "3.7.3",
+    "@legendapp/list": "3.9.0",
     "@opencode/protocol": {
       "effect": "catalog:",
     },
@@ -1136,7 +1140,7 @@
     "react-native-image-viewing": "0.2.2",
     "react-native-keyboard-controller": "1.23.0",
     "react-native-pdf-jsi": "6.1.0",
-    "react-native-reanimated": "4.7.1",
+    "react-native-reanimated": "4.8.0",
     "react-native-svg": "15.16.1",
     "react-native-webview": "14.0.1",
     "remark-math": {
@@ -1178,7 +1182,7 @@
     "@effect/sql-sqlite-do": "4.1.5",
     "@effect/vitest": "4.1.5",
     "@electron-webauthn/macos": "1.3.1",
-    "@legendapp/list": "3.7.3",
+    "@legendapp/list": "3.9.0",
     "@noble/curves": "1.9.1",
     "@noble/hashes": "1.8.0",
     "@pierre/diffs": "1.7.0-beta.4",
@@ -2021,7 +2025,7 @@
 
     "@koromix/koffi-win32-x64": ["@koromix/koffi-win32-x64@3.3.6", "", { "os": "win32", "cpu": "x64" }, "sha512-g9KC6VKQLe88Tjgeubk3yhu0CjtqSeRq4XjWFWxUq4rsP0/wfLUBoeISvG60HoPmhYQp+U7hVd8Ms+amOMHDvA=="],
 
-    "@legendapp/list": ["@legendapp/list@3.7.3", "", { "dependencies": { "use-sync-external-store": "1.7.0" }, "peerDependencies": { "react": "*", "react-dom": "*", "react-native": "*" }, "optionalPeers": ["react-dom", "react-native"] }, "sha512-trGu1i4xo1+r6gG6GI3qrrZAfYHbB25uVj32/KnxhaQ7/eW4AqzhM5cW21Oye4dpg+180Ts1aejRuI8z6Xc4eg=="],
+    "@legendapp/list": ["@legendapp/list@3.9.0", "", { "dependencies": { "use-sync-external-store": "1.7.0" }, "peerDependencies": { "react": "*", "react-dom": "*", "react-native": "*" }, "optionalPeers": ["react-dom", "react-native"] }, "sha512-gMLdgX0TzCtD1VGlrPZ423Npq7CtkQK8oWNRWvtO0AYkAFt5MP+knzaxnojbifHW82817QVc5lmit9JU2xKsaQ=="],
 
     "@libsql/client": ["@libsql/client@0.17.3", "", { "dependencies": { "@libsql/core": "0.17.3", "@libsql/hrana-client": "0.10.0", "js-base64": "3.7.8", "libsql": "0.5.29", "promise-limit": "2.7.0" } }, "sha512-HXk9wiAoJbKFbyBH4O+aEhN6ir5ERXuXvwE5OD2eR4/5RUa3Pw/8L9zrnVdU+iNJitRvisPWaIwmhkO3bH7giA=="],
 
@@ -3591,7 +3595,7 @@
 
     "expo-notifications": ["expo-notifications@58.1.9", "", { "dependencies": { "@expo/image-utils": "0.12.7", "abort-controller": "3.0.0", "badgin": "1.2.3", "expo-application": "58.1.2", "expo-constants": "58.0.16" }, "peerDependencies": { "expo": "*", "react": "*", "react-native": "*" } }, "sha512-Zhixn1+3hdd+XqwAwnNqggePs+/fcwERoBxrxTaJjfEMA0N9Q4RPm2iIsBuzKxrccRBJz0BMF2QULQXoA5yGtw=="],
 
-    "expo-observe": ["expo-observe@58.0.19", "", { "dependencies": { "expo-app-metrics": "58.0.15", "expo-eas-client": "58.0.2" }, "peerDependencies": { "@react-navigation/native": "^7.0.0", "expo": "*", "expo-router": "*", "react": "*", "react-native": "*", "react-native-reanimated": "4.7.1" }, "optionalPeers": ["@react-navigation/native", "expo-router", "react-native-reanimated"] }, "sha512-QcaRhq1gOW0oRqycsPSqf3x5gSLDBpNrmFXt0jF2OoRFtYqNlnLNtmQZpMuKp9sazQm6mdJzn91boXKUVbcFtg=="],
+    "expo-observe": ["expo-observe@58.0.19", "", { "dependencies": { "expo-app-metrics": "58.0.15", "expo-eas-client": "58.0.2" }, "peerDependencies": { "@react-navigation/native": "^7.0.0", "expo": "*", "expo-router": "*", "react": "*", "react-native": "*", "react-native-reanimated": "4.8.0" }, "optionalPeers": ["@react-navigation/native", "expo-router", "react-native-reanimated"] }, "sha512-QcaRhq1gOW0oRqycsPSqf3x5gSLDBpNrmFXt0jF2OoRFtYqNlnLNtmQZpMuKp9sazQm6mdJzn91boXKUVbcFtg=="],
 
     "expo-paste-input": ["expo-paste-input@0.2.2", "", { "peerDependencies": { "expo": "*", "react": "*", "react-native": "*" } }, "sha512-uDv5qi+/FRsEYwVF0Y9MJE7k9pxTNpI77jOnNqS1TQDQlqSfj11O5yvd+G8e7Hi8fDVBZx/BhyImG0b9sK/zIQ=="],
 
@@ -4561,7 +4565,7 @@
 
     "react-native": ["react-native@0.88.1", "", { "dependencies": { "@react-native/asset-utils": "0.88.1", "@react-native/codegen": "0.88.1", "@react-native/community-cli-plugin": "0.88.1", "@react-native/gradle-plugin": "0.88.1", "@react-native/normalize-colors": "0.88.1", "@react-native/virtualized-lists": "0.88.1", "anser": "1.4.10", "ansi-regex": "5.0.1", "base64-js": "1.5.1", "flow-enums-runtime": "0.0.6", "flow-parser": "0.327.0", "hermes-compiler": "260318099.0.5", "invariant": "2.2.4", "memoize-one": "5.2.1", "metro-runtime": "0.87.1", "metro-source-map": "0.87.1", "nullthrows": "1.1.1", "pretty-format": "29.7.0", "promise": "8.3.0", "react-devtools-core": "6.1.5", "react-refresh": "0.14.2", "regenerator-runtime": "0.13.11", "scheduler": "0.28.0", "semver": "7.8.5", "stacktrace-parser": "0.1.11", "tinyglobby": "0.2.17", "whatwg-fetch": "3.6.20", "ws": "7.5.11", "yargs": "17.7.2" }, "peerDependencies": { "@types/react": "^19.1.1", "react": "^19.3.0" }, "optionalPeers": ["@types/react"], "bin": { "react-native": "cli.js" } }, "sha512-wajWcLZ93GCN7k4Uwh4CS4L2Ah8ohcvkOXnvIYmh4Yvuqho5j3APZ9qozK+nQrHWSgauq4h8D3HN5DKK84SrHA=="],
 
-    "react-native-enriched-markdown": ["react-native-enriched-markdown@apps/mobile/deps/react-native-enriched-markdown-1.2.0-t3.18-16db4c75.tgz", { "peerDependencies": { "katex": ">=0.16.0", "react": "*", "react-native": "*" }, "optionalPeers": ["katex"], "hasInstallScript": true }, "sha512-TdP2nTxn8W4jPJ5EU+9Ctgf6aOncENP/kMa9aEZpJDmWNLXkxPpcugHMWyZJt2o5WDYE4SPi0V6zV6mOl3+8cA=="],
+    "react-native-enriched-markdown": ["react-native-enriched-markdown@apps/mobile/deps/react-native-enriched-markdown-1.2.0-t3.19-3757a449.tgz", { "peerDependencies": { "katex": ">=0.16.0", "react": "*", "react-native": "*" }, "optionalPeers": ["katex"], "hasInstallScript": true }, "sha512-2L4/684IqrUZaVXoh7nGIngUsDadWNudooGMK//PYUYQRK191Cy3yVPW0sCFuBMKLqYCWNHDfnS6+n5gDR7oEA=="],
 
     "react-native-gesture-handler": ["react-native-gesture-handler@3.5.0", "", { "dependencies": { "@types/react-test-renderer": "19.1.0", "invariant": "2.2.4" }, "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-bm8yepwMBUhEOSeU7WQbNNrstD0Hbv6i+XsApARBJSlb+WlRvyaQsobi+tZ5Uyr5kDVgXzg6kPb+CWY9zvyfEw=="],
 
@@ -4569,17 +4573,17 @@
 
     "react-native-is-edge-to-edge": ["react-native-is-edge-to-edge@1.3.1", "", { "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-NIXU/iT5+ORyCc7p0z2nnlkouYKX425vuU1OEm6bMMtWWR9yvb+Xg5AZmImTKoF9abxCPqrKC3rOZsKzUYgYZA=="],
 
-    "react-native-keyboard-controller": ["react-native-keyboard-controller@1.23.0", "", { "dependencies": { "react-native-is-edge-to-edge": "1.3.1" }, "peerDependencies": { "react": "*", "react-native": "*", "react-native-reanimated": "4.7.1" } }, "sha512-UqHOiGeVQnUj1NBggzQ9LD9rqHf7k4u81hqDpIyS2k3r1noOp9w5/lLiSajipH88BsMO7J43E3N/L+bfKEiuZA=="],
+    "react-native-keyboard-controller": ["react-native-keyboard-controller@1.23.0", "", { "dependencies": { "react-native-is-edge-to-edge": "1.3.1" }, "peerDependencies": { "react": "*", "react-native": "*", "react-native-reanimated": "4.8.0" } }, "sha512-UqHOiGeVQnUj1NBggzQ9LD9rqHf7k4u81hqDpIyS2k3r1noOp9w5/lLiSajipH88BsMO7J43E3N/L+bfKEiuZA=="],
 
     "react-native-nitro-modules": ["react-native-nitro-modules@0.37.2", "", { "dependencies": { "nitro-core": "0.37.2" }, "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-Odnrq/p6/q0R01qZlkqeXu9VHHMuGEnZZmyxMvehEu6QiACNHhBCmAHgyBDqOSo9Lb3G0TscFAT+HG0uxsR/GA=="],
 
     "react-native-pdf-jsi": ["react-native-pdf-jsi@6.1.0", "", { "peerDependencies": { "expo": ">=52.0.0", "react": "*", "react-native": ">=0.76.0", "react-native-nitro-modules": "^0.37.1" }, "optionalPeers": ["expo"] }, "sha512-bB8nuJkTypWssAasAlSe3ye3h9PTCyttBPQuzVgMNpMmEWR9I/J1Gpkmz1fxqHa7GXAChlYCSUXa5jDFKZnx4Q=="],
 
-    "react-native-reanimated": ["react-native-reanimated@4.7.1", "", { "dependencies": { "react-native-is-edge-to-edge": "1.3.1", "semver": "7.8.5" }, "peerDependencies": { "react": "*", "react-native": "0.86 - 0.88", "react-native-worklets": "0.13.x" } }, "sha512-HviDFSZ6V4KTRsrLS6hRbBJ4j63l/L8a5az0EoWdJwaMLYnBNyYISTDxwXpEYkMbAbLzCMCviIdiOxXHYQWcNA=="],
+    "react-native-reanimated": ["react-native-reanimated@4.8.0", "", { "dependencies": { "react-native-is-edge-to-edge": "1.3.1", "semver": "7.8.5" }, "peerDependencies": { "react": "*", "react-native": "0.87 - 0.89", "react-native-worklets": "0.14.x" } }, "sha512-emcLwcnEl6Xwg2op8VPyONeZm75Y5FD2sPaOJtF7EbGn/IJVbas0Yq4VQRsl1tZgo9oI9qeqIkPzU9gAgAGQFQ=="],
 
     "react-native-safe-area-context": ["react-native-safe-area-context@5.11.1", "", { "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-yCltXXwhwp42vMqfhAsH5BWgAysbLNgwfn3PDwNpOn/CgwfM+eMWgScZIbHbMzJYNLi5bKJEOIUEG4RwKNiECA=="],
 
-    "react-native-screens": ["react-native-screens@apps/mobile/deps/react-native-screens-5.0.0-t3.62.tgz", { "dependencies": { "react-freeze": "^1.0.0", "warn-once": "^0.1.0" }, "peerDependencies": { "react": "*", "react-native": "*" }, "hasInstallScript": true }, "sha512-2sBhSUlx5h4CQnhnMHeCgGjJTSi8ExSHFFC3Igx6dav8boiAR3dI3CMque0Ckz0LInzB+bKC4FippUd/2AhgZw=="],
+    "react-native-screens": ["react-native-screens@apps/mobile/deps/react-native-screens-5.0.0-t3.63.tgz", { "dependencies": { "react-freeze": "^1.0.0", "warn-once": "^0.1.0" }, "peerDependencies": { "react": "*", "react-native": "*" }, "hasInstallScript": true }, "sha512-ysQvdpLFkq/RVZROperMyTiJD6n1b5JmMh0SrABXUHPpnpaXGmo++0B30it7NJk8Fcn2AL8RyZCA+3FDPIhWzw=="],
 
     "react-native-svg": ["react-native-svg@15.16.1", "", { "dependencies": { "css-select": "5.2.2", "css-tree": "1.1.3" }, "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-Y4hCfg0o9ovGJYnNIySph5xWGqzawhW7MB2AjMUTpqJkrtPAx5XCeSk+jRMux2hanUvi9KvdVf2aZu0OFWtjgw=="],
 
@@ -4587,7 +4591,7 @@
 
     "react-native-webview": ["react-native-webview@14.0.1", "", { "dependencies": { "escape-string-regexp": "4.0.0", "invariant": "2.2.4" }, "peerDependencies": { "react": "*", "react-native": "*" } }, "sha512-lBUuvFk459Mo+5vUNqwzGvn+I8rDJE6zvOulG2hWWudeEOJfWTsQwOfuYnRu+27djUIXrESFfC+EQE3PGu+FWA=="],
 
-    "react-native-worklets": ["react-native-worklets@0.13.1", "", { "dependencies": { "@babel/generator": "7.29.7", "@babel/plugin-transform-arrow-functions": "7.29.7", "@babel/plugin-transform-class-properties": "7.29.7", "@babel/plugin-transform-classes": "7.29.7", "@babel/plugin-transform-nullish-coalescing-operator": "7.29.7", "@babel/plugin-transform-optional-chaining": "7.29.7", "@babel/plugin-transform-shorthand-properties": "7.29.7", "@babel/plugin-transform-template-literals": "7.29.7", "@babel/plugin-transform-unicode-regex": "7.29.7", "@babel/preset-typescript": "7.29.7", "@babel/traverse": "7.29.7", "@babel/types": "7.29.8", "@jridgewell/remapping": "2.3.5", "convert-source-map": "2.0.0", "semver": "7.8.5", "whatwg-fetch": "3.6.20" }, "peerDependencies": { "@babel/core": "*", "@react-native/metro-config": "0.88.1", "react": "*", "react-native": "0.86 - 0.88" } }, "sha512-sX55Vx89/Y9uJmvAbAGoHXBZvCWXtYPGWPJ9Z9yl0h76mP9A10ULlSrixzGqBFLXeQMBpIpyJEhWpzXP7GG6YA=="],
+    "react-native-worklets": ["react-native-worklets@0.14.0", "", { "dependencies": { "@babel/generator": "7.29.7", "@babel/plugin-transform-arrow-functions": "7.29.7", "@babel/plugin-transform-class-properties": "7.29.7", "@babel/plugin-transform-classes": "7.29.7", "@babel/plugin-transform-nullish-coalescing-operator": "7.29.7", "@babel/plugin-transform-optional-chaining": "7.29.7", "@babel/plugin-transform-shorthand-properties": "7.29.7", "@babel/plugin-transform-template-literals": "7.29.7", "@babel/plugin-transform-unicode-regex": "7.29.7", "@babel/preset-typescript": "7.29.7", "@babel/traverse": "7.29.7", "@babel/types": "7.29.8", "@jridgewell/remapping": "2.3.5", "convert-source-map": "2.0.0", "semver": "7.8.5", "whatwg-fetch": "3.6.20" }, "peerDependencies": { "@babel/core": "*", "@react-native/metro-config": "0.88.1", "react": "*", "react-native": "0.87 - 0.89" } }, "sha512-FAMNVHF8ClJmC61V+2jDOCUDjaZPnda+PBK5QqMkGtn13D3itDkkJxrFb0pCSnIfRTuIS/muE338usqEcRbuSg=="],
 
     "react-refresh": ["react-refresh@0.14.2", "", {}, "sha512-jCvmsr+1IUSMUyzOkRcvnVbX3ZYC6g9TDrDbFuFmRDq7PD4yaGbLKNQL6k2jnArV8hjYxh7hVhAZB6s9HDGpZA=="],
 

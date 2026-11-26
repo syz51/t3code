@@ -139,7 +139,8 @@ const make = Effect.gen(function* () {
 
   // Even a pass that deletes nothing scans the event store. Persist completion
   // so restarting does not trigger another scan before the six-hour interval.
-  const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at");
+  // Versioned: a stamp from before passes purged deleted threads must not delay the first purge.
+  const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at-v2");
   const compact = Effect.gen(function* () {
     let sliceStarted = yield* Clock.monotonicTimeNanos;
     const betweenPages = Effect.gen(function* () {
@@ -155,7 +156,8 @@ const make = Effect.gen(function* () {
     if (
       result.deletedEventCount > 0 ||
       result.deletedReceiptCount > 0 ||
-      result.compactedTurnItemCount > 0
+      result.compactedTurnItemCount > 0 ||
+      result.purgedRowCount > 0
     ) {
       yield* Effect.logInfo("Compacted orchestration history", result);
     }
