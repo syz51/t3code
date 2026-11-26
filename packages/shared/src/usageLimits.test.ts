@@ -209,6 +209,34 @@ describe("new thread model fallback", () => {
       ).toEqual(usesFallback ? fallback : defaultSelection);
     },
   );
+  it("resolves Antigravity model aliases before matching quota pools", () => {
+    const antigravity = provider({
+      driver: ProviderDriverKind.make("antigravity"),
+      models: [
+        {
+          slug: "gemini-4-neon",
+          name: "Gemini 4 Neon",
+          isCustom: false,
+          isDefault: true,
+          aliases: ["antigravity-default"],
+          capabilities: null,
+        },
+      ],
+      usageLimits: {
+        checkedAt: limited.checkedAt,
+        windows: [{ ...window, id: "3p-weekly", usedPercent: 100 }],
+      },
+    });
+    expect(exhaustedUsageWindow(antigravity, now, "antigravity-default")).toBeUndefined();
+    const geminiExhausted = {
+      ...antigravity,
+      usageLimits: {
+        checkedAt: limited.checkedAt,
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 100 }],
+      },
+    };
+    expect(exhaustedUsageWindow(geminiExhausted, now, "antigravity-default")?.id).toBe("gemini-5h");
+  });
 });
 
 describe("pace", () => {

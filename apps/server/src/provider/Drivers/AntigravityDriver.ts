@@ -69,7 +69,6 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
 import {
   attachAntigravityCliUsageLimits,
-  makeAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
 } from "../antigravityCliUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -84,7 +83,6 @@ import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIden
 import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
-const sharedAntigravityCliUsageCache = makeAntigravityCliUsageCache();
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
 const isNodeRuntimeUnavailableError = Schema.is(NodeRuntimeUnavailableError);
 const isAcpRequestError = Schema.is(AcpErrors.AcpRequestError);
@@ -741,7 +739,6 @@ export const AntigravityDriver: ProviderDriver<
       profileDirectory,
       authMethod: auth.authMethod,
       readAccountEmail,
-      cache: sharedAntigravityCliUsageCache,
       prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
         cwd: string,
       ) {

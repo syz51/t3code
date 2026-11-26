@@ -49,7 +49,10 @@ export function exhaustedUsageWindow(
       return /^(auto|default|grok|composer)/.test(model) ? auto && api : api;
     }
     case "antigravity": {
-      const family = model.match(/^(gemini|claude|gpt)-/)?.[1];
+      const resolvedModel =
+        provider.models.find((entry) => entry.slug === model || entry.aliases?.includes(model))
+          ?.slug ?? model;
+      const family = resolvedModel.match(/^(gemini|claude|gpt)-/)?.[1];
       return exhausted.find((window) => {
         const pool = window.id.match(/^(gemini|claude|gpt|3p)-/)?.[1];
         return (

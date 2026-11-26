@@ -194,6 +194,7 @@ describe("parseAntigravityCliUsageOutput", () => {
 
   it("extracts JSON surrounded by leading and trailing CLI notice lines", () => {
     const wrapped = [
+      '{"event":"startup","ok":true}',
       "Notice: Checking quota...",
       JSON.stringify(JSON.parse(LIVE_SHAPE_USAGE_JSON), null, 2),
       "Done.",
@@ -476,9 +477,85 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         expect(spawnCount).toBe(2);
       }),
   );
+
+  it.effect.skipIf(windowsHost)(
+    "evicts cached email entry on clearAccount even after logout deletes the token file",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseEnv = yield* HostProcess.Environment;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-logout-" });
+        const acpDir = path.join(root, "antigravity-acp");
+        const tokenPath = path.join(acpDir, "antigravity-oauth-token");
+        yield* fs.makeDirectory(acpDir, { recursive: true });
+        yield* fs.writeFileString(tokenPath, "{}");
+
+        const scriptPath = path.join(root, "ok-agy.sh");
+        yield* fs.writeFileString(
+          scriptPath,
+          [
+            "#!/bin/sh",
+            `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(scriptPath, 0o755);
+
+        let tokenPresent = true;
+        let spawnCount = 0;
+        const probe = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: root,
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.sync(() => (tokenPresent ? "user@example.com" : undefined)),
+          prepareIsolatedSpawn: (_cwd) =>
+            Effect.gen(function* () {
+              spawnCount += 1;
+              const isolatedProfileDirectory = yield* fs.makeTempDirectoryScoped({
+                prefix: "t3-ag-iso-logout-",
+              });
+              return {
+                isolatedProfileDirectory,
+                spawn: {
+                  command: scriptPath,
+                  env: {
+                    PATH: baseEnv.PATH ?? "/usr/bin:/bin",
+                    GEMINI_HOME: isolatedProfileDirectory,
+                  },
+                },
+              };
+            }),
+        });
+
+        expect((yield* probe.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(1);
+
+        // Logout deletes the token file before calling clearAccount.
+        tokenPresent = false;
+        yield* fs.remove(tokenPath);
+        yield* probe.clearAccount;
+
+        // Re-signing into the same account immediately probes instead of returning stale cache.
+        tokenPresent = true;
+        yield* fs.writeFileString(tokenPath, "{}");
+        expect((yield* probe.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(2);
+      }),
+  );
 });
 
 describe("attachAntigravityCliUsageLimits", () => {
+  const waitForSnapshot = (
+    stream: Stream.Stream<ServerProvider>,
+    predicate: (snap: ServerProvider) => boolean,
+  ) =>
+    stream.pipe(
+      Stream.filter(predicate),
+      Stream.take(1),
+      Stream.runHead,
+      Effect.forkScoped({ startImmediately: true }),
+    );
+
   it.effect(
     "probes once on startup readiness, skips periodic publishes, refreshes stale sessions, and clears on sign-out/email switch",
     () =>
@@ -525,12 +602,14 @@ describe("attachAntigravityCliUsageLimits", () => {
           shouldRunBackgroundWork: Effect.succeed(true),
         });
 
-        // Boot probe runs once automatically.
+        // Boot probe runs once automatically; await its published snapshot via streamChanges.
+        const bootPublished = yield* waitForSnapshot(
+          wrapped.snapshot.streamChanges,
+          (snap) => snap.usageLimits?.windows[0]?.usedPercent === 30,
+        );
         yield* Deferred.await(probeStarted);
         yield* Deferred.succeed(probeGate, undefined);
-        // Yield to let the forked boot fiber commit the overlay.
-        yield* Effect.yieldNow;
-        yield* Effect.yieldNow;
+        expect((yield* Fiber.join(bootPublished))._tag).toBe("Some");
 
         expect(probeCalls).toBe(1);
         expect((yield* wrapped.snapshot.getSnapshot).usageLimits?.windows[0]?.usedPercent).toBe(30);
@@ -538,14 +617,19 @@ describe("attachAntigravityCliUsageLimits", () => {
           30,
         );
 
-        // Periodic health check snapshot updates do NOT re-trigger CLI probes.
+        // Periodic health check snapshot updates forward on streamChanges without re-probing.
+        const periodicPublished = yield* waitForSnapshot(
+          wrapped.snapshot.streamChanges,
+          (snap) => snap.checkedAt === "2026-11-26T10:01:00.000Z",
+        );
         yield* fake.publish(makeBaseSnapshot({ checkedAt: "2026-11-26T10:01:00.000Z" }));
-        yield* Effect.yieldNow;
+        expect((yield* Fiber.join(periodicPublished))._tag).toBe("Some");
         expect(probeCalls).toBe(1);
 
-        // Fresh overlay skips onSessionStarted probe.
+        // Fresh overlay skips onSessionStarted probe (still clears any prior failure backoff).
+        const backoffBeforeSession = clearedBackoff;
         yield* wrapped.onSessionStarted();
-        yield* Effect.yieldNow;
+        expect(clearedBackoff).toBe(backoffBeforeSession + 1);
         expect(probeCalls).toBe(1);
 
         // After 5 minutes, onSessionStarted triggers a background refresh.
@@ -562,9 +646,12 @@ describe("attachAntigravityCliUsageLimits", () => {
             },
           ],
         };
+        const stalePublished = yield* waitForSnapshot(
+          wrapped.snapshot.streamChanges,
+          (snap) => snap.usageLimits?.windows[0]?.usedPercent === 55,
+        );
         yield* wrapped.onSessionStarted();
-        yield* Effect.yieldNow;
-        yield* Effect.yieldNow;
+        expect((yield* Fiber.join(stalePublished))._tag).toBe("Some");
         expect(probeCalls).toBe(2);
         expect((yield* wrapped.snapshot.getSnapshot).usageLimits?.windows[0]?.usedPercent).toBe(55);
 
@@ -575,7 +662,7 @@ describe("attachAntigravityCliUsageLimits", () => {
           unavailable: { reason: "probeFailed", message: "boom" },
         };
         const refreshed = yield* wrapped.snapshot.refresh;
-        expect(clearedBackoff).toBeGreaterThanOrEqual(1);
+        expect(clearedBackoff).toBeGreaterThanOrEqual(2);
         expect(refreshed.usageLimits?.windows[0]?.usedPercent).toBe(55);
 
         // Account switch clears overlay and re-probes.
@@ -591,19 +678,100 @@ describe("attachAntigravityCliUsageLimits", () => {
             },
           ],
         };
+        const switchedPublished = yield* waitForSnapshot(
+          wrapped.snapshot.streamChanges,
+          (snap) =>
+            snap.auth.email === "other@example.com" &&
+            snap.usageLimits?.windows[0]?.usedPercent === 10,
+        );
         yield* fake.publish(
           makeBaseSnapshot({
             auth: { status: "authenticated", type: "oauth-personal", email: "other@example.com" },
           }),
         );
-        yield* Effect.yieldNow;
-        yield* Effect.yieldNow;
+        expect((yield* Fiber.join(switchedPublished))._tag).toBe("Some");
         expect(clearedAccount).toBeGreaterThanOrEqual(1);
         expect((yield* wrapped.snapshot.getSnapshot).usageLimits?.windows[0]?.usedPercent).toBe(10);
 
         // Sign-out clears overlay immediately.
         yield* wrapped.onSignedOut;
         expect((yield* wrapped.snapshot.getSnapshot).usageLimits).toBeUndefined();
+      }),
+  );
+
+  it.effect(
+    "forced snapshot.refresh cleanly interrupts an in-flight background probe and handles an account switch without aborting",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeProvider(makeBaseSnapshot());
+        const cache = makeAntigravityCliUsageCache();
+        const bgStarted = yield* Deferred.make<void>();
+        const bgInterrupted = yield* Deferred.make<void>();
+        const forcedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-11-26T10:02:00.000Z",
+          windows: [
+            {
+              id: "gemini-5h",
+              kind: "session",
+              label: "Gemini · 5-hour",
+              usedPercent: 64,
+              windowDurationMins: 300,
+            },
+          ],
+        };
+
+        const usage: AntigravityCliUsageProbe = {
+          probe: (options) =>
+            Effect.gen(function* () {
+              const key = "email:test";
+              if (!options?.force) {
+                const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
+                cache.inFlight.set(key, pending);
+                return yield* Effect.gen(function* () {
+                  yield* Deferred.succeed(bgStarted, undefined);
+                  return yield* Effect.never;
+                }).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.gen(function* () {
+                      if (cache.inFlight.get(key) === pending) {
+                        cache.inFlight.delete(key);
+                      }
+                      yield* Deferred.succeed(pending, undefined);
+                      yield* Deferred.succeed(bgInterrupted, undefined);
+                    }),
+                  ),
+                );
+              }
+              return forcedLimits;
+            }),
+          clearAccount: Effect.void,
+          clearBackoff: Effect.void,
+        };
+
+        // Simulate snapshot.refresh discovering a switched email on disk and publishing to base streamChanges.
+        const switchedSnap = makeBaseSnapshot({
+          auth: { status: "authenticated", type: "oauth-personal", email: "switched@example.com" },
+        });
+        const providerWithSwitchRefresh = {
+          ...fake.provider,
+          snapshot: {
+            ...fake.provider.snapshot,
+            refresh: fake.publish(switchedSnap).pipe(Effect.as(switchedSnap)),
+          },
+        };
+
+        const wrapped = yield* attachAntigravityCliUsageLimits({
+          provider: providerWithSwitchRefresh,
+          usage,
+          enabled: true,
+          shouldRunBackgroundWork: Effect.succeed(true),
+        });
+
+        yield* Deferred.await(bgStarted);
+        const refreshed = yield* wrapped.snapshot.refresh;
+        yield* Deferred.await(bgInterrupted);
+        expect(refreshed.auth.email).toBe("switched@example.com");
+        expect(refreshed.usageLimits).toEqual(forcedLimits);
       }),
   );
 
@@ -640,7 +808,6 @@ describe("attachAntigravityCliUsageLimits", () => {
         shouldRunBackgroundWork: Effect.succeed(true),
       });
 
-      yield* Effect.yieldNow;
       expect((yield* wrapped.snapshot.getSnapshot).usageLimits).toEqual(nativeLimits);
       expect((yield* wrapped.snapshot.refresh).usageLimits).toEqual(nativeLimits);
       yield* wrapped.snapshot.refreshUsage!;
@@ -676,14 +843,10 @@ describe("attachAntigravityCliUsageLimits", () => {
         shouldRunBackgroundWork: Effect.succeed(false),
       });
 
-      const nextChange = yield* wrapped.snapshot.streamChanges.pipe(
-        Stream.filter((snap) => snap.usageLimits !== undefined),
-        Stream.take(1),
-        Stream.runHead,
-        Effect.forkScoped,
+      const nextChange = yield* waitForSnapshot(
+        wrapped.snapshot.streamChanges,
+        (snap) => snap.usageLimits !== undefined,
       );
-      yield* Effect.yieldNow;
-      yield* Effect.yieldNow;
       yield* wrapped.snapshot.refreshUsage!;
       const received = yield* Fiber.join(nextChange);
       expect(received._tag).toBe("Some");

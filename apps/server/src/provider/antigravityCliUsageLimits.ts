@@ -59,7 +59,7 @@ const AgyUsageGroup = Schema.Struct({
 });
 
 const AgyCliUsageResponse = Schema.Struct({
-  status: Schema.optional(Schema.String),
+  status: Schema.String,
   error: Schema.optional(Schema.String),
   command: Schema.optional(
     Schema.Struct({
@@ -83,27 +83,31 @@ export function isAntigravityCliAuthPrompt(text: string): boolean {
   return AUTH_ERROR_PATTERN.test(text);
 }
 
-function parseJsonObjectFromOutput(text: string): unknown {
+function decodeUsageResponseFromOutput(
+  text: string,
+): Option.Option<typeof AgyCliUsageResponse.Type> {
   const trimmed = text.trim();
-  if (trimmed.length === 0) return undefined;
+  if (trimmed.length === 0) return Option.none();
   try {
-    return JSON.parse(trimmed);
+    const decoded = decodeAgyCliUsage(JSON.parse(trimmed));
+    if (Option.isSome(decoded)) return decoded;
   } catch {
-    // Handle leading or trailing notice lines around single-line or pretty-printed JSON.
-    const lines = trimmed.split("\n");
-    for (let start = 0; start < lines.length; start += 1) {
-      if (!lines[start]?.trimStart().startsWith("{")) continue;
-      for (let end = lines.length; end > start; end -= 1) {
-        if (!lines[end - 1]?.trimEnd().endsWith("}")) continue;
-        try {
-          return JSON.parse(lines.slice(start, end).join("\n"));
-        } catch {
-          // Try a tighter slice when trailing notice lines follow the JSON payload.
-        }
+    // Fall through to line-based scanning when notice lines surround the JSON payload.
+  }
+  const lines = trimmed.split("\n");
+  for (let start = 0; start < lines.length; start += 1) {
+    if (!lines[start]?.trimStart().startsWith("{")) continue;
+    for (let end = lines.length; end > start; end -= 1) {
+      if (!lines[end - 1]?.trimEnd().endsWith("}")) continue;
+      try {
+        const decoded = decodeAgyCliUsage(JSON.parse(lines.slice(start, end).join("\n")));
+        if (Option.isSome(decoded)) return decoded;
+      } catch {
+        // Try a tighter slice when trailing notice lines follow the JSON payload.
       }
     }
-    return undefined;
   }
+  return Option.none();
 }
 
 function formatGroupLabel(groupName: string | undefined, bucketId: string): string {
@@ -170,8 +174,7 @@ export function parseAntigravityCliUsageOutput(input: {
   readonly checkedAt: string;
   readonly credentialFingerprint?: string | undefined;
 }): ParsedAntigravityCliUsage {
-  const rawJson = parseJsonObjectFromOutput(input.stdout);
-  const decoded = rawJson === undefined ? Option.none() : decodeAgyCliUsage(rawJson);
+  const decoded = decodeUsageResponseFromOutput(input.stdout);
   if (Option.isNone(decoded)) {
     if (isAntigravityCliAuthPrompt(input.stdout) || isAntigravityCliAuthPrompt(input.stderr)) {
       return { kind: "unauthenticated" };
@@ -302,6 +305,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const digest = yield* Digest.Digest;
   const cache = input.cache ?? makeAntigravityCliUsageCache();
+  const ownedKeys = new Set<string>();
   const cliTokenPath = path.join(
     input.profileDirectory,
     "antigravity-acp",
@@ -473,62 +477,75 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       if (!(yield* hasSavedToken)) return undefined;
 
       const { key, credentialFingerprint } = yield* accountKeyAndFingerprint;
-      const now = yield* Clock.currentTimeMillis;
       const force = options?.force === true;
 
-      if (!force) {
-        const cached = cache.entries.get(key);
-        if (cached !== undefined) {
-          const ttl =
-            cached.limits.unavailable?.reason === "probeFailed"
-              ? USAGE_FAILURE_BACKOFF_MS
-              : USAGE_FRESH_MS;
-          if (now - cached.recordedAtMs < ttl) {
-            return cached.limits;
+      while (true) {
+        if (!force) {
+          const now = yield* Clock.currentTimeMillis;
+          const cached = cache.entries.get(key);
+          if (cached !== undefined) {
+            const ttl =
+              cached.limits.unavailable?.reason === "probeFailed"
+                ? USAGE_FAILURE_BACKOFF_MS
+                : USAGE_FRESH_MS;
+            if (now - cached.recordedAtMs < ttl) {
+              return cached.limits;
+            }
+          }
+          const existing = cache.inFlight.get(key);
+          if (existing !== undefined) {
+            const awaited = yield* Deferred.await(existing);
+            if (awaited !== undefined) return awaited;
+            // Owner probe was interrupted before finishing; re-check cache or run a fresh probe.
+            continue;
           }
         }
+
+        const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
+        cache.inFlight.set(key, pending);
+        ownedKeys.add(key);
+        if (force) cache.entries.delete(key);
+
+        let result: ServerProviderUsageLimits | undefined;
+        return yield* runCliOnce(credentialFingerprint).pipe(
+          Effect.tap((limits) =>
+            Effect.gen(function* () {
+              result = limits;
+              const recordedAtMs = yield* Clock.currentTimeMillis;
+              cache.entries.set(key, { limits, recordedAtMs });
+            }),
+          ),
+          Effect.ensuring(
+            Effect.suspend(() => {
+              if (cache.inFlight.get(key) === pending) {
+                cache.inFlight.delete(key);
+              }
+              return Deferred.succeed(pending, result).pipe(Effect.asVoid);
+            }),
+          ),
+        );
       }
-
-      const existing = cache.inFlight.get(key);
-      if (existing !== undefined) {
-        return yield* Deferred.await(existing);
-      }
-
-      const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
-      cache.inFlight.set(key, pending);
-      if (force) cache.entries.delete(key);
-
-      let result: ServerProviderUsageLimits | undefined;
-      return yield* runCliOnce(credentialFingerprint).pipe(
-        Effect.tap((limits) =>
-          Effect.gen(function* () {
-            result = limits;
-            const recordedAtMs = yield* Clock.currentTimeMillis;
-            cache.entries.set(key, { limits, recordedAtMs });
-          }),
-        ),
-        Effect.ensuring(
-          Effect.suspend(() => {
-            if (cache.inFlight.get(key) === pending) {
-              cache.inFlight.delete(key);
-            }
-            return Deferred.succeed(pending, result).pipe(Effect.asVoid);
-          }),
-        ),
-      );
     },
   );
 
   const clearAccount = Effect.gen(function* () {
     const { key } = yield* accountKeyAndFingerprint;
     cache.entries.delete(key);
+    for (const ownedKey of ownedKeys) {
+      cache.entries.delete(ownedKey);
+    }
+    ownedKeys.clear();
   });
 
   const clearBackoff = Effect.gen(function* () {
     const { key } = yield* accountKeyAndFingerprint;
-    const cached = cache.entries.get(key);
-    if (cached?.limits.unavailable?.reason === "probeFailed") {
-      cache.entries.delete(key);
+    const keys = new Set(ownedKeys);
+    keys.add(key);
+    for (const candidate of keys) {
+      const cached = cache.entries.get(candidate);
+      if (cached?.limits.unavailable?.reason === "probeFailed") {
+        cache.entries.delete(candidate);
+      }
     }
   });
 
@@ -654,24 +671,35 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
     // Run once after startup readiness (never on periodic 1-minute checks) and reset on sign-out/account switch.
     let bootProbed = false;
     let lastEmail: string | undefined;
+    const reconcileAccount = Effect.fn("AntigravityCliUsageLimits.reconcileAccount")(function* (
+      snap: ServerProvider,
+      options?: { readonly markBootProbed?: boolean },
+    ) {
+      const email = snap.auth.email?.trim().toLowerCase();
+      if (snap.auth.status === "unauthenticated") {
+        lastEmail = undefined;
+        bootProbed = false;
+        yield* resetOverlay;
+        return "unauthenticated" as const;
+      }
+      if (lastEmail !== undefined && email !== undefined && email !== lastEmail) {
+        lastEmail = email;
+        bootProbed = options?.markBootProbed === true;
+        yield* resetOverlay;
+        return "switched" as const;
+      }
+      if (email !== undefined) lastEmail = email;
+      if (options?.markBootProbed === true) bootProbed = true;
+      return "unchanged" as const;
+    });
+
     const handleSnapshot = Effect.fn("AntigravityCliUsageLimits.handleSnapshot")(function* (
       snap: ServerProvider,
       publish: boolean,
     ) {
-      const email = snap.auth.email?.trim().toLowerCase();
-      if (snap.auth.status === "unauthenticated") {
-        yield* resetOverlay;
-        lastEmail = undefined;
-        bootProbed = false;
-        if (publish) yield* publishMerged(snap);
-        return;
-      }
-      if (lastEmail !== undefined && email !== undefined && email !== lastEmail) {
-        yield* resetOverlay;
-        bootProbed = false;
-      }
-      if (email !== undefined) lastEmail = email;
+      const accountState = yield* reconcileAccount(snap);
       if (publish) yield* publishMerged(snap);
+      if (accountState === "unauthenticated") return;
       if (
         !bootProbed &&
         snap.enabled &&
@@ -685,15 +713,15 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       }
     });
 
+    // Subscribe before reading the initial snapshot so PubSub never drops a concurrent startup check.
+    yield* input.provider.snapshot.streamChanges.pipe(
+      Stream.runForEach((snap) => handleSnapshot(snap, true)),
+      Effect.ignoreCause({ log: true }),
+      Effect.forkScoped({ startImmediately: true }),
+    );
     yield* input.provider.snapshot.getSnapshot.pipe(
       Effect.flatMap((snap) => handleSnapshot(snap, false)),
-      Effect.andThen(
-        input.provider.snapshot.streamChanges.pipe(
-          Stream.runForEach((snap) => handleSnapshot(snap, true)),
-        ),
-      ),
       Effect.ignoreCause({ log: true }),
-      Effect.forkScoped,
     );
 
     const getSnapshot = Effect.gen(function* () {
@@ -707,6 +735,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
     const refresh = Effect.fn("AntigravityCliUsageLimits.refresh")(function* () {
       yield* input.usage.clearBackoff;
       const refreshed = yield* input.provider.snapshot.refresh;
+      yield* reconcileAccount(refreshed, { markBootProbed: true });
       if (refreshed.usageLimits !== undefined) return refreshed;
       if (
         refreshed.enabled &&
@@ -714,6 +743,8 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
         refreshed.status !== "error" &&
         refreshed.auth.status !== "unauthenticated"
       ) {
+        // Clear waits for any interrupted background probe's finalizers before starting the forced probe.
+        yield* FiberHandle.clear(usageRead);
         yield* FiberHandle.run(usageRead, runProbe(true), {
           onlyIfMissing: false,
           startImmediately: true,
@@ -725,6 +756,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
 
     const refreshUsage = Effect.fn("AntigravityCliUsageLimits.refreshUsage")(function* () {
       const base = yield* input.provider.snapshot.getSnapshot;
+      yield* reconcileAccount(base, { markBootProbed: true });
       if (base.usageLimits !== undefined) {
         if (input.provider.snapshot.refreshUsage) {
           yield* input.provider.snapshot.refreshUsage;
@@ -738,6 +770,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
         base.status !== "error" &&
         base.auth.status !== "unauthenticated"
       ) {
+        yield* FiberHandle.clear(usageRead);
         yield* FiberHandle.run(usageRead, runProbe(true), {
           onlyIfMissing: false,
           startImmediately: true,
@@ -750,6 +783,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       "AntigravityCliUsageLimits.onSessionStarted",
     )(function* (started, cwd, session) {
       yield* input.provider.onSessionStarted(started, cwd, session);
+      yield* input.usage.clearBackoff;
       const current = yield* Ref.get(overlayRef);
       if (yield* isStale(current)) {
         yield* triggerBackgroundProbe();
