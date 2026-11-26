@@ -50,11 +50,14 @@ squash, so `fork` keeps upstream's history and the next merge finds the right ba
 [deliver the build](#deliver-the-build).
 
 Agent Context Budget fails when upstream grew the agent context since the last sync. The fork's
-own instruction edits make its budget differ from upstream's, so compare growth, not values. Run
-`git diff <old> upstream/main -- apps/server/src/provider/agentContextBudget.json`, where `<old>`
-is `git merge-base origin/fork upstream/main` taken before the merge. When no number grew more on
-the branch than in that diff, the growth is upstream's: add the `agent-context-increase` label to
-the PR.
+own instruction edits make its budget differ from upstream's, so compare growth, not values. Before
+opening the PR, run `git diff <old> upstream/main -- apps/server/src/provider/agentContextBudget.json`,
+where `<old>` is `git merge-base origin/fork upstream/main` taken before the merge. When upstream
+grew the budget and no number grew more on the branch than in that diff, the growth is upstream's:
+pass `--label agent-context-increase` to `gh pr create`. If the label is added after the PR is
+opened (or an `opened` run finishes before the label lands and fails), add the label and rerun the
+failed run (`gh run rerun <run-id> --failed`); the workflow reads the PR's live labels at run time,
+so no empty commit is needed.
 
 On macOS, some server tests fail locally because temporary paths resolve to `/private/var` or
 the file system ignores case. CI runs them on Linux; trust its result there.
@@ -98,7 +101,9 @@ the runners its callers pass. Each mapped line keeps upstream's label or timeout
 `# fork-mapped:` or `# fork-scaled:` comment, so a rerun rescales from upstream's value. The
 script also checks that Agent Context Budget compares with the PR's base branch, because `fork`
 lags `main` until the sync. Upstream's check reads the PR merge's first parent, which is that
-base.
+base. The fork also changes `agent-context-budget.yml` to read live PR labels via `gh api` (with
+`pull-requests: read`) instead of `github.event.pull_request.labels`, so `gh pr create --label`
+and reruns see the current labels; keep that change if an upstream edit conflicts there.
 
 A `runs-on` or `timeout-minutes` line conflicts when upstream edits it. In each conflict hunk,
 keep upstream's side, then rerun the script. Do not check out a whole workflow file from either
