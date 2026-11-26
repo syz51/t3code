@@ -712,3 +712,224 @@ it.effect.skipIf(!symlinksSupported)(
       assert.isTrue(yield* fs.exists(outsideFile));
     }).pipe(Effect.provide(baseLayer)),
 );
+
+it.effect(
+  "protects custom-named Antigravity instances, deferred deleted threads, live-owned descendants, and parents whose child is skipped",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const fs = yield* FileSystem.FileSystem;
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* ServerConfig.ServerConfig;
+
+      const customActiveId = "10101010-1010-4010-8010-101010101010";
+      const customDeletedId = "20202020-2020-4020-8020-202020202020";
+      const deferredOutboxId = "30303030-3030-4030-8030-303030303030";
+      const deferredParentTaskId = "40404040-4040-4040-8040-404040404040";
+      const sharedParentId = "50505050-5050-4050-8050-505050505050";
+      const sharedChildId = "60606060-6060-4060-8060-606060606060";
+      const blockedOpenParentId = "70707070-7070-4070-8070-707070707070";
+      const blockedOpenChildId = "80808080-8080-4080-8080-808080808080";
+      const blockedUsageParentId = "90909090-9090-4090-8090-909090909090";
+      const blockedUsageChildId = "a0a0a0a0-a0a0-40a0-80a0-a0a0a0a0a0a0";
+
+      const oldTime = DateTime.formatIso(DateTime.makeUnsafe(NOW_MS - 48 * HOUR_MS));
+
+      // 1. Custom-named Antigravity instance (`antigravity-work`) active thread -> must NOT be swept as orphan.
+      const customActive = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: customActiveId,
+        mtimeMs: NOW_MS - 48 * HOUR_MS,
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, deleted_at, payload_json
+        ) VALUES (
+          'custom-active', 'project:test', 'Custom active', 'antigravity-work',
+          'full-access', 'default', ${oldTime}, ${oldTime}, NULL, ${JSON.stringify({ title: "Custom active", settledAt: null })}
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_provider_threads (
+          provider_thread_id, thread_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json
+        ) VALUES (
+          'pt:custom-active', 'custom-active', 'antigravity-work', 'antigravity', 'antigravity-work',
+          'ps:custom-active', 'idle', ${oldTime},
+          ${JSON.stringify({ driver: "antigravity", providerInstanceId: "antigravity-work", nativeThreadRef: { driver: "antigravity", nativeId: customActiveId, strength: "strong" } })}
+        )
+      `;
+
+      // 2. Custom-named Antigravity instance deleted thread -> MUST be purged.
+      const customDeleted = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: customDeletedId,
+        mtimeMs: NOW_MS - 48 * HOUR_MS,
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, deleted_at, payload_json
+        ) VALUES (
+          'custom-deleted', 'project:test', 'Custom deleted', 'antigravity-work',
+          'full-access', 'default', ${oldTime}, ${oldTime}, ${oldTime}, ${JSON.stringify({ title: "Custom deleted" })}
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_provider_threads (
+          provider_thread_id, thread_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json
+        ) VALUES (
+          'pt:custom-deleted', 'custom-deleted', 'antigravity-work', 'antigravity', 'antigravity-work',
+          'ps:custom-deleted', 'idle', ${oldTime},
+          ${JSON.stringify({ driver: "antigravity", providerInstanceId: "antigravity-work", nativeThreadRef: { driver: "antigravity", nativeId: customDeletedId, strength: "strong" } })}
+        )
+      `;
+
+      // 3. Deleted thread with pending outbox effect -> deferred (kept).
+      const deferredOutbox = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: deferredOutboxId,
+      });
+      yield* insertThreadRow({
+        threadId: "deleted-pending-outbox",
+        nativeSessionId: deferredOutboxId,
+        updatedAtMs: NOW_MS - 48 * HOUR_MS,
+        deletedAtMs: NOW_MS - 48 * HOUR_MS,
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_effect_outbox (
+          effect_id, thread_id, command_id, effect_type, status, attempt_count, available_at, payload_json, created_at, updated_at
+        ) VALUES (
+          'eff:pending', 'deleted-pending-outbox', 'cmd:1', 'attachment.cleanup', 'pending', 0, ${oldTime}, '{}', ${oldTime}, ${oldTime}
+        )
+      `;
+
+      // 4. Deleted child thread still referenced by an active parent subagent task -> deferred (kept).
+      const deferredParentTask = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: deferredParentTaskId,
+      });
+      yield* insertThreadRow({
+        threadId: "deleted-active-parent-task",
+        nativeSessionId: deferredParentTaskId,
+        updatedAtMs: NOW_MS - 48 * HOUR_MS,
+        deletedAtMs: NOW_MS - 48 * HOUR_MS,
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_subagents (
+          subagent_id, thread_id, parent_node_id, child_thread_id, provider, origin, status, updated_at, payload_json
+        ) VALUES (
+          'sub:active-parent', 'custom-active', 'node:parent', 'deleted-active-parent-task', 'antigravity', 'delegated', 'running', ${oldTime}, '{}'
+        )
+      `;
+
+      // 5. Deleted thread whose disk-discovered child is owned by another live thread -> both kept on purgeDeletedThread.
+      const sharedParent = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: sharedParentId,
+        detachedChildren: [sharedChildId],
+      });
+      const sharedChild = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: sharedChildId,
+      });
+      yield* insertThreadRow({
+        threadId: "deleted-shared-parent",
+        nativeSessionId: sharedParentId,
+        updatedAtMs: NOW_MS - 48 * HOUR_MS,
+        deletedAtMs: NOW_MS - 48 * HOUR_MS,
+      });
+      yield* insertThreadRow({
+        threadId: "live-child-owner",
+        nativeSessionId: sharedChildId,
+        updatedAtMs: NOW_MS - HOUR_MS,
+        settledAtMs: null,
+      });
+
+      // 6. Settled parent whose child has an open OS handle -> both parent and child skipped.
+      const blockedOpenParent = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: blockedOpenParentId,
+        detachedChildren: [blockedOpenChildId],
+      });
+      const blockedOpenChild = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: blockedOpenChildId,
+      });
+      yield* insertThreadRow({
+        threadId: "mcp:blocked-open-parent",
+        nativeSessionId: blockedOpenParentId,
+        updatedAtMs: NOW_MS - 48 * HOUR_MS,
+        settledAtMs: NOW_MS - 48 * HOUR_MS,
+      });
+
+      // 7. Settled parent whose child fails usage scanning -> both parent and child skipped.
+      const blockedUsageParent = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: blockedUsageParentId,
+        detachedChildren: [blockedUsageChildId],
+        outputTokens: 5,
+      });
+      const blockedUsageChild = yield* seedSessionFiles({
+        stateDir: config.stateDir,
+        sessionId: blockedUsageChildId,
+        corruptDb: true,
+      });
+      yield* insertThreadRow({
+        threadId: "mcp:blocked-usage-parent",
+        nativeSessionId: blockedUsageParentId,
+        updatedAtMs: NOW_MS - 48 * HOUR_MS,
+        settledAtMs: NOW_MS - 48 * HOUR_MS,
+      });
+
+      const canonicalOpenChildDb = yield* fs.realPath(blockedOpenChild.dbPath);
+      const retentionLayer = AntigravitySessionRetention.layer.pipe(
+        Layer.provide(
+          Layer.succeed(AntigravitySessionRetention.OpenFileProbe, () =>
+            Effect.succeed(new Set([canonicalOpenChildDb])),
+          ),
+        ),
+        Layer.provide(
+          Layer.succeed(AntigravitySessionRetention.UsageArchiver, () => Effect.succeed(true)),
+        ),
+      );
+
+      // Single-thread purge on deleted-shared-parent must protect the live-owned child AND parent.
+      const purgeShared = yield* AntigravitySessionRetention.AntigravitySessionRetention.pipe(
+        Effect.flatMap((service) =>
+          service.purgeDeletedThread(ThreadId.make("deleted-shared-parent")),
+        ),
+        Effect.provide(retentionLayer),
+      );
+      assert.equal(purgeShared.deletedSessions, 0);
+      assert.equal(purgeShared.removedSubagentSessions, 0);
+      assert.isTrue(yield* fs.exists(sharedParent.dbPath));
+      assert.isTrue(yield* fs.exists(sharedChild.dbPath));
+
+      // Full prune pass.
+      const result = yield* AntigravitySessionRetention.AntigravitySessionRetention.pipe(
+        Effect.flatMap((service) => service.pruneSessions()),
+        Effect.provide(retentionLayer),
+      );
+      assert.equal(result.deletedSessions, 1);
+      assert.equal(result.prunedSettledSessions, 0);
+      assert.equal(result.skippedOpenSessions, 2);
+      assert.equal(result.skippedUsageErrorSessions, 2);
+
+      // Custom deleted was purged; every protected/deferred/blocked session remains intact.
+      assert.isFalse(yield* fs.exists(customDeleted.dbPath));
+      for (const kept of [
+        customActive,
+        deferredOutbox,
+        deferredParentTask,
+        sharedParent,
+        sharedChild,
+        blockedOpenParent,
+        blockedOpenChild,
+        blockedUsageParent,
+        blockedUsageChild,
+      ]) {
+        assert.isTrue(yield* fs.exists(kept.dbPath), `expected kept: ${kept.dbPath}`);
+      }
+    }).pipe(Effect.provide(baseLayer)),
+);

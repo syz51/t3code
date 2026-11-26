@@ -4486,4 +4486,74 @@ describe("UsageService", () => {
       );
     }),
   );
+
+  it.effect(
+    "archiveScannedFilesOffline fails closed when an existing scan cache cannot be decoded and clears coveredSince on legacy upgrade",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "usage-offline-archive-" });
+        const cachePath = NodePath.join(tempDir, SCAN_CACHE_FILE_NAME);
+        const sampleFile = {
+          path: NodePath.join(tempDir, "session.db"),
+          size: 128,
+          mtimeMs: 1_700_000_000_000,
+          records: [
+            {
+              provider: "antigravity" as const,
+              timestampMs: Date.parse("2026-08-01T10:00:00Z"),
+              model: "gemini-2.5-pro",
+              sessionId: "session-offline-1",
+              totals: {
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheCreationTokens: 0,
+                outputTokens: 25,
+                reasoningTokens: 0,
+              },
+              reportedCostUsd: null,
+              speed: "standard" as const,
+              dedupeKey: "session-offline-1:0",
+            },
+          ],
+        };
+
+        // 1. Corrupt existing current cache -> must fail closed and leave file untouched.
+        yield* fs.writeFileString(cachePath, "{not-valid-json");
+        const failed = yield* UsageService.archiveScannedFilesOffline({
+          stateDir: tempDir,
+          provider: "antigravity",
+          files: [sampleFile],
+        });
+        assert.isFalse(failed);
+        assert.equal(yield* fs.readFileString(cachePath), "{not-valid-json");
+
+        // 2. Legacy v16 cache with coveredSince -> upgrades cleanly while dropping coveredSince.
+        yield* fs.remove(cachePath);
+        const legacyPath = NodePath.join(tempDir, "usage-scan-cache-v16.json");
+        yield* fs.writeFileString(
+          legacyPath,
+          JSON.stringify({
+            version: 16,
+            models: [],
+            sessions: [],
+            files: {},
+            sources: {},
+            coveredSince: { claude: 1_700_000_000_000 },
+          }),
+        );
+        const upgraded = yield* UsageService.archiveScannedFilesOffline({
+          stateDir: tempDir,
+          provider: "antigravity",
+          files: [sampleFile],
+        });
+        assert.isTrue(upgraded);
+        const written = JSON.parse(yield* fs.readFileString(cachePath)) as {
+          coveredSince?: Record<string, number>;
+          files: Record<string, { p: string }>;
+        };
+        assert.deepEqual(written.coveredSince ?? {}, {});
+        assert.equal(Object.values(written.files)[0]?.p, "antigravity");
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

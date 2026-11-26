@@ -1,8 +1,8 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Reads native SQLite child links, file mtimes, and POSIX open-file probes directly.
+// @effect-diagnostics nodeBuiltinImport:off -- Reads native SQLite child links via worker thread, file mtimes, and POSIX open-file probes directly.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import * as NodeSqlite from "node:sqlite";
+import * as NodeWorkerThreads from "node:worker_threads";
 
 import type { ProviderSessionId, ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -236,11 +236,131 @@ interface ThreadRetentionRow {
   readonly has_active_run: number;
   readonly has_pending_request: number;
   readonly has_active_provider_thread: number;
+  readonly has_pending_outbox_effect: number;
+  readonly has_active_parent_task: number;
 }
 
 type SessionAction =
   | { readonly kind: "full"; readonly category: "deleted" | "subagent" | "orphan" }
   | { readonly kind: "settled-parent" };
+
+// Inline worker avoids blocking the main event loop when reading conversation SQLite DBs.
+const invokeStepReaderWorkerSource = `
+const { parentPort } = require("node:worker_threads");
+const { DatabaseSync } = require("node:sqlite");
+parentPort.on("message", (request) => {
+  if (request.type === "shutdown") {
+    parentPort.close();
+    return;
+  }
+  const { id, filename, stepType, maxBytes, maxRows } = request;
+  let db;
+  try {
+    db = new DatabaseSync(filename, { readOnly: true, allowExtension: false });
+    db.exec("PRAGMA busy_timeout = 100");
+    const hasSteps = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'")
+      .get();
+    if (hasSteps === undefined) {
+      parentPort.postMessage({ id, payloads: [] });
+      return;
+    }
+    const rows = db
+      .prepare(
+        "SELECT step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND length(step_payload) <= ? LIMIT ?",
+      )
+      .all(stepType, maxBytes, maxRows);
+    const payloads = [];
+    for (const row of rows) {
+      if (row && row.step_payload instanceof Uint8Array) payloads.push(row.step_payload);
+    }
+    parentPort.postMessage({ id, payloads });
+  } catch {
+    parentPort.postMessage({ id, payloads: [] });
+  } finally {
+    if (db !== undefined) {
+      try { db.close(); } catch {}
+    }
+  }
+});
+`;
+
+interface InvokeStepReader {
+  readonly readPayloads: (filename: string) => Promise<ReadonlyArray<Uint8Array>>;
+  readonly close: () => Promise<void>;
+}
+
+function makeInvokeStepReader(): InvokeStepReader {
+  let worker: NodeWorkerThreads.Worker | undefined;
+  let nextId = 0;
+  let closed = false;
+  const pending = new Map<number, (payloads: ReadonlyArray<Uint8Array>) => void>();
+
+  const drainPending = () => {
+    for (const resolve of pending.values()) resolve([]);
+    pending.clear();
+  };
+
+  const ensureWorker = (): NodeWorkerThreads.Worker => {
+    if (worker !== undefined) return worker;
+    const next = new NodeWorkerThreads.Worker(invokeStepReaderWorkerSource, { eval: true });
+    next.unref();
+    next.on(
+      "message",
+      (reply: { readonly id: number; readonly payloads?: ReadonlyArray<Uint8Array> }) => {
+        const resolve = pending.get(reply.id);
+        if (resolve === undefined) return;
+        pending.delete(reply.id);
+        if (pending.size === 0) next.unref();
+        resolve(reply.payloads ?? []);
+      },
+    );
+    next.on("error", () => {
+      if (worker === next) worker = undefined;
+      drainPending();
+      void next.terminate();
+    });
+    next.on("exit", () => {
+      if (worker === next) worker = undefined;
+      drainPending();
+    });
+    worker = next;
+    return next;
+  };
+
+  return {
+    readPayloads: (filename) => {
+      if (closed) return Promise.resolve([]);
+      return new Promise<ReadonlyArray<Uint8Array>>((resolve) => {
+        const active = ensureWorker();
+        const id = ++nextId;
+        pending.set(id, resolve);
+        if (pending.size === 1) active.ref();
+        const message = {
+          id,
+          filename,
+          stepType: INVOKE_SUBAGENT_STEP_TYPE,
+          maxBytes: MAX_STEP_BYTES,
+          maxRows: MAX_INVOKE_ROWS,
+        };
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        active.postMessage(message);
+      });
+    },
+    close: async () => {
+      closed = true;
+      const active = worker;
+      worker = undefined;
+      drainPending();
+      if (active === undefined) return;
+      try {
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        active.postMessage({ type: "shutdown" });
+      } catch {}
+      await active.terminate();
+    },
+  };
+}
 
 async function listProfileRoots(stateDir: string): Promise<ReadonlyArray<string>> {
   const antigravityDir = NodePath.join(stateDir, "providers", "antigravity");
@@ -265,6 +385,7 @@ async function listProfileRoots(stateDir: string): Promise<ReadonlyArray<string>
 async function discoverDirectChildSessionIds(
   profileRoot: string,
   rootSessionId: string,
+  stepReader: InvokeStepReader,
 ): Promise<ReadonlyArray<string>> {
   const discovered = new Set<string>();
 
@@ -304,58 +425,32 @@ async function discoverDirectChildSessionIds(
     }
   }
 
-  // 3. Classic invoke_subagent steps inside conversations/<root>.db
+  // 3. Classic invoke_subagent steps inside conversations/<root>.db (read off-thread)
   const dbEntry = await antigravityManagedPath(
     profileRoot,
     ["antigravity-acp", "conversations", `${rootSessionId}.db`],
     "file",
   );
   if (dbEntry !== undefined) {
-    let database: NodeSqlite.DatabaseSync | undefined;
-    try {
-      database = new NodeSqlite.DatabaseSync(dbEntry.path, { readOnly: true });
-      database.exec("PRAGMA busy_timeout = 100");
-      const hasSteps = database
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'")
-        .get();
-      if (hasSteps !== undefined) {
-        const rows = database
-          .prepare(
-            "SELECT step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND length(step_payload) <= ? LIMIT ?",
-          )
-          .all(INVOKE_SUBAGENT_STEP_TYPE, MAX_STEP_BYTES, MAX_INVOKE_ROWS);
-        for (const row of rows) {
-          if (
-            row === null ||
-            typeof row !== "object" ||
-            !("step_payload" in row) ||
-            !(row.step_payload instanceof Uint8Array)
-          ) {
-            continue;
-          }
-          try {
-            for (const [field, value] of protoFields(row.step_payload)) {
-              if (field !== STEP_INVOKE_SUBAGENT) continue;
-              for (const [subField, subValue] of protoFields(value)) {
-                if (subField !== INVOKE_RESULTS) continue;
-                for (const [resField, resValue] of protoFields(subValue)) {
-                  if (resField !== 1) continue;
-                  const childId = utf8Decoder.decode(resValue).trim();
-                  if (isNativeSessionId(childId) && childId !== rootSessionId) {
-                    discovered.add(childId);
-                  }
-                }
+    const payloads = await stepReader.readPayloads(dbEntry.path).catch(() => []);
+    for (const payload of payloads) {
+      try {
+        for (const [field, value] of protoFields(payload)) {
+          if (field !== STEP_INVOKE_SUBAGENT) continue;
+          for (const [subField, subValue] of protoFields(value)) {
+            if (subField !== INVOKE_RESULTS) continue;
+            for (const [resField, resValue] of protoFields(subValue)) {
+              if (resField !== 1) continue;
+              const childId = utf8Decoder.decode(resValue).trim();
+              if (isNativeSessionId(childId) && childId !== rootSessionId) {
+                discovered.add(childId);
               }
             }
-          } catch {
-            // Skip undecodable step blobs.
           }
         }
+      } catch {
+        // Skip undecodable step blobs.
       }
-    } catch {
-      // Unreadable or locked conversation DBs are skipped safely.
-    } finally {
-      database?.close();
     }
   }
 
@@ -365,13 +460,14 @@ async function discoverDirectChildSessionIds(
 async function discoverDescendantSessionIds(
   profileRoot: string,
   rootSessionId: string,
+  stepReader: InvokeStepReader,
 ): Promise<ReadonlyArray<string>> {
   const seen = new Set<string>([rootSessionId]);
   const descendants: string[] = [];
   const queue: string[] = [rootSessionId];
   while (queue.length > 0 && descendants.length < MAX_DESCENDANTS_PER_ROOT) {
     const current = queue.shift()!;
-    const children = await discoverDirectChildSessionIds(profileRoot, current);
+    const children = await discoverDirectChildSessionIds(profileRoot, current, stepReader);
     for (const child of children) {
       if (seen.has(child)) continue;
       seen.add(child);
@@ -557,12 +653,15 @@ interface PlannedSessionOp {
   readonly profileRoot: string;
   readonly sessionId: string;
   readonly action: SessionAction;
+  readonly childSessionIds: ReadonlyArray<string>;
   readonly dbPath: string | undefined;
   readonly openCheckPaths: ReadonlyArray<string>;
   readonly filePaths: ReadonlyArray<string>;
   readonly dirPaths: ReadonlyArray<string>;
   readonly brainDirPath: string | undefined;
 }
+
+const sessionOpKey = (profileRoot: string, sessionId: string) => `${profileRoot}\0${sessionId}`;
 
 const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* (stateDir: string) {
   const sql = yield* SqlClient.SqlClient;
@@ -572,82 +671,14 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
   const usageArchiver = yield* UsageArchiver;
   const openFileProbe = yield* OpenFileProbe;
 
-  const readThreadRetentionState = Effect.fnUntraced(function* (onlyThreadId?: ThreadId) {
-    const links = yield* (
-      onlyThreadId === undefined
-        ? sql<{ readonly thread_id: string | null; readonly native_session_id: string }>`
-            SELECT DISTINCT thread_id, native_session_id FROM (
-              SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_session_id
-              FROM orchestration_v2_projection_provider_threads
-              WHERE provider = 'antigravity'
-                AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
-              UNION
-              SELECT thread_id, json_extract(payload_json, '$.nativeThreadId') AS native_session_id
-              FROM orchestration_v2_projection_run_attempts
-              WHERE provider = 'antigravity'
-                AND json_extract(payload_json, '$.nativeThreadId') IS NOT NULL
-              UNION
-              SELECT thread_id, json_extract(payload_json, '$.childSessionId') AS native_session_id
-              FROM orchestration_v2_projection_subagents
-              WHERE json_extract(payload_json, '$.childSessionId') IS NOT NULL
-            )
-          `
-        : sql<{ readonly thread_id: string | null; readonly native_session_id: string }>`
-            WITH target_sessions(native_session_id) AS (
-              SELECT json_extract(payload_json, '$.nativeThreadRef.nativeId')
-              FROM orchestration_v2_projection_provider_threads
-              WHERE provider = 'antigravity' AND thread_id = ${onlyThreadId}
-                AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
-              UNION
-              SELECT json_extract(payload_json, '$.nativeThreadId')
-              FROM orchestration_v2_projection_run_attempts
-              WHERE provider = 'antigravity' AND thread_id = ${onlyThreadId}
-                AND json_extract(payload_json, '$.nativeThreadId') IS NOT NULL
-              UNION
-              SELECT json_extract(payload_json, '$.childSessionId')
-              FROM orchestration_v2_projection_subagents
-              WHERE thread_id = ${onlyThreadId}
-                AND json_extract(payload_json, '$.childSessionId') IS NOT NULL
-            )
-            SELECT DISTINCT all_links.thread_id, all_links.native_session_id
-            FROM (
-              SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_session_id
-              FROM orchestration_v2_projection_provider_threads
-              WHERE provider = 'antigravity'
-                AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
-              UNION
-              SELECT thread_id, json_extract(payload_json, '$.nativeThreadId') AS native_session_id
-              FROM orchestration_v2_projection_run_attempts
-              WHERE provider = 'antigravity'
-                AND json_extract(payload_json, '$.nativeThreadId') IS NOT NULL
-              UNION
-              SELECT thread_id, json_extract(payload_json, '$.childSessionId') AS native_session_id
-              FROM orchestration_v2_projection_subagents
-              WHERE json_extract(payload_json, '$.childSessionId') IS NOT NULL
-            ) AS all_links
-            WHERE all_links.native_session_id IN (SELECT native_session_id FROM target_sessions)
-          `
-    ).pipe(NodeSqliteClient.readOnly);
-
-    const sessionToThreads = new Map<string, Set<string | null>>();
-    const threadIds = new Set<string>();
-    for (const link of links) {
-      if (!isNativeSessionId(link.native_session_id)) continue;
-      let owners = sessionToThreads.get(link.native_session_id);
-      if (owners === undefined) {
-        owners = new Set();
-        sessionToThreads.set(link.native_session_id, owners);
-      }
-      owners.add(link.thread_id);
-      if (link.thread_id !== null) threadIds.add(link.thread_id);
-    }
-
-    const threadMap = new Map<string, ThreadRetentionRow>();
-    const threadProviderSessions = new Map<string, Array<ProviderSessionId>>();
-    const allThreadIds = [...threadIds];
-
-    for (let start = 0; start < allThreadIds.length; start += 200) {
-      const batch = allThreadIds.slice(start, start + 200);
+  const loadThreadStates = Effect.fnUntraced(function* (
+    threadIds: ReadonlyArray<string>,
+    threadMap: Map<string, ThreadRetentionRow>,
+    threadProviderSessions: Map<string, Array<ProviderSessionId>>,
+  ) {
+    const missing = threadIds.filter((threadId) => !threadMap.has(threadId));
+    for (let start = 0; start < missing.length; start += 200) {
+      const batch = missing.slice(start, start + 200);
       const rows = yield* sql<ThreadRetentionRow>`
         WITH RECURSIVE shown(thread_id) AS (
           SELECT thread_id FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL
@@ -684,9 +715,22 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
           EXISTS (
             SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
             WHERE pt.thread_id = thread.thread_id
-              AND pt.provider = 'antigravity'
+              AND (pt.driver = 'antigravity' OR (pt.driver IS NULL AND pt.provider = 'antigravity'))
               AND pt.status = 'active'
-          ) AS has_active_provider_thread
+          ) AS has_active_provider_thread,
+          EXISTS (
+            SELECT 1 FROM orchestration_v2_effect_outbox AS effect
+            WHERE effect.thread_id = thread.thread_id
+              AND effect.status IN ('pending', 'running')
+              AND effect.effect_type NOT IN ('thread-content.purge', 'thread-title.generate')
+          ) AS has_pending_outbox_effect,
+          EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_subagents AS task
+            JOIN orchestration_v2_projection_threads AS parent ON parent.thread_id = task.thread_id
+            WHERE task.child_thread_id = thread.thread_id
+              AND task.status IN ('idle', 'pending', 'running', 'waiting')
+              AND parent.deleted_at IS NULL
+          ) AS has_active_parent_task
         FROM orchestration_v2_projection_threads AS thread
         WHERE thread.thread_id IN ${sql.in(batch)}
       `.pipe(NodeSqliteClient.readOnly);
@@ -699,11 +743,12 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
         SELECT DISTINCT thread_id, provider_session_id FROM (
           SELECT thread_id, provider_session_id
           FROM orchestration_v2_projection_provider_sessions
-          WHERE provider = 'antigravity' AND thread_id IN ${sql.in(batch)}
+          WHERE (driver = 'antigravity' OR (driver IS NULL AND provider = 'antigravity'))
+            AND thread_id IN ${sql.in(batch)}
           UNION
           SELECT thread_id, provider_session_id
           FROM orchestration_v2_projection_provider_threads
-          WHERE provider = 'antigravity'
+          WHERE (driver = 'antigravity' OR (driver IS NULL AND provider = 'antigravity'))
             AND provider_session_id IS NOT NULL
             AND thread_id IN ${sql.in(batch)}
         )
@@ -714,6 +759,138 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
         threadProviderSessions.set(row.thread_id, list);
       }
     }
+  });
+
+  const loadLinksForSessions = Effect.fnUntraced(function* (
+    onlySessionIds: ReadonlyArray<string> | undefined,
+  ) {
+    if (onlySessionIds === undefined) {
+      return yield* sql<{
+        readonly thread_id: string | null;
+        readonly native_session_id: string;
+      }>`
+        SELECT DISTINCT thread_id, native_session_id FROM (
+          SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_session_id
+          FROM orchestration_v2_projection_provider_threads
+          WHERE (driver = 'antigravity' OR (driver IS NULL AND provider = 'antigravity'))
+            AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+          UNION
+          SELECT ra.thread_id, json_extract(ra.payload_json, '$.nativeThreadId') AS native_session_id
+          FROM orchestration_v2_projection_run_attempts AS ra
+          WHERE (
+              ra.provider = 'antigravity'
+              OR json_extract(ra.payload_json, '$.driver') = 'antigravity'
+              OR EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+                WHERE pt.provider_thread_id = ra.provider_thread_id
+                  AND (pt.driver = 'antigravity' OR (pt.driver IS NULL AND pt.provider = 'antigravity'))
+              )
+            )
+            AND json_extract(ra.payload_json, '$.nativeThreadId') IS NOT NULL
+          UNION
+          SELECT thread_id, json_extract(payload_json, '$.childSessionId') AS native_session_id
+          FROM orchestration_v2_projection_subagents
+          WHERE json_extract(payload_json, '$.childSessionId') IS NOT NULL
+        )
+      `.pipe(NodeSqliteClient.readOnly);
+    }
+
+    const results: Array<{
+      readonly thread_id: string | null;
+      readonly native_session_id: string;
+    }> = [];
+    for (let start = 0; start < onlySessionIds.length; start += 200) {
+      const batch = onlySessionIds.slice(start, start + 200);
+      const rows = yield* sql<{
+        readonly thread_id: string | null;
+        readonly native_session_id: string;
+      }>`
+        SELECT DISTINCT thread_id, native_session_id FROM (
+          SELECT thread_id, json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_session_id
+          FROM orchestration_v2_projection_provider_threads
+          WHERE (driver = 'antigravity' OR (driver IS NULL AND provider = 'antigravity'))
+            AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IN ${sql.in(batch)}
+          UNION
+          SELECT ra.thread_id, json_extract(ra.payload_json, '$.nativeThreadId') AS native_session_id
+          FROM orchestration_v2_projection_run_attempts AS ra
+          WHERE (
+              ra.provider = 'antigravity'
+              OR json_extract(ra.payload_json, '$.driver') = 'antigravity'
+              OR EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+                WHERE pt.provider_thread_id = ra.provider_thread_id
+                  AND (pt.driver = 'antigravity' OR (pt.driver IS NULL AND pt.provider = 'antigravity'))
+              )
+            )
+            AND json_extract(ra.payload_json, '$.nativeThreadId') IN ${sql.in(batch)}
+          UNION
+          SELECT thread_id, json_extract(payload_json, '$.childSessionId') AS native_session_id
+          FROM orchestration_v2_projection_subagents
+          WHERE json_extract(payload_json, '$.childSessionId') IN ${sql.in(batch)}
+        )
+      `.pipe(NodeSqliteClient.readOnly);
+      for (const row of rows) results.push(row);
+    }
+    return results;
+  });
+
+  const readThreadRetentionState = Effect.fnUntraced(function* (onlyThreadId?: ThreadId) {
+    let targetSessionIds: ReadonlyArray<string> | undefined;
+    if (onlyThreadId !== undefined) {
+      const targetRows = yield* sql<{ readonly native_session_id: string }>`
+        SELECT DISTINCT native_session_id FROM (
+          SELECT json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_session_id
+          FROM orchestration_v2_projection_provider_threads
+          WHERE (driver = 'antigravity' OR (driver IS NULL AND provider = 'antigravity'))
+            AND thread_id = ${onlyThreadId}
+            AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+          UNION
+          SELECT json_extract(ra.payload_json, '$.nativeThreadId') AS native_session_id
+          FROM orchestration_v2_projection_run_attempts AS ra
+          WHERE ra.thread_id = ${onlyThreadId}
+            AND (
+              ra.provider = 'antigravity'
+              OR json_extract(ra.payload_json, '$.driver') = 'antigravity'
+              OR EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+                WHERE pt.provider_thread_id = ra.provider_thread_id
+                  AND (pt.driver = 'antigravity' OR (pt.driver IS NULL AND pt.provider = 'antigravity'))
+              )
+            )
+            AND json_extract(ra.payload_json, '$.nativeThreadId') IS NOT NULL
+          UNION
+          SELECT json_extract(payload_json, '$.childSessionId') AS native_session_id
+          FROM orchestration_v2_projection_subagents
+          WHERE thread_id = ${onlyThreadId}
+            AND json_extract(payload_json, '$.childSessionId') IS NOT NULL
+        )
+      `.pipe(NodeSqliteClient.readOnly);
+      targetSessionIds = targetRows
+        .map((row) => row.native_session_id)
+        .filter((id) => isNativeSessionId(id));
+    }
+
+    const links =
+      targetSessionIds !== undefined && targetSessionIds.length === 0
+        ? []
+        : yield* loadLinksForSessions(targetSessionIds);
+
+    const sessionToThreads = new Map<string, Set<string | null>>();
+    const threadIds = new Set<string>();
+    for (const link of links) {
+      if (!isNativeSessionId(link.native_session_id)) continue;
+      let owners = sessionToThreads.get(link.native_session_id);
+      if (owners === undefined) {
+        owners = new Set();
+        sessionToThreads.set(link.native_session_id, owners);
+      }
+      owners.add(link.thread_id);
+      if (link.thread_id !== null) threadIds.add(link.thread_id);
+    }
+
+    const threadMap = new Map<string, ThreadRetentionRow>();
+    const threadProviderSessions = new Map<string, Array<ProviderSessionId>>();
+    yield* loadThreadStates([...threadIds], threadMap, threadProviderSessions);
 
     return { sessionToThreads, threadMap, threadProviderSessions };
   });
@@ -766,7 +943,11 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
         return "protected";
       }
       if (row.deleted_at !== null) {
-        return row.is_shown === 1 ? "protected" : "deleted";
+        return row.is_shown === 1 ||
+          row.has_pending_outbox_effect === 1 ||
+          row.has_active_parent_task === 1
+          ? "protected"
+          : "deleted";
       }
       if (options.onlyThreadId !== undefined) {
         // Immediate thread.deleted purge only touches deleted threads.
@@ -809,105 +990,157 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
       }
     }
 
-    const operations: PlannedSessionOp[] = [];
-    for (const profileRoot of profileRoots) {
-      const diskIds = yield* Effect.promise(() => listDiskSessionIds(profileRoot));
-      if (diskIds.size === 0) continue;
-
-      // Protect all descendant subagent sessions of every protected parent session.
-      const protectedAll = new Set<string>(protectedRoots);
-      if (options.onlyThreadId === undefined) {
-        for (const rootId of protectedRoots) {
-          if (!diskIds.has(rootId)) continue;
-          const descendants = yield* Effect.promise(() =>
-            discoverDescendantSessionIds(profileRoot, rootId),
-          );
-          for (const childId of descendants) protectedAll.add(childId);
-          yield* options.betweenPages;
+    const protectDiscoveredDescendantsOwnedByLiveThreads = Effect.fnUntraced(function* (
+      descendants: ReadonlyArray<string>,
+      protectedAll: Set<string>,
+    ) {
+      if (options.onlyThreadId === undefined) return;
+      const unchecked = descendants.filter(
+        (id) => !protectedAll.has(id) && !sessionToThreads.has(id),
+      );
+      if (unchecked.length === 0) return;
+      const links = yield* loadLinksForSessions(unchecked);
+      const extraThreadIds = new Set<string>();
+      const ownersBySession = new Map<string, Set<string | null>>();
+      for (const link of links) {
+        if (!isNativeSessionId(link.native_session_id)) continue;
+        let owners = ownersBySession.get(link.native_session_id);
+        if (owners === undefined) {
+          owners = new Set();
+          ownersBySession.set(link.native_session_id, owners);
+        }
+        owners.add(link.thread_id);
+        if (link.thread_id !== null) extraThreadIds.add(link.thread_id);
+      }
+      if (extraThreadIds.size > 0) {
+        yield* loadThreadStates([...extraThreadIds], threadMap, threadProviderSessions);
+      }
+      for (const [sessionId, owners] of ownersBySession) {
+        for (const owner of owners) {
+          if ((yield* classifyThread(owner)) === "protected") {
+            protectedAll.add(sessionId);
+            break;
+          }
         }
       }
+    });
 
-      const plannedBySession = new Map<string, SessionAction>();
-      const scheduleAction = (sessionId: string, action: SessionAction) => {
-        if (protectedAll.has(sessionId) || !diskIds.has(sessionId)) return;
-        const existing = plannedBySession.get(sessionId);
-        // Full removal supersedes partial settled pruning if a session is both.
-        if (
-          existing === undefined ||
-          (existing.kind === "settled-parent" && action.kind === "full")
-        ) {
-          plannedBySession.set(sessionId, action);
+    const stepReader = makeInvokeStepReader();
+    return yield* Effect.gen(function* () {
+      const operations: PlannedSessionOp[] = [];
+      for (const profileRoot of profileRoots) {
+        const diskIds = yield* Effect.promise(() => listDiskSessionIds(profileRoot));
+        if (diskIds.size === 0) continue;
+
+        // Protect all descendant subagent sessions of every protected parent session.
+        const protectedAll = new Set<string>(protectedRoots);
+        if (options.onlyThreadId === undefined) {
+          for (const rootId of protectedRoots) {
+            if (!diskIds.has(rootId)) continue;
+            const descendants = yield* Effect.promise(() =>
+              discoverDescendantSessionIds(profileRoot, rootId, stepReader),
+            );
+            for (const childId of descendants) protectedAll.add(childId);
+            yield* options.betweenPages;
+          }
         }
-      };
 
-      // Deleted roots + cascaded children (full delete).
-      for (const rootId of deletedRoots) {
-        if (!diskIds.has(rootId)) continue;
-        const descendants = yield* Effect.promise(() =>
-          discoverDescendantSessionIds(profileRoot, rootId),
-        );
-        for (const childId of descendants) {
-          scheduleAction(childId, { kind: "full", category: "subagent" });
-        }
-        scheduleAction(rootId, { kind: "full", category: "deleted" });
-        yield* options.betweenPages;
-      }
-
-      // Settled expired roots (partial parent prune) + cascaded children (full delete).
-      for (const rootId of settledRoots) {
-        if (!diskIds.has(rootId)) continue;
-        const descendants = yield* Effect.promise(() =>
-          discoverDescendantSessionIds(profileRoot, rootId),
-        );
-        for (const childId of descendants) {
-          scheduleAction(childId, { kind: "full", category: "subagent" });
-        }
-        scheduleAction(rootId, { kind: "settled-parent" });
-        yield* options.betweenPages;
-      }
-
-      // Orphan sweep (only during full maintenance pass, never during single-thread deletion).
-      if (options.onlyThreadId === undefined) {
-        for (const sessionId of diskIds) {
+        const plannedBySession = new Map<string, SessionAction>();
+        const childSessionIdsByRoot = new Map<string, Set<string>>();
+        const scheduleAction = (sessionId: string, action: SessionAction) => {
+          if (protectedAll.has(sessionId) || !diskIds.has(sessionId)) return;
+          const existing = plannedBySession.get(sessionId);
+          // Full removal supersedes partial settled pruning if a session is both.
           if (
-            sessionToThreads.has(sessionId) ||
-            protectedAll.has(sessionId) ||
-            plannedBySession.has(sessionId)
+            existing === undefined ||
+            (existing.kind === "settled-parent" && action.kind === "full")
           ) {
-            continue;
+            plannedBySession.set(sessionId, action);
           }
-          const newestMtimeMs = yield* Effect.promise(() =>
-            sessionNewestMtimeMs(profileRoot, sessionId),
+        };
+
+        const scheduleRootWithDescendants = Effect.fnUntraced(function* (
+          rootId: string,
+          rootAction: SessionAction,
+        ) {
+          if (!diskIds.has(rootId)) return;
+          const descendants = yield* Effect.promise(() =>
+            discoverDescendantSessionIds(profileRoot, rootId, stepReader),
           );
-          if (newestMtimeMs !== null && nowMs - newestMtimeMs >= orphanGraceMs) {
-            scheduleAction(sessionId, { kind: "full", category: "orphan" });
+          yield* protectDiscoveredDescendantsOwnedByLiveThreads(descendants, protectedAll);
+          // If any child subagent is protected, keep the parent intact so the child's links survive.
+          if (descendants.some((childId) => protectedAll.has(childId))) {
+            protectedAll.add(rootId);
+            yield* options.betweenPages;
+            return;
           }
+          const scheduledChildren = childSessionIdsByRoot.get(rootId) ?? new Set<string>();
+          for (const childId of descendants) {
+            if (diskIds.has(childId)) {
+              scheduledChildren.add(childId);
+              scheduleAction(childId, { kind: "full", category: "subagent" });
+            }
+          }
+          if (scheduledChildren.size > 0) childSessionIdsByRoot.set(rootId, scheduledChildren);
+          scheduleAction(rootId, rootAction);
           yield* options.betweenPages;
+        });
+
+        // Deleted roots + cascaded children (full delete).
+        for (const rootId of deletedRoots) {
+          yield* scheduleRootWithDescendants(rootId, { kind: "full", category: "deleted" });
+        }
+
+        // Settled expired roots (partial parent prune) + cascaded children (full delete).
+        for (const rootId of settledRoots) {
+          yield* scheduleRootWithDescendants(rootId, { kind: "settled-parent" });
+        }
+
+        // Orphan sweep (only during full maintenance pass, never during single-thread deletion).
+        if (options.onlyThreadId === undefined) {
+          for (const sessionId of diskIds) {
+            if (
+              sessionToThreads.has(sessionId) ||
+              protectedAll.has(sessionId) ||
+              plannedBySession.has(sessionId)
+            ) {
+              continue;
+            }
+            const newestMtimeMs = yield* Effect.promise(() =>
+              sessionNewestMtimeMs(profileRoot, sessionId),
+            );
+            if (newestMtimeMs !== null && nowMs - newestMtimeMs >= orphanGraceMs) {
+              scheduleAction(sessionId, { kind: "full", category: "orphan" });
+            }
+            yield* options.betweenPages;
+          }
+        }
+
+        // Resolve actual managed targets on disk; children run before parents in order.
+        const ordered = [...plannedBySession.entries()].sort(([, left], [, right]) => {
+          const rank = (action: SessionAction) =>
+            action.kind === "full" && action.category === "subagent" ? 0 : 1;
+          return rank(left) - rank(right);
+        });
+
+        for (const [sessionId, action] of ordered) {
+          const targets = yield* Effect.promise(() =>
+            existingSessionTargets(profileRoot, sessionId, action),
+          );
+          if (targets.filePaths.length === 0 && targets.dirPaths.length === 0) continue;
+          const childSet = childSessionIdsByRoot.get(sessionId);
+          operations.push({
+            profileRoot,
+            sessionId,
+            action,
+            childSessionIds: childSet === undefined ? [] : [...childSet],
+            ...targets,
+          });
         }
       }
 
-      // Resolve actual managed targets on disk; children run before parents in order.
-      const ordered = [...plannedBySession.entries()].sort(([, left], [, right]) => {
-        const rank = (action: SessionAction) =>
-          action.kind === "full" && action.category === "subagent" ? 0 : 1;
-        return rank(left) - rank(right);
-      });
-
-      for (const [sessionId, action] of ordered) {
-        const targets = yield* Effect.promise(() =>
-          existingSessionTargets(profileRoot, sessionId, action),
-        );
-        if (targets.filePaths.length === 0 && targets.dirPaths.length === 0) continue;
-        operations.push({
-          profileRoot,
-          sessionId,
-          action,
-          ...targets,
-        });
-      }
-    }
-
-    return operations;
+      return operations;
+    }).pipe(Effect.ensuring(Effect.promise(() => stepReader.close())));
   });
 
   const executePlan = Effect.fnUntraced(function* (
@@ -917,14 +1150,22 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
     if (operations.length === 0) return EMPTY_RETENTION_RESULT;
 
     // 1. OS-level open-file guard across all candidate DB/WAL/SHM paths.
+    // Children appear before parents, so a skipped child also blocks removing its parent.
     const allOpenCheckPaths = operations.flatMap((op) => op.openCheckPaths);
     const openPaths = yield* openFileProbe(allOpenCheckPaths);
 
+    const skippedOpenKeys = new Set<string>();
     const closedOps: PlannedSessionOp[] = [];
     let skippedOpenSessions = 0;
     for (const op of operations) {
-      const isOpen = op.openCheckPaths.some((filePath) => openPaths.has(filePath));
+      const key = sessionOpKey(op.profileRoot, op.sessionId);
+      const isOpen =
+        op.openCheckPaths.some((filePath) => openPaths.has(filePath)) ||
+        op.childSessionIds.some((childId) =>
+          skippedOpenKeys.has(sessionOpKey(op.profileRoot, childId)),
+        );
       if (isOpen) {
+        skippedOpenKeys.add(key);
         skippedOpenSessions += 1;
         continue;
       }
@@ -963,15 +1204,24 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
     }
 
     // 3. Delete verified sessions, yielding between items.
+    // A child whose usage could not be archived blocks removing its parent too.
     let deletedSessions = 0;
     let prunedSettledSessions = 0;
     let removedSubagentSessions = 0;
     let removedOrphanSessions = 0;
     let skippedUsageErrorSessions = 0;
     let reclaimedBytes = 0;
+    const failedUsageKeys = new Set<string>();
 
     for (const op of closedOps) {
-      if (op.dbPath !== undefined && failedUsageDbs.has(op.dbPath)) {
+      const key = sessionOpKey(op.profileRoot, op.sessionId);
+      if (
+        (op.dbPath !== undefined && failedUsageDbs.has(op.dbPath)) ||
+        op.childSessionIds.some((childId) =>
+          failedUsageKeys.has(sessionOpKey(op.profileRoot, childId)),
+        )
+      ) {
+        failedUsageKeys.add(key);
         skippedUsageErrorSessions += 1;
         continue;
       }
@@ -1067,13 +1317,23 @@ const makeForStateDir = Effect.fn("AntigravitySessionRetention.make")(function* 
       });
       if (operations.length === 0) return EMPTY_INSPECTION;
       const openPaths = yield* openFileProbe(operations.flatMap((op) => op.openCheckPaths));
+      const skippedOpenKeys = new Set<string>();
       let deletedSessions = 0;
       let settledSessions = 0;
       let subagentSessions = 0;
       let orphanSessions = 0;
       let reclaimableBytes = 0;
       for (const op of operations) {
-        if (op.openCheckPaths.some((filePath) => openPaths.has(filePath))) continue;
+        const key = sessionOpKey(op.profileRoot, op.sessionId);
+        if (
+          op.openCheckPaths.some((filePath) => openPaths.has(filePath)) ||
+          op.childSessionIds.some((childId) =>
+            skippedOpenKeys.has(sessionOpKey(op.profileRoot, childId)),
+          )
+        ) {
+          skippedOpenKeys.add(key);
+          continue;
+        }
         for (const filePath of op.filePaths) {
           reclaimableBytes += yield* Effect.promise(() =>
             NodeFSP.lstat(filePath)

@@ -685,34 +685,31 @@ export const layerExecutor: Layer.Layer<
             );
           }
           case "thread-content.purge":
-            return projectionMaintenance.purgeDeletedThread(effect.threadId).pipe(
-              Effect.andThen(
-                antigravityRetention
-                  .purgeDeletedThread(effect.threadId, {
-                    isSessionLive: providerSessions.isLive,
-                  })
-                  .pipe(
-                    Effect.catch((cause) =>
-                      Effect.logWarning(
-                        "Could not purge Antigravity session files for deleted thread",
-                        {
-                          threadId: effect.threadId,
-                          cause,
-                        },
-                      ),
-                    ),
+            return antigravityRetention
+              .purgeDeletedThread(effect.threadId, {
+                isSessionLive: providerSessions.isLive,
+              })
+              .pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning(
+                    "Could not purge Antigravity session files for deleted thread",
+                    {
+                      threadId: effect.threadId,
+                      cause,
+                    },
                   ),
-              ),
-              Effect.asVoid,
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationEffectExecutionError({
-                    effectId: effect.id,
-                    effectType: effect.request.type,
-                    cause,
-                  }),
-              ),
-            );
+                ),
+                Effect.andThen(projectionMaintenance.purgeDeletedThread(effect.threadId)),
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "thread-title.generate":
             return threadTitleRegeneration
               .execute({

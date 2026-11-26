@@ -1348,15 +1348,40 @@ export const archiveScannedFilesOffline = Effect.fn("UsageService.archiveScanned
         Effect.flatMap((raw) => decodeScanCacheFile(raw)),
         Effect.catchCause(() => Effect.succeed(null)),
       );
-    let document = yield* readDocument(scanCachePath);
-    for (const fileName of LEGACY_SCAN_CACHE_FILE_NAMES) {
-      if (document !== null) break;
-      document = yield* readDocument(path.join(input.stateDir, fileName));
+    const currentExists = yield* fileSystem
+      .exists(scanCachePath)
+      .pipe(Effect.catchCause(() => Effect.succeed(true)));
+    let document: unknown = null;
+    let current = false;
+    if (currentExists) {
+      document = yield* readDocument(scanCachePath);
+      // Fail closed if an existing current scan cache cannot be read or decoded so we never
+      // overwrite prior Claude/Codex/Antigravity history with a partial snapshot.
+      if (document === null) return false;
+      current = true;
+    } else {
+      for (const fileName of LEGACY_SCAN_CACHE_FILE_NAMES) {
+        const legacyPath = path.join(input.stateDir, fileName);
+        const legacyExists = yield* fileSystem
+          .exists(legacyPath)
+          .pipe(Effect.catchCause(() => Effect.succeed(false)));
+        if (!legacyExists) continue;
+        document = yield* readDocument(legacyPath);
+        if (document === null) return false;
+        break;
+      }
     }
     const cache: ScanCache =
       document === null
         ? new Map()
         : decodeScanCache(document, transcriptFormats, scanProviderKinds);
+    const savedFiles =
+      document === null ? undefined : (document as { readonly files?: unknown }).files;
+    const complete =
+      typeof savedFiles === "object" &&
+      savedFiles !== null &&
+      Object.keys(savedFiles).length === cache.size;
+    const keepCoveredSince = current && complete && cache.size > 0;
     const extraSources = document === null ? Option.none() : decodeCachedSources(document);
     let changed = false;
     for (const file of nonEmpty) {
@@ -1389,7 +1414,7 @@ export const archiveScannedFilesOffline = Effect.fn("UsageService.archiveScanned
       onNone: () => ({ sources: {}, coveredSince: {} }),
       onSome: (saved) => ({
         sources: saved.sources,
-        coveredSince: saved.coveredSince ?? {},
+        coveredSince: keepCoveredSince ? (saved.coveredSince ?? {}) : {},
       }),
     });
     return yield* Effect.sync(() => writeScanCache(cache, extra)).pipe(

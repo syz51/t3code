@@ -679,7 +679,7 @@ const layerAntigravityLiveSessionProbe = Layer.effect(
   Effect.map(ProviderSessionManager.ProviderSessionManagerV2, (sessions) => sessions.isLive),
 );
 
-const layerAntigravityRetentionForMaintenance = AntigravitySessionRetention.layer.pipe(
+const layerAntigravityRetentionForMaintenance = Layer.fresh(AntigravitySessionRetention.layer).pipe(
   Layer.provide(layerAntigravityLiveSessionProbe),
 );
 
