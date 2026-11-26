@@ -519,14 +519,17 @@ exec /bin/rm "$@"
     }
   });
 
-  it("reclaims intra-page B-tree slack on the live DB when above threshold, preserves backup, and honors --no-defrag", () => {
+  it("reclaims intra-page B-tree slack on the live DB when above threshold, preserves uncheckpointed WAL and backup, and honors --no-defrag", () => {
     const seedFragmentedDb = (targetPath: string) => {
-      const db = new NodeSqlite.DatabaseSync(targetPath);
+      const sourceDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-frag-seed-"));
+      const sourcePath = NodePath.join(sourceDir, "statev2.sqlite");
+      const db = new NodeSqlite.DatabaseSync(sourcePath);
       try {
         db.exec(`
           PRAGMA page_size = 4096;
           PRAGMA auto_vacuum = INCREMENTAL;
           PRAGMA journal_mode = WAL;
+          PRAGMA wal_autocheckpoint = 0;
           CREATE TABLE payloads (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
         `);
         const insert = db.prepare("INSERT INTO payloads (id, body) VALUES (?, ?)");
@@ -542,10 +545,16 @@ exec /bin/rm "$@"
         }
         db.exec("COMMIT");
         db.exec("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);");
-        // Add an uncheckpointed WAL row to verify WAL replay is preserved during defrag swap.
+        // Add an uncheckpointed WAL row and snapshot while open so -wal stays uncheckpointed.
         db.exec("INSERT INTO payloads (id, body) VALUES (501, 'wal-live-row')");
+        NodeFS.copyFileSync(sourcePath, targetPath);
+        NodeFS.copyFileSync(`${sourcePath}-wal`, `${targetPath}-wal`);
+        if (NodeFS.existsSync(`${sourcePath}-shm`)) {
+          NodeFS.copyFileSync(`${sourcePath}-shm`, `${targetPath}-shm`);
+        }
       } finally {
         db.close();
+        NodeFS.rmSync(sourceDir, { recursive: true, force: true });
       }
     };
 
@@ -556,13 +565,19 @@ exec /bin/rm "$@"
       const newBuildB = NodePath.join(workDir, "build-b", "T3 Code (Beta).app");
       const backupRootA = NodePath.join(workDir, "backups-a");
       const backupRootB = NodePath.join(workDir, "backups-b");
-      const dbPath = NodePath.join(workDir, "userdata", "statev2.sqlite");
-      NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
+      const dbPathNoDefrag = NodePath.join(workDir, "userdata-a", "statev2.sqlite");
+      const dbPathDefrag = NodePath.join(workDir, "userdata-b", "statev2.sqlite");
+      NodeFS.mkdirSync(NodePath.dirname(dbPathNoDefrag), { recursive: true });
+      NodeFS.mkdirSync(NodePath.dirname(dbPathDefrag), { recursive: true });
       makeFakeApp(installedApp, "0.1.12-fork.20261125");
       makeFakeApp(newBuildA, "0.1.12-fork.20261126");
       makeFakeApp(newBuildB, "0.1.12-fork.20261127");
-      seedFragmentedDb(dbPath);
-      const beforeSize = NodeFS.statSync(dbPath).size;
+      seedFragmentedDb(dbPathNoDefrag);
+      seedFragmentedDb(dbPathDefrag);
+      const beforeNoDefragSize = NodeFS.statSync(dbPathNoDefrag).size;
+      const beforeDefragSize = NodeFS.statSync(dbPathDefrag).size;
+      assert.isTrue(NodeFS.existsSync(`${dbPathDefrag}-wal`));
+      assert.isAbove(NodeFS.statSync(`${dbPathDefrag}-wal`).size, 0);
 
       const { binDir } = makeStubBin(workDir);
 
@@ -577,7 +592,7 @@ exec /bin/rm "$@"
             PATH: `${binDir}:${process.env.PATH ?? ""}`,
             T3_UPDATE_APP: installedApp,
             T3_UPDATE_BUILD: newBuildA,
-            T3_UPDATE_STATE_DB: dbPath,
+            T3_UPDATE_STATE_DB: dbPathNoDefrag,
             T3_UPDATE_BACKUP_ROOT: backupRootA,
             T3_UPDATE_DEFRAG_MIN_MIB: "0",
           },
@@ -585,9 +600,9 @@ exec /bin/rm "$@"
       );
       assert.equal(noDefrag.status, 0, `stdout:\n${noDefrag.stdout}\nstderr:\n${noDefrag.stderr}`);
       assert.include(noDefrag.stdout, "skipping live database defrag");
-      assert.equal(NodeFS.statSync(dbPath).size, beforeSize);
+      assert.equal(NodeFS.statSync(dbPathNoDefrag).size, beforeNoDefragSize);
 
-      // 2. Default defrag (with min MiB 0 for small test fixture) shrinks live DB, clears stale WAL/SHM, and keeps valid backup.
+      // 2. Default defrag (with min MiB 0 for small test fixture) shrinks live DB, replays + clears uncheckpointed WAL, and keeps valid backup.
       const defrag = NodeChildProcess.spawnSync("bash", [updateScript], {
         encoding: "utf8",
         env: {
@@ -595,19 +610,20 @@ exec /bin/rm "$@"
           PATH: `${binDir}:${process.env.PATH ?? ""}`,
           T3_UPDATE_APP: installedApp,
           T3_UPDATE_BUILD: newBuildB,
-          T3_UPDATE_STATE_DB: dbPath,
+          T3_UPDATE_STATE_DB: dbPathDefrag,
           T3_UPDATE_BACKUP_ROOT: backupRootB,
-          T3_UPDATE_DEFRAG_MIN_MIB: "0",
+          T3_UPDATE_DEFRAG_MIN_MIB: "00",
+          T3_UPDATE_KEEP: "01",
         },
       });
       assert.equal(defrag.status, 0, `stdout:\n${defrag.stdout}\nstderr:\n${defrag.stderr}`);
       assert.include(defrag.stdout, "defragmented live database verified");
-      const afterSize = NodeFS.statSync(dbPath).size;
-      assert.isBelow(afterSize, beforeSize, "live DB should measurably shrink after defrag");
-      assert.isFalse(NodeFS.existsSync(`${dbPath}-wal`));
-      assert.isFalse(NodeFS.existsSync(`${dbPath}-shm`));
+      const afterSize = NodeFS.statSync(dbPathDefrag).size;
+      assert.isBelow(afterSize, beforeDefragSize, "live DB should measurably shrink after defrag");
+      assert.isFalse(NodeFS.existsSync(`${dbPathDefrag}-wal`));
+      assert.isFalse(NodeFS.existsSync(`${dbPathDefrag}-shm`));
 
-      const verifyLive = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+      const verifyLive = new NodeSqlite.DatabaseSync(dbPathDefrag, { readOnly: true });
       try {
         assert.equal(
           (verifyLive.prepare("PRAGMA quick_check").get() as { quick_check: string }).quick_check,
@@ -649,6 +665,105 @@ exec /bin/rm "$@"
       } finally {
         verifyBackup.close();
       }
+    } finally {
+      NodeFS.rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("handles empty backup_root in --dry-run, leading-zero env vars, canonicalizes build cleanup guard, and skips cleanup when open fails", () => {
+    const workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-update-guards-"));
+    try {
+      const fakeHome = NodePath.join(workDir, "home");
+      const installedApp = NodePath.join(workDir, "apps", "T3 Code (Beta).app");
+      const newBuild = NodePath.join(fakeHome, "build", "T3 Code (Beta).app");
+      const backupRoot = NodePath.join(workDir, "backups");
+      const dbPath = NodePath.join(workDir, "userdata", "statev2.sqlite");
+      NodeFS.mkdirSync(fakeHome, { recursive: true });
+      NodeFS.mkdirSync(NodePath.dirname(dbPath), { recursive: true });
+      NodeFS.mkdirSync(backupRoot, { recursive: true });
+      makeFakeApp(installedApp, "0.1.12-fork.20261125");
+      makeFakeApp(newBuild, "0.1.12-fork.20261126");
+      seedUncheckpointedWalDb(dbPath, { keepShm: false });
+
+      const { binDir } = makeStubBin(workDir);
+
+      // 1. --dry-run with empty backup_root and leading-zero env vars succeeds with empty stderr.
+      const emptyDryRun = NodeChildProcess.spawnSync("bash", [updateScript, "--dry-run"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          T3_UPDATE_APP: installedApp,
+          T3_UPDATE_BUILD: newBuild,
+          T3_UPDATE_BUILD_ROOT: `${fakeHome}/`,
+          T3_UPDATE_STATE_DB: dbPath,
+          T3_UPDATE_BACKUP_ROOT: backupRoot,
+          T3_UPDATE_KEEP: "01",
+          T3_UPDATE_DEFRAG_MIN_MIB: "08",
+          T3_UPDATE_DEFRAG_MIN_PCT: "09",
+        },
+      });
+      assert.equal(
+        emptyDryRun.status,
+        0,
+        `stdout:\n${emptyDryRun.stdout}\nstderr:\n${emptyDryRun.stderr}`,
+      );
+      assert.equal(emptyDryRun.stderr, "");
+      // Trailing slash on $HOME must not be accepted as a build cleanup target.
+      assert.notInclude(emptyDryRun.stdout, "Would remove staged build:");
+
+      // 2. Parent traversal to $HOME (`$HOME/build/..`) must also be rejected.
+      const traversalDryRun = NodeChildProcess.spawnSync("bash", [updateScript, "--dry-run"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          T3_UPDATE_APP: installedApp,
+          T3_UPDATE_BUILD: newBuild,
+          T3_UPDATE_BUILD_ROOT: `${fakeHome}/build/..`,
+          T3_UPDATE_STATE_DB: dbPath,
+          T3_UPDATE_BACKUP_ROOT: backupRoot,
+        },
+      });
+      assert.equal(traversalDryRun.status, 0);
+      assert.notInclude(traversalDryRun.stdout, "Would remove staged build:");
+
+      // 3. When `open` fails, old backups and staged build must both be preserved.
+      const oldBackup = NodePath.join(backupRoot, "20261101-010000-update");
+      NodeFS.mkdirSync(oldBackup, { recursive: true });
+      const failOpenBin = NodePath.join(workDir, "bin-fail-open");
+      NodeFS.mkdirSync(failOpenBin, { recursive: true });
+      NodeFS.writeFileSync(NodePath.join(failOpenBin, "sleep"), "#!/usr/bin/env bash\nexit 0\n", {
+        mode: 0o755,
+      });
+      NodeFS.writeFileSync(NodePath.join(failOpenBin, "open"), "#!/usr/bin/env bash\nexit 1\n", {
+        mode: 0o755,
+      });
+
+      const failedOpen = NodeChildProcess.spawnSync("bash", [updateScript], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          PATH: `${failOpenBin}:${process.env.PATH ?? ""}`,
+          T3_UPDATE_APP: installedApp,
+          T3_UPDATE_BUILD: newBuild,
+          T3_UPDATE_BUILD_ROOT: NodePath.join(fakeHome, "build"),
+          T3_UPDATE_STATE_DB: dbPath,
+          T3_UPDATE_BACKUP_ROOT: backupRoot,
+          T3_UPDATE_KEEP: "1",
+        },
+      });
+      assert.equal(
+        failedOpen.status,
+        0,
+        `stdout:\n${failedOpen.stdout}\nstderr:\n${failedOpen.stderr}`,
+      );
+      assert.include(failedOpen.stdout, "keeping old backups and staged build");
+      assert.isTrue(NodeFS.existsSync(oldBackup));
+      assert.isTrue(NodeFS.existsSync(NodePath.join(fakeHome, "build")));
     } finally {
       NodeFS.rmSync(workDir, { recursive: true, force: true });
     }

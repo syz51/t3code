@@ -30,19 +30,26 @@ for arg in "$@"; do
 done
 
 keep_count="${T3_UPDATE_KEEP-1}"
-[[ "$keep_count" =~ ^[0-9]+$ && "$keep_count" -ge 1 ]] ||
+[[ "$keep_count" =~ ^[0-9]+$ ]] ||
   fail "T3_UPDATE_KEEP must be an integer >= 1 (got '$keep_count')"
+keep_count=$((10#$keep_count))
+((keep_count >= 1)) ||
+  fail "T3_UPDATE_KEEP must be an integer >= 1 (got '${T3_UPDATE_KEEP-1}')"
 
 [[ "$defrag_enabled" == "0" || "$defrag_enabled" == "1" ]] ||
   fail "T3_UPDATE_DEFRAG must be 0 or 1 (got '$defrag_enabled')"
 
 defrag_min_pct="${T3_UPDATE_DEFRAG_MIN_PCT-10}"
-[[ "$defrag_min_pct" =~ ^[0-9]+$ && "$defrag_min_pct" -le 100 ]] ||
+[[ "$defrag_min_pct" =~ ^[0-9]+$ ]] ||
   fail "T3_UPDATE_DEFRAG_MIN_PCT must be an integer between 0 and 100 (got '$defrag_min_pct')"
+defrag_min_pct=$((10#$defrag_min_pct))
+((defrag_min_pct <= 100)) ||
+  fail "T3_UPDATE_DEFRAG_MIN_PCT must be an integer between 0 and 100 (got '${T3_UPDATE_DEFRAG_MIN_PCT-10}')"
 
 defrag_min_mib="${T3_UPDATE_DEFRAG_MIN_MIB-64}"
 [[ "$defrag_min_mib" =~ ^[0-9]+$ ]] ||
   fail "T3_UPDATE_DEFRAG_MIN_MIB must be a non-negative integer (got '$defrag_min_mib')"
+defrag_min_mib=$((10#$defrag_min_mib))
 
 app="${T3_UPDATE_APP:-/Applications/T3 Code (Beta).app}"
 new="${T3_UPDATE_BUILD:-$HOME/.t3-fork/build/mac-arm64/T3 Code (Beta).app}"
@@ -137,12 +144,14 @@ plan_pruned_backups() {
 
   if [[ "$mode" == "dry-run" ]]; then
     local already_present=0
-    for name in "${all_names[@]}"; do
-      if [[ "$name" == "$current_base" ]]; then
-        already_present=1
-        break
-      fi
-    done
+    if ((${#all_names[@]} > 0)); then
+      for name in "${all_names[@]}"; do
+        if [[ "$name" == "$current_base" ]]; then
+          already_present=1
+          break
+        fi
+      done
+    fi
     if [[ $already_present -eq 0 ]]; then
       all_names+=("$current_base")
     fi
@@ -186,10 +195,34 @@ prune_old_backups() {
   done < <(plan_pruned_backups real)
 }
 
+canonical_path() {
+  local target="$1"
+  if [[ -d "$target" ]]; then
+    CDPATH='' cd "$target" 2>/dev/null && pwd -P
+    return
+  fi
+  local parent base
+  parent="$(dirname "$target")"
+  base="$(basename "$target")"
+  parent="$(CDPATH='' cd "$parent" 2>/dev/null && pwd -P)" || return 1
+  if [[ "$parent" == "/" ]]; then
+    printf '/%s\n' "$base"
+  else
+    printf '%s/%s\n' "$parent" "$base"
+  fi
+}
+
 safe_build_cleanup_target() {
   [[ -n "$build_cleanup_target" ]] || return 1
-  [[ "$build_cleanup_target" != "/" && "$build_cleanup_target" != "$HOME" && "$build_cleanup_target" != "/Applications" ]] || return 1
   [[ ! -L "$build_cleanup_target" && -e "$build_cleanup_target" ]] || return 1
+  local resolved home_resolved
+  resolved="$(canonical_path "$build_cleanup_target")" || return 1
+  home_resolved="$(canonical_path "$HOME" 2>/dev/null || printf '%s' "$HOME")"
+  case "$resolved" in
+    "" | "/" | "/Applications" | "/Library" | "/System" | "/Users" | "/usr" | "$home_resolved")
+      return 1
+      ;;
+  esac
   return 0
 }
 
@@ -352,7 +385,7 @@ elif [[ $detach -eq 1 ]]; then
   T3_UPDATE_LOG="$log_file" perl -MPOSIX -e '
     fork and exit; POSIX::setsid(); fork and exit;
     open STDIN, "<", "/dev/null"; open STDOUT, ">>", $ENV{T3_UPDATE_LOG}; open STDERR, ">&", \*STDOUT;
-    exec @ARGV' -- "$0" "${detach_args[@]}" || fail "could not start the detached run"
+    exec @ARGV' -- "$0" ${detach_args[@]+"${detach_args[@]}"} || fail "could not start the detached run"
   echo "Started detached. The app quits in about $quit_delay s. Log: $log_file"
   exit 0
 else
@@ -414,9 +447,8 @@ if ! run ditto "$new" "$app"; then
   reopen
   exit 1
 fi
-run env -u ELECTRON_RUN_AS_NODE open "$app" || log "warning: could not open $app; open it by hand"
-
 if [[ $dry_run -eq 1 ]]; then
+  run env -u ELECTRON_RUN_AS_NODE open "$app"
   while IFS= read -r target; do
     [[ -n "$target" ]] && echo "Would prune old update backup: $target"
   done < <(plan_pruned_backups dry-run)
@@ -426,7 +458,11 @@ if [[ $dry_run -eq 1 ]]; then
   echo
   echo "Dry run: nothing changed."
 else
-  prune_old_backups
-  cleanup_staged_build
+  if run env -u ELECTRON_RUN_AS_NODE open "$app"; then
+    prune_old_backups
+    cleanup_staged_build
+  else
+    log "warning: could not open $app; open it by hand (keeping old backups and staged build)"
+  fi
   log "finished; installed version $(plist "$app" CFBundleShortVersionString); old app and database backup are in $backup"
 fi
