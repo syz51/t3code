@@ -118,6 +118,8 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       readonly agentVersion?: string;
       /** Token JSON written to `$GEMINI_HOME/antigravity-acp/antigravity-oauth-token` on launch. */
       readonly writeCliTokenOnLaunch?: string;
+      /** JSON printed to stdout when invoked with `-p /usage ...`. */
+      readonly usageJson?: string;
     } = {},
   ) {
     const directory = path.join(root, name);
@@ -129,6 +131,20 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       executablePath,
       [
         "#!/bin/sh",
+        'if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then',
+        ...(options.usageJson === undefined
+          ? ["  exit 1"]
+          : [
+              ...(options.writeCliTokenOnLaunch === undefined
+                ? []
+                : [
+                    '  mkdir -p "$GEMINI_HOME/antigravity-acp"',
+                    `  printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
+                  ]),
+              `  printf '%s\\n' ${shellQuote(options.usageJson)}`,
+              "  exit 0",
+            ]),
+        "fi",
         ...(options.writeCliTokenOnLaunch === undefined
           ? []
           : [
@@ -1020,6 +1036,137 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           }),
         );
         expect(levelOf(yield* h.instance.snapshot.getSnapshot, "gemini-test-low")).toBe("high");
+        yield* h.assertClosed;
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "reads usage limits via isolated `agy -p /usage --output-format json` and syncs renewed tokens back",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness({
+          environment: [
+            { name: "DISPLAY", value: ":99" },
+            { name: "WAYLAND_DISPLAY", value: "wayland-1" },
+          ],
+        });
+        const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
+        const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
+        yield* h.fs.makeDirectory(acpDir, { recursive: true });
+        const initialToken = JSON.stringify({
+          token: {
+            access_token: "initial-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-usage",
+            expiry: "2020-01-01T00:00:00Z",
+          },
+          id_token_email: "usage-probe@example.com",
+        });
+        const renewedToken = JSON.stringify({
+          token: {
+            access_token: "renewed-usage-access",
+            token_type: "Bearer",
+            refresh_token: "refresh-usage",
+            expiry: "2099-01-01T00:00:00Z",
+          },
+          id_token_email: "usage-probe@example.com",
+        });
+        const usageJson = JSON.stringify({
+          status: "SUCCESS",
+          command: {
+            name: "usage",
+            data: {
+              groups: [
+                {
+                  name: "Gemini Models",
+                  buckets: [
+                    {
+                      id: "gemini-5h",
+                      window: "5h",
+                      remaining_fraction: 0.65,
+                      reset_time: "2026-11-26T18:00:00Z",
+                    },
+                    {
+                      id: "gemini-weekly",
+                      window: "weekly",
+                      remaining_fraction: 0.9,
+                      reset_time: "2026-12-01T00:00:00Z",
+                    },
+                  ],
+                },
+                {
+                  name: "Claude and GPT models",
+                  buckets: [
+                    {
+                      id: "3p-5h",
+                      window: "5h",
+                      remaining_fraction: 1,
+                      reset_time: "1970-01-01T00:00:00Z",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        });
+        h.controls.selected = yield* h.makeExecutable("runtime usage", {
+          usageJson,
+          writeCliTokenOnLaunch: renewedToken,
+        });
+        yield* h.fs.writeFileString(tokenPath, initialToken);
+
+        const refreshed = yield* h.instance.snapshot.refresh;
+        expect(refreshed.usageLimits?.credentialFingerprint).toMatch(/^email:[0-9a-f]{64}$/);
+        expect(refreshed.usageLimits?.windows).toEqual([
+          {
+            id: "3p-5h",
+            kind: "session",
+            label: "Claude & GPT (shared) · 5-hour",
+            usedPercent: 0,
+            windowDurationMins: 300,
+          },
+          {
+            id: "gemini-5h",
+            kind: "session",
+            label: "Gemini · 5-hour",
+            usedPercent: 35,
+            resetsAt: "2026-11-26T18:00:00.000Z",
+            windowDurationMins: 300,
+          },
+          {
+            id: "gemini-weekly",
+            kind: "weekly",
+            label: "Gemini · Weekly",
+            usedPercent: 10,
+            resetsAt: "2026-12-01T00:00:00.000Z",
+            windowDurationMins: 10080,
+          },
+        ]);
+
+        const usageLaunch = h.launches.find(
+          (launch) => launch.args[0] === "-p" && launch.args[1] === "/usage",
+        );
+        expect(usageLaunch).toBeDefined();
+        expect(usageLaunch?.args).toEqual([
+          "-p",
+          "/usage",
+          "--output-format",
+          "json",
+          "--print-timeout",
+          "15s",
+        ]);
+        expect(usageLaunch?.profileDirectory).toContain("usage-profile-");
+        expect(usageLaunch?.profileDirectory).not.toBe(h.profileDirectory);
+        expect(usageLaunch?.forceFileStorage).toBe("1");
+        expect(usageLaunch?.credentialKeys).toEqual([]);
+        expect(usageLaunch?.environment.DISPLAY).toBeUndefined();
+        expect(usageLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
+        expect(usageLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 1 127.0.0.1 22");
+        expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
+        if (usageLaunch?.profileDirectory) {
+          expect(yield* h.fs.exists(usageLaunch.profileDirectory)).toBe(false);
+        }
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
         yield* h.assertClosed;
       }),
   );

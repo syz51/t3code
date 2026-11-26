@@ -130,6 +130,9 @@ describe("new thread model fallback", () => {
     ["cursor", ["autoPercentUsed"], "claude-opus-5-5", false, undefined, undefined],
     ["cursor", ["autoPercentUsed"], "composer-2.5", false, undefined, undefined],
     ["cursor", ["autoPercentUsed", "apiPercentUsed"], "composer-2.5", true, undefined, undefined],
+    ["antigravity", ["3p-weekly"], "gemini-4-neon", false, undefined, undefined],
+    ["antigravity", ["3p-weekly"], "claude-opus-5-5", true, undefined, undefined],
+    ["antigravity", ["gemini-5h"], "gemini-4-neon", true, undefined, undefined],
     ["codex", ["individual"], "gpt-5.5", true, undefined, undefined],
     ["opencode", ["go_weekly"], "opencode/big-pickle", false, undefined, undefined],
     ["opencode", ["go_weekly"], "opencode-go/big-pickle", true, undefined, undefined],
@@ -206,6 +209,34 @@ describe("new thread model fallback", () => {
       ).toEqual(usesFallback ? fallback : defaultSelection);
     },
   );
+  it("resolves Antigravity model aliases before matching quota pools", () => {
+    const antigravity = provider({
+      driver: ProviderDriverKind.make("antigravity"),
+      models: [
+        {
+          slug: "gemini-4-neon",
+          name: "Gemini 4 Neon",
+          isCustom: false,
+          isDefault: true,
+          aliases: ["antigravity-default"],
+          capabilities: null,
+        },
+      ],
+      usageLimits: {
+        checkedAt: limited.checkedAt,
+        windows: [{ ...window, id: "3p-weekly", usedPercent: 100 }],
+      },
+    });
+    expect(exhaustedUsageWindow(antigravity, now, "antigravity-default")).toBeUndefined();
+    const geminiExhausted = {
+      ...antigravity,
+      usageLimits: {
+        checkedAt: limited.checkedAt,
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 100 }],
+      },
+    };
+    expect(exhaustedUsageWindow(geminiExhausted, now, "antigravity-default")?.id).toBe("gemini-5h");
+  });
 });
 
 describe("pace", () => {
@@ -1239,6 +1270,27 @@ describe("pooled account columns", () => {
     expect(visible.map((window) => window.id)).toEqual(ids);
     expect(visible.map((window) => window.remainingPercent)).toEqual(remaining);
     expect(cursorUsageWindowDetails(ids.at(-1)!, pool)?.label).toBe(label);
+  });
+
+  it("orders Antigravity Gemini windows before 3p windows with session before weekly", () => {
+    const accounts = [
+      {
+        ...account("ag", [
+          { ...weekly, id: "3p-weekly", usedPercent: 10 },
+          { ...window, id: "3p-5h", usedPercent: 5 },
+          { ...weekly, id: "gemini-weekly", usedPercent: 25 },
+          { ...window, id: "gemini-5h", usedPercent: 15 },
+        ]),
+        driver: ProviderDriverKind.make("antigravity"),
+      },
+    ];
+    const pool = collectLimitPools(accounts, now)[0]!;
+    expect(displayLimitWindows(pool).map((entry) => entry.id)).toEqual([
+      "gemini-5h",
+      "gemini-weekly",
+      "3p-5h",
+      "3p-weekly",
+    ]);
   });
 
   // regression: #20349 sessions stay visible while the weekly quota is exhausted

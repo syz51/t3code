@@ -67,6 +67,10 @@ import {
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import {
+  attachAntigravityCliUsageLimits,
+  makeAntigravityCliUsageProbe,
+} from "../antigravityCliUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
@@ -605,67 +609,6 @@ export const AntigravityDriver: ProviderDriver<
       return email && email.length > 0 ? email : undefined;
     }).pipe(Effect.orElseSucceed(() => undefined));
 
-    const provider = yield* makeAntigravityProvider(settings, {
-      environment: processEnvironment,
-      stampIdentity: classifyModels,
-      probe,
-      readAccountEmail,
-      auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
-      ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
-      rememberRuntimeModes: (modes) =>
-        writeFileStringAtomically({
-          filePath: runtimeModesPath,
-          contents: encodeRememberedRuntimeModes({ authMethod: auth.authMethod, modes }),
-        }).pipe(
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, path),
-          Effect.catch(() => Effect.logWarning("Could not save Antigravity permission modes.")),
-        ),
-      supportsTextGeneration: Effect.succeed(true),
-    }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderDriverError({
-            driver: DRIVER,
-            instanceId,
-            detail: "Could not prepare the Antigravity provider status.",
-            cause,
-          }),
-      ),
-    );
-    const defaultModel = currentCatalog.pipe(Effect.map((catalog) => catalog?.defaultChatModel));
-    const orchestrationAdapter = yield* makeAntigravityAdapterV2({
-      instanceId,
-      selfInvocation,
-      makeRuntime,
-      withProcess: authFlow.withProcess,
-      defaultModel,
-      supportsNativeGoals: provider.snapshot.getSnapshot.pipe(
-        Effect.map(
-          (snapshot) => snapshot.slashCommands?.some((command) => command.name === "goal") === true,
-        ),
-      ),
-      profileDirectory,
-      onSessionStarted: (started, cwd, session) =>
-        provider
-          .onSessionStarted(started, cwd, session)
-          .pipe(Effect.andThen(authFlow.onSignedInElsewhere)),
-      onSessionEvent: (event, cwd) => {
-        if (event._tag === "ConfigOptionsUpdated") {
-          return provider.onConfigOptionsUpdated(event.configOptions);
-        }
-        return event._tag === "AvailableCommandsUpdated"
-          ? provider.onAvailableCommands(event.availableCommands, cwd)
-          : Effect.void;
-      },
-      continuationRequests,
-      nativeLogging: (threadId) =>
-        makeNativeLogger({
-          nativeEventLogger: loggers.native,
-          provider: DRIVER,
-          threadId,
-        }),
-    });
     const readCliTokenRecord = (filePath: string) =>
       fileSystem.readFileString(filePath).pipe(
         Effect.map((contents) =>
@@ -729,56 +672,168 @@ export const AntigravityDriver: ProviderDriver<
       },
     );
 
-    const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
-      function* (cwd: string) {
-        yield* fileSystem
-          .makeDirectory(directories.isolatedProfiles, { recursive: true, mode: 0o700 })
-          .pipe(
-            Effect.mapError(
-              () =>
-                new ProviderSetupError({
-                  instanceId,
-                  operation: "start",
-                  detail: "Could not create an isolated Antigravity text generation profile.",
-                }),
-            ),
-          );
-        if ((yield* HostProcess.Platform) !== "win32") {
-          yield* fileSystem.chmod(directories.isolatedProfiles, 0o700).pipe(Effect.ignore);
-        }
-        const isolatedProfileDirectory = yield* fileSystem
-          .makeTempDirectoryScoped({
-            directory: directories.isolatedProfiles,
-            prefix: "text-profile-",
-          })
-          .pipe(
-            Effect.mapError(
-              () =>
-                new ProviderSetupError({
-                  instanceId,
-                  operation: "start",
-                  detail: "Could not create an isolated Antigravity text generation profile.",
-                }),
-            ),
-          );
-        const sourceTokenPath = path.join(
-          profileDirectory,
-          "antigravity-acp",
-          "antigravity-oauth-token",
+    const makeIsolatedProfileDirectory = Effect.fn(
+      "AntigravityDriver.makeIsolatedProfileDirectory",
+    )(function* (prefix: string, detail: string) {
+      yield* fileSystem
+        .makeDirectory(directories.isolatedProfiles, { recursive: true, mode: 0o700 })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new ProviderSetupError({
+                instanceId,
+                operation: "start",
+                detail,
+              }),
+          ),
+        );
+      if ((yield* HostProcess.Platform) !== "win32") {
+        yield* fileSystem.chmod(directories.isolatedProfiles, 0o700).pipe(Effect.ignore);
+      }
+      return yield* fileSystem
+        .makeTempDirectoryScoped({
+          directory: directories.isolatedProfiles,
+          prefix,
+        })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new ProviderSetupError({
+                instanceId,
+                operation: "start",
+                detail,
+              }),
+          ),
+        );
+    });
+
+    const baseProvider = yield* makeAntigravityProvider(settings, {
+      environment: processEnvironment,
+      stampIdentity: classifyModels,
+      probe,
+      readAccountEmail,
+      auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+      ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
+      rememberRuntimeModes: (modes) =>
+        writeFileStringAtomically({
+          filePath: runtimeModesPath,
+          contents: encodeRememberedRuntimeModes({ authMethod: auth.authMethod, modes }),
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.catch(() => Effect.logWarning("Could not save Antigravity permission modes.")),
+        ),
+      supportsTextGeneration: Effect.succeed(true),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER,
+            instanceId,
+            detail: "Could not prepare the Antigravity provider status.",
+            cause,
+          }),
+      ),
+    );
+    const cliUsage = yield* makeAntigravityCliUsageProbe({
+      profileDirectory,
+      authMethod: auth.authMethod,
+      readAccountEmail,
+      prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
+        cwd: string,
+      ) {
+        const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
+          "usage-profile-",
+          "Could not create an isolated Antigravity usage profile.",
         );
         const isolatedTokenPath = path.join(
           isolatedProfileDirectory,
           "antigravity-acp",
           "antigravity-oauth-token",
         );
-        const originalSource = yield* readCliTokenRecord(sourceTokenPath);
-        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
-        yield* Effect.addFinalizer(() =>
-          syncRenewedCliToken({
-            sourceTokenPath,
+        const originalSource = yield* readCliTokenRecord(cliTokenPath);
+        const { spawn } = yield* prepareSpawn(cwd, processEnvironment, isolatedProfileDirectory);
+        return {
+          spawn,
+          isolatedProfileDirectory,
+          onAfterExit: syncRenewedCliToken({
+            sourceTokenPath: cliTokenPath,
             isolatedTokenPath,
             originalSource,
           }).pipe(Effect.ignore),
+        };
+      }),
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Effect.provideService(Digest.Digest, digest),
+    );
+    const provider = yield* attachAntigravityCliUsageLimits({
+      provider: baseProvider,
+      usage: cliUsage,
+      enabled,
+      shouldRunBackgroundWork: Effect.all([
+        host.shouldRunBackgroundWork({ type: "provider-status" }),
+        host.shouldRunBackgroundWork({ type: "provider-status", instanceId }),
+      ]).pipe(Effect.map(([generic, specific]) => generic || specific)),
+    });
+    const defaultModel = currentCatalog.pipe(Effect.map((catalog) => catalog?.defaultChatModel));
+    const orchestrationAdapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation,
+      makeRuntime,
+      withProcess: authFlow.withProcess,
+      defaultModel,
+      supportsNativeGoals: provider.snapshot.getSnapshot.pipe(
+        Effect.map(
+          (snapshot) => snapshot.slashCommands?.some((command) => command.name === "goal") === true,
+        ),
+      ),
+      profileDirectory,
+      onSessionStarted: (started, cwd, session) =>
+        provider
+          .onSessionStarted(started, cwd, session)
+          .pipe(Effect.andThen(authFlow.onSignedInElsewhere)),
+      onSessionEvent: (event, cwd) => {
+        if (event._tag === "ConfigOptionsUpdated") {
+          return provider.onConfigOptionsUpdated(event.configOptions);
+        }
+        return event._tag === "AvailableCommandsUpdated"
+          ? provider.onAvailableCommands(event.availableCommands, cwd)
+          : Effect.void;
+      },
+      continuationRequests,
+      nativeLogging: (threadId) =>
+        makeNativeLogger({
+          nativeEventLogger: loggers.native,
+          provider: DRIVER,
+          threadId,
+        }),
+    });
+
+    const makeIsolatedTextRuntime = Effect.fn("AntigravityDriver.makeIsolatedTextRuntime")(
+      function* (cwd: string) {
+        const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
+          "text-profile-",
+          "Could not create an isolated Antigravity text generation profile.",
+        );
+        const isolatedTokenPath = path.join(
+          isolatedProfileDirectory,
+          "antigravity-acp",
+          "antigravity-oauth-token",
+        );
+        const originalSource = yield* readCliTokenRecord(cliTokenPath);
+        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
+        yield* Effect.addFinalizer(() =>
+          syncRenewedCliToken({
+            sourceTokenPath: cliTokenPath,
+            isolatedTokenPath,
+            originalSource,
+          }).pipe(
+            Effect.flatMap((synced) => (synced ? provider.onTokenRefreshed : Effect.void)),
+            Effect.ignore,
+          ),
         );
         return yield* makeRuntime({
           cwd,
