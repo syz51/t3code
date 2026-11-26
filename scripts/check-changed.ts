@@ -50,9 +50,15 @@ export const defaultConcurrency = (cores: number, availableBytes: number) =>
 
 export type Outcome = "pass" | "FAIL" | "TIMEOUT";
 
+export interface StepResult {
+  readonly ok: boolean;
+  readonly output: string;
+  readonly summaryNote?: string;
+}
+
 export interface Step<R> {
   readonly name: string;
-  readonly run: Effect.Effect<{ readonly ok: boolean; readonly output: string }, never, R>;
+  readonly run: Effect.Effect<StepResult, never, R>;
   // Budget slots the step holds: one per worker it runs in parallel.
   readonly weight?: number;
   // Vitest runs started together race to rebuild node_modules/.vitest-cache (ENOTEMPTY).
@@ -86,9 +92,15 @@ export const runSteps = Effect.fn("checkChanged.runSteps")(function* <R>(
             ? `killed after ${options.timeoutSeconds}s`
             : `${seconds.toFixed(1)}s`;
         yield* Console.log(`\n> vp ${step.name}  ${outcome}  ${time}`);
-        const output = Option.getOrUndefined(result)?.output.trimEnd();
+        const value = Option.getOrUndefined(result);
+        const output = value?.output.trimEnd();
         if (output) yield* Console.log(output);
-        return { name: step.name, outcome, time };
+        return {
+          name: step.name,
+          outcome,
+          time,
+          ...(value?.summaryNote ? { summaryNote: value.summaryNote } : {}),
+        };
       });
       const slots = Math.min(step.weight ?? 1, options.concurrency);
       const limited = Effect.acquireUseRelease(
@@ -261,6 +273,163 @@ export const docReaderTests = (files: ReadonlyArray<string>) =>
   files.includes("docs/user/t3-connect-troubleshooting.md")
     ? ["apps/server/src/cloud/ConnectReachability.test.ts"]
     : [];
+
+const ANSI_ESCAPE = /\x1b\[[0-9;]*m/g;
+const stripAnsi = (text: string) => text.replace(ANSI_ESCAPE, "");
+
+const SIGNAL_BY_NUMBER = new Map<number, string>(
+  Object.entries(NodeOS.constants.signals).map(([name, num]) => [num, name]),
+);
+const SIGNAL_ERROR = /Process interrupted due to receipt of signal: '([^']+)'/;
+const FAILED_VITE_TASK =
+  /^\s*\[\d+\]\s+(\S+?):\s+.*\s+✗\s+\((?:exit code:\s*(-?\d+)|signal:\s*([A-Za-z0-9]+))\)\s*$/;
+
+const extractSignal = (error: unknown): string | undefined => {
+  const message = error instanceof Error ? error.message : String(error);
+  const direct = SIGNAL_ERROR.exec(message)?.[1];
+  if (direct) return direct;
+  if (typeof error === "object" && error !== null && "cause" in error) {
+    return extractSignal(error.cause);
+  }
+  return undefined;
+};
+
+const isKilledExit = (exit: {
+  readonly exitCode?: number | undefined;
+  readonly signal?: string | undefined;
+}): boolean =>
+  exit.signal !== undefined ||
+  (exit.exitCode !== undefined && exit.exitCode > 128 && exit.exitCode <= 192);
+
+const formatExitReason = (exit: {
+  readonly exitCode?: number | undefined;
+  readonly signal?: string | undefined;
+}): string => {
+  if (exit.signal !== undefined) {
+    return exit.exitCode !== undefined
+      ? `exit ${exit.exitCode}, ${exit.signal}`
+      : `signal ${exit.signal}`;
+  }
+  if (exit.exitCode !== undefined) {
+    const signal =
+      exit.exitCode > 128 && exit.exitCode <= 192
+        ? SIGNAL_BY_NUMBER.get(exit.exitCode - 128)
+        : undefined;
+    return signal ? `exit ${exit.exitCode}, ${signal}` : `exit ${exit.exitCode}`;
+  }
+  return "failed";
+};
+
+const splitViteRunSummary = (
+  output: string,
+): { readonly body: string; readonly summaryLines: ReadonlyArray<string> } => {
+  const lines = output.split(/\r?\n/);
+  const titleIndex = lines.findIndex((line) =>
+    stripAnsi(line).includes("Vite+ Task Runner • Execution Summary"),
+  );
+  if (titleIndex === -1) return { body: output.trimEnd(), summaryLines: [] };
+  const startIndex =
+    titleIndex > 0 && /^━+$/.test(stripAnsi(lines[titleIndex - 1]!).trim())
+      ? titleIndex - 1
+      : titleIndex;
+  let endIndex = lines.length - 1;
+  for (let i = titleIndex + 2; i < lines.length; i++) {
+    if (/^━+$/.test(stripAnsi(lines[i]!).trim())) {
+      endIndex = i;
+      break;
+    }
+  }
+  const body = [...lines.slice(0, startIndex), ...lines.slice(endIndex + 1)].join("\n").trimEnd();
+  return { body, summaryLines: lines.slice(startIndex, endIndex + 1) };
+};
+
+interface FailedViteTask {
+  readonly task: string;
+  readonly exitCode?: number;
+  readonly signal?: string;
+}
+
+const parseFailedViteTasks = (summaryLines: ReadonlyArray<string>): Array<FailedViteTask> => {
+  const failed: Array<FailedViteTask> = [];
+  for (const line of summaryLines) {
+    const match = FAILED_VITE_TASK.exec(stripAnsi(line));
+    if (!match) continue;
+    const [, task, exitCodeText, signal] = match;
+    failed.push({
+      task: task!,
+      ...(exitCodeText !== undefined ? { exitCode: Number(exitCodeText) } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  }
+  return failed;
+};
+
+export interface TypecheckRunResult {
+  readonly ok: boolean;
+  readonly exitCode?: number;
+  readonly signal?: string;
+  readonly output: string;
+}
+
+export const formatTypecheckResult = (
+  result: TypecheckRunResult,
+  affected: ReadonlyArray<string>,
+  concurrency: number,
+): StepResult => {
+  const { body, summaryLines } = splitViteRunSummary(result.output);
+  if (result.ok) return { ok: true, output: body };
+
+  const failedTasks = parseFailedViteTasks(summaryLines);
+  const rerunHint =
+    concurrency > 1
+      ? `Re-run with fewer workers: CHECK_CHANGED_CONCURRENCY=${Math.max(1, Math.floor(concurrency / 2))} vp run check:changed (or --concurrency ${Math.max(1, Math.floor(concurrency / 2))})`
+      : "Re-run with CHECK_CHANGED_CONCURRENCY=1 (or --concurrency 1) after freeing memory.";
+
+  if (failedTasks.length > 0) {
+    // vp run kills in-flight siblings with exit 137 when another task fails normally;
+    // only report OOM when every failed task died from exit 137 or a signal.
+    const nonSignal = failedTasks.filter((task) => !isKilledExit(task));
+    if (nonSignal.length === 0) {
+      const details = failedTasks.map((task) => `${task.task} (${formatExitReason(task)})`);
+      const message =
+        `Typecheck worker killed (likely out of memory):\n` +
+        details.map((detail) => `  - ${detail}`).join("\n") +
+        `\n${rerunHint}`;
+      return {
+        ok: false,
+        output: body ? `${body}\n${message}` : message,
+        summaryNote:
+          `KILLED: typecheck worker killed (likely out of memory): ${details.join(", ")}. ` +
+          "Lower CHECK_CHANGED_CONCURRENCY or --concurrency.",
+      };
+    }
+    const details = nonSignal.map((task) => `${task.task} (${formatExitReason(task)})`);
+    const message = `Failed typecheck tasks: ${details.join(", ")}`;
+    return {
+      ok: false,
+      output: body ? `${body}\n${message}` : message,
+    };
+  }
+
+  if (isKilledExit(result)) {
+    const target =
+      affected.length > 0 && affected.length <= 5
+        ? affected.join(", ")
+        : `${affected.length} packages`;
+    const reason = formatExitReason(result);
+    const message =
+      `Typecheck worker killed (likely out of memory): ${target} (${reason})\n` + rerunHint;
+    return {
+      ok: false,
+      output: body ? `${body}\n${message}` : message,
+      summaryNote:
+        `KILLED: typecheck (${target}) killed (${reason}, likely out of memory). ` +
+        "Lower CHECK_CHANGED_CONCURRENCY or --concurrency.",
+    };
+  }
+
+  return { ok: false, output: body };
+};
 
 const checkChanged = Effect.fn("checkChanged")(function* (input: {
   readonly ref: Option.Option<string>;
@@ -455,13 +624,30 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
             forceKillAfter: "5 seconds",
           }),
         );
-        const [output, exitCode] = yield* Effect.all(
-          [Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode],
+        const [output, exit] = yield* Effect.all(
+          [
+            Stream.mkString(Stream.decodeText(handle.all)),
+            handle.exitCode.pipe(
+              Effect.map((exitCode) => ({ _tag: "exited" as const, exitCode: Number(exitCode) })),
+              Effect.catch((error) => {
+                const signal = extractSignal(error);
+                return signal
+                  ? Effect.succeed({ _tag: "signaled" as const, signal })
+                  : Effect.fail(error);
+              }),
+            ),
+          ],
           { concurrency: 2 },
         );
-        return { ok: exitCode === 0, output };
+        return exit._tag === "exited"
+          ? { ok: exit.exitCode === 0, exitCode: exit.exitCode, output }
+          : { ok: false, signal: exit.signal, output };
       }),
-    ).pipe(Effect.catch((error) => Effect.succeed({ ok: false, output: error.message })));
+    ).pipe(
+      Effect.catch((error) =>
+        Effect.succeed<TypecheckRunResult>({ ok: false, output: error.message }),
+      ),
+    );
 
   // Resolve without the lockfile in a temp copy to preserve the working tree and lockfile.
   // Copy mobile modules too: they are file: dependencies, not workspace packages.
@@ -529,15 +715,19 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
           {
             // `effect-tsgo tsrs --noEmit` writes nothing another package reads, so dependency order
             // only made dependents wait: --parallel cut a contracts change from 13 s to 9 s.
-            ...command(`typecheck (${affected.length} packages)`, [
+            // `--verbose` prints per-task exit codes inline so killed workers are never silent
+            // and never race with concurrent `vp run` steps over `--last-details`.
+            name: `typecheck (${affected.length} packages)`,
+            run: vp([
               "run",
+              "--verbose",
               "--cache",
               "--parallel",
               "--concurrency-limit",
               String(typecheckWorkers),
               ...filters(affected),
               "typecheck",
-            ]),
+            ]).pipe(Effect.map((result) => formatTypecheckResult(result, affected, concurrency))),
             weight: typecheckWorkers,
           },
         ]
@@ -587,6 +777,7 @@ const checkChanged = Effect.fn("checkChanged")(function* (input: {
   const summary = ["check:changed summary"];
   for (const result of results) {
     summary.push(`  ${result.outcome}  ${result.name}  ${result.time}`);
+    if (result.summaryNote) summary.push(`  ${result.summaryNote}`);
   }
   if (results.some((result) => result.outcome === "TIMEOUT")) {
     summary.push(
