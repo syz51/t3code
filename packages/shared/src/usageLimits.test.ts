@@ -469,6 +469,127 @@ describe("pools", () => {
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(30);
   });
 
+  it("merges instances sharing credentialFingerprint when only one has auth.email", () => {
+    const antigravity = ProviderDriverKind.make("antigravity");
+    const staleWithoutEmail = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravity"),
+      displayName: "Antigravity",
+      auth: { status: "authenticated", type: "oauth-personal" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [
+          { ...window, id: "gemini-5h", usedPercent: 0 },
+          { ...weekly, id: "gemini-weekly", usedPercent: 18 },
+        ],
+      },
+    });
+    const freshWithEmail = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravityTextGen"),
+      displayName: "Antigravity (Titles)",
+      auth: { status: "authenticated", type: "oauth-personal", email: "User@Example.com" },
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "email:shared-hash",
+        windows: [
+          { ...window, id: "gemini-5h", usedPercent: 5 },
+          { ...weekly, id: "gemini-weekly", usedPercent: 20 },
+        ],
+      },
+    });
+
+    for (const providers of [
+      [staleWithoutEmail, freshWithEmail],
+      [freshWithEmail, staleWithoutEmail],
+    ]) {
+      const accounts = collectLimitAccounts(
+        new Map([[EnvironmentId.make("pro"), { ...laptop, serverConfig: { providers } }]]),
+      );
+      expect(accounts).toHaveLength(1);
+      expect(accounts[0]?.email).toBe("User@Example.com");
+      expect(accounts[0]?.limits.checkedAt).toBe("2026-09-03T14:00:00.000Z");
+      const [pool] = collectLimitPools(accounts, now);
+      expect(pool?.accounts).toHaveLength(1);
+      expect(
+        pool?.windows.map((entry) => [entry.id, entry.members.length, entry.remainingPercent]),
+      ).toEqual([
+        ["gemini-5h", 1, 95],
+        ["gemini-weekly", 1, 80],
+      ]);
+
+      const report = collectProviderUsageLimits(staleWithoutEmail.instanceId, providers, [], now);
+      expect(report?.accounts).toHaveLength(1);
+      expect(report?.accounts[0]).toMatchObject({
+        email: "User@Example.com",
+        limits: { checkedAt: "2026-09-03T14:00:00.000Z" },
+      });
+    }
+
+    // Preserve email even when the fingerprint-only report is the fresher reading.
+    const fresherWithoutEmail = {
+      ...staleWithoutEmail,
+      usageLimits: {
+        ...staleWithoutEmail.usageLimits!,
+        checkedAt: "2026-09-03T15:00:00.000Z",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 12 }],
+      },
+    };
+    const reportFresherAnonymous = collectProviderUsageLimits(
+      fresherWithoutEmail.instanceId,
+      [fresherWithoutEmail, freshWithEmail],
+      [],
+      now,
+    );
+    expect(reportFresherAnonymous?.accounts).toHaveLength(1);
+    expect(reportFresherAnonymous?.accounts[0]).toMatchObject({
+      email: "User@Example.com",
+      limits: { checkedAt: "2026-09-03T15:00:00.000Z" },
+    });
+
+    // Do not alias across drivers or when a fingerprint maps to multiple distinct emails.
+    const otherDriver = provider({
+      driver: claude,
+      instanceId: ProviderInstanceId.make("claude"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "five_hour", usedPercent: 10 }],
+      },
+    });
+    expect(
+      collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            { ...laptop, serverConfig: { providers: [freshWithEmail, otherDriver] } },
+          ],
+        ]),
+      ),
+    ).toHaveLength(2);
+
+    const conflictingEmail = provider({
+      ...freshWithEmail,
+      instanceId: ProviderInstanceId.make("antigravity-other"),
+      auth: { status: "authenticated", type: "oauth-personal", email: "other@example.com" },
+    });
+    expect(
+      collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            {
+              ...laptop,
+              serverConfig: { providers: [staleWithoutEmail, freshWithEmail, conflictingEmail] },
+            },
+          ],
+        ]),
+      ),
+    ).toHaveLength(3);
+  });
+
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
     const native = provider({
       driver: claude,
