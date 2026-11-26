@@ -105,6 +105,9 @@ describe("Antigravity process environment", () => {
         HOME: "/home/developer",
         PATH: "/usr/bin",
         CUSTOM_SETTING: "keep-this",
+        SSH_CONNECTION: "10.0.0.1 50000 10.0.0.2 22",
+        SSH_CLIENT: "10.0.0.1 50000 22",
+        SSH_TTY: "/dev/pts/0",
         GEMINI_HOME: profile.geminiHome,
         AGY_CLI_DISABLE_AUTO_UPDATE: "true",
         BROWSER: profile.browserCommand,
@@ -113,10 +116,19 @@ describe("Antigravity process environment", () => {
       },
     });
     expect("ELECTRON_RUN_AS_NODE" in (spawn.env ?? {})).toBe(false);
-    expect("SSH_CONNECTION" in (spawn.env ?? {})).toBe(false);
-    expect("SSH_CLIENT" in (spawn.env ?? {})).toBe(false);
-    expect("SSH_TTY" in (spawn.env ?? {})).toBe(false);
     expect("AGY_ACP_FORCE_FILE_STORAGE" in (spawn.env ?? {})).toBe(false);
+
+    // On macOS, inherited SSH_* variables are stripped so `agy` stays on macOS Keychain.
+    const darwinSpawn = buildAntigravityAcpSpawnInput({
+      installation: { executablePath: "/usr/bin/agy" },
+      profile: { ...profile, platform: "darwin" },
+      cwd: "/project",
+      baseEnv,
+    });
+    expect("SSH_CONNECTION" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("SSH_CLIENT" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("SSH_TTY" in (darwinSpawn.env ?? {})).toBe(false);
+    expect("AGY_ACP_FORCE_FILE_STORAGE" in (darwinSpawn.env ?? {})).toBe(false);
     expect(
       buildAntigravityAcpSpawnInput({
         installation: { executablePath: "/usr/bin/agy" },
@@ -1223,7 +1235,7 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         const helper = preflightHelper(Effect.void);
         const profile = yield* prepareAntigravityProfile({
           profileDirectory: isolatedProfile,
-          isolatedSourceProfileDirectory: sourceProfile,
+          skipUserConfigLinks: true,
           userHome,
           runtimeExecutablePath: "/fake/node",
           platform: "linux",

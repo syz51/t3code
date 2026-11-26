@@ -1114,10 +1114,17 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(usageLaunch?.credentialKeys).toEqual([]);
         expect(usageLaunch?.environment.DISPLAY).toBeUndefined();
         expect(usageLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
-        expect(usageLaunch?.environment.SSH_CONNECTION).toBeUndefined();
+        if (HostProcess.Platform.defaultValue() === "darwin") {
+          expect(usageLaunch?.environment.SSH_CONNECTION).toBeUndefined();
+        }
         expect(usageLaunch?.environment.GEMINI_API_KEY).toBeUndefined();
+        expect(usageLaunch?.environment.BROWSER).toBe("");
         expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
         expect(usageLaunch?.environment.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+        expect(
+          usageLaunch?.tempDirectory?.startsWith(`${h.directories.runtimeTemp}${h.path.sep}`),
+        ).toBe(true);
+        expect(refreshed.usageLimits?.credentialFingerprint).toBe("keyring:oauth-personal");
         yield* h.assertClosed;
       }),
   );

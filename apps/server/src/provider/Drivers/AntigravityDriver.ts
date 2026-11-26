@@ -41,6 +41,7 @@ import {
   antigravityAuthUsesBrowser,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
+  prepareAntigravityCliUsageEnv,
   prepareAntigravityProfile,
   resolveAntigravityInstanceDirectories,
   type AntigravityAuthConfig,
@@ -260,9 +261,7 @@ export const AntigravityDriver: ProviderDriver<
         auth,
         userHome,
         tempDirectory: directories.runtimeTemp,
-        ...(isolatedProfileDirectory === undefined
-          ? {}
-          : { isolatedSourceProfileDirectory: profileDirectory }),
+        ...(isolatedProfileDirectory === undefined ? {} : { skipUserConfigLinks: true }),
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -646,6 +645,7 @@ export const AntigravityDriver: ProviderDriver<
           }),
       ),
     );
+    const hostPlatform = yield* HostProcess.Platform;
     const cliUsage = yield* makeAntigravityCliUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
@@ -653,6 +653,7 @@ export const AntigravityDriver: ProviderDriver<
         Effect.map((snapshot) => snapshot.auth.email),
       ),
       cache: getSharedAntigravityCliUsageCache(installation),
+      platform: hostPlatform,
       prepareSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* () {
         if (authConfigIssue !== null) {
           return yield* new ProviderSetupError({
@@ -674,9 +675,51 @@ export const AntigravityDriver: ProviderDriver<
                 }),
             ),
           );
+        yield* fileSystem
+          .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          );
+        const runtimeTempDirectory = yield* Effect.acquireRelease(
+          fileSystem.makeTempDirectory({ directory: directories.runtimeTemp, prefix: "run-" }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          ),
+          (directory) =>
+            fileSystem
+              .remove(directory, { recursive: true, force: true })
+              .pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("Could not remove an Antigravity runtime temp directory."),
+                ),
+              ),
+        );
+        const env = yield* prepareAntigravityCliUsageEnv({
+          baseEnv: processEnvironment,
+          runtimeTempDirectory,
+          platform: hostPlatform,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
         return {
           command: executable.executablePath,
-          env: processEnvironment,
+          env,
         };
       }),
     }).pipe(

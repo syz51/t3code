@@ -513,7 +513,8 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         const probe = yield* makeAntigravityCliUsageProbe({
           profileDirectory: path.join(root, "profile"),
           authMethod: "oauth-personal",
-          readAccountEmail: Effect.succeed("cli-home@example.com"),
+          readAccountEmail: Effect.undefined,
+          platform: "darwin",
           prepareSpawn: () =>
             Effect.succeed({
               command: scriptPath,
@@ -535,6 +536,7 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
 
         const result = yield* probe.probe();
         expect(result?.windows).toHaveLength(4);
+        expect(result?.credentialFingerprint).toBe("keyring:oauth-personal");
         const dump = yield* fs.readFileString(dumpPath);
         expect(dump).toContain("HOME=/real/user/home\n");
         expect(dump).toContain("GEMINI_HOME=\n");

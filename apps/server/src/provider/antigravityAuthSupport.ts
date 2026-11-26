@@ -75,9 +75,6 @@ const removedEnvironmentKeys = new Set([
   "GEMINI_HOME",
   "AGY_ACP_FORCE_FILE_STORAGE",
   "AGY_CLI_DISABLE_AUTO_UPDATE",
-  "SSH_CONNECTION",
-  "SSH_CLIENT",
-  "SSH_TTY",
   "BROWSER",
   "PYTHONUNBUFFERED",
   // Inherited ELECTRON_RUN_AS_NODE would make Electron apps launched by agent shells exit as Node.
@@ -86,6 +83,10 @@ const removedEnvironmentKeys = new Set([
   // An inherited pipe whose owner exited makes Electron-as-Node print Crashpad errors to stderr.
   "CHROME_CRASHPAD_PIPE_NAME",
 ]);
+
+// On macOS, an inherited SSH_* variable makes `agy` skip macOS Keychain for file-backed storage.
+// On Linux, preserve real SSH_* variables so headless SSH hosts without a keyring still work.
+const darwinSshEnvironmentKeys = new Set(["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]);
 
 export interface AntigravityProfile {
   readonly platform: NodeJS.Platform;
@@ -186,7 +187,7 @@ export interface AntigravityInstanceDirectories {
   readonly profile: string;
   /** Short, dot-free temp root exported as TMPDIR/TEMP/TMP so unpack globs and POSIX SUN_LEN stay healthy. */
   readonly runtimeTemp: string;
-  /** Private dir inside stateDir for OAuth-bearing isolated text-generation profiles (also sweeps legacy runtimeTemp). */
+  /** Private dir inside stateDir for isolated helper profiles such as text generation (also sweeps legacy runtimeTemp). */
   readonly isolatedProfiles: string;
 }
 
@@ -316,8 +317,11 @@ function antigravityEnvironment(
 ) {
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(baseEnv)) {
+    const upper = key.toUpperCase();
     // Windows treats environment keys as case-insensitive. Remove aliases too.
-    if (!removedEnvironmentKeys.has(key.toUpperCase())) environment[key] = value;
+    if (removedEnvironmentKeys.has(upper)) continue;
+    if (profile.platform === "darwin" && darwinSshEnvironmentKeys.has(upper)) continue;
+    environment[key] = value;
   }
   // Put the GCP pair in settings.json because GOOGLE_API_KEY takes precedence in the environment.
   const credential =
@@ -535,6 +539,81 @@ const ensurePrivatePosixDirectory = Effect.fn("ensurePrivatePosixDirectory")(fun
     );
 });
 
+const resolveLinuxCaBundlePath = Effect.fn("resolveLinuxCaBundlePath")(function* (
+  platform: NodeJS.Platform,
+  baseEnv: NodeJS.ProcessEnv,
+) {
+  if (platform !== "linux") return undefined;
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  // Bundled Python may look for certificates at paths absent on this distribution.
+  // Relative paths would resolve differently when the agent runs in the project directory.
+  for (const candidate of [
+    baseEnv.NIX_SSL_CERT_FILE,
+    "/etc/ssl/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+  ]) {
+    if (
+      candidate &&
+      path.isAbsolute(candidate) &&
+      (yield* fs.exists(candidate).pipe(Effect.orElseSucceed(() => false)))
+    ) {
+      return candidate;
+    }
+  }
+  return undefined;
+});
+
+/**
+ * Prepares the environment for non-interactive `agy -p /usage` calls using the CLI's native
+ * authentication (OS keyring on desktop, real SSH env on headless Linux) with T3-owned temp dir
+ * and Linux CA bundle resolution.
+ */
+export const prepareAntigravityCliUsageEnv = Effect.fn("prepareAntigravityCliUsageEnv")(
+  function* (input: {
+    readonly baseEnv: NodeJS.ProcessEnv;
+    readonly runtimeTempDirectory: string;
+    readonly platform?: NodeJS.Platform;
+  }) {
+    const platform = input.platform ?? (yield* HostProcess.Platform);
+    const caBundlePath = yield* resolveLinuxCaBundlePath(platform, input.baseEnv);
+    const environment: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(input.baseEnv)) {
+      const upper = key.toUpperCase();
+      if (
+        removedEnvironmentKeys.has(upper) ||
+        upper === "DISPLAY" ||
+        upper === "WAYLAND_DISPLAY" ||
+        upper === "CLAUDECODE" ||
+        upper === "AGENT_BOARD_HOOKS" ||
+        upper === "TMPDIR" ||
+        upper === "TEMP" ||
+        upper === "TMP"
+      ) {
+        continue;
+      }
+      if (platform === "darwin" && darwinSshEnvironmentKeys.has(upper)) continue;
+      environment[key] = value;
+    }
+    return {
+      ...environment,
+      ...(caBundlePath !== undefined &&
+      input.baseEnv.SSL_CERT_FILE === undefined &&
+      input.baseEnv.SSL_CERT_DIR === undefined
+        ? { SSL_CERT_FILE: caBundlePath }
+        : {}),
+      AGY_CLI_DISABLE_AUTO_UPDATE: "true",
+      AGENT_BOARD_HOOKS: "off",
+      BROWSER: "",
+      ...(platform === "win32"
+        ? { TEMP: input.runtimeTempDirectory, TMP: input.runtimeTempDirectory }
+        : { TMPDIR: input.runtimeTempDirectory }),
+    };
+  },
+);
+
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
   readonly baseEnv?: NodeJS.ProcessEnv;
@@ -544,7 +623,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly userHome?: string;
   readonly tempDirectory?: string;
   /** Skip user config/hooks/MCP links so helper sessions stay isolated while using native OS keyring auth. */
-  readonly isolatedSourceProfileDirectory?: string;
+  readonly skipUserConfigLinks?: boolean;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -618,27 +697,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     );
   }
 
-  let caBundlePath: string | undefined;
-  if (platform === "linux") {
-    // Bundled Python may look for certificates at paths absent on this distribution.
-    // Relative paths would resolve differently when the agent runs in the project directory.
-    for (const candidate of [
-      baseEnv.NIX_SSL_CERT_FILE,
-      "/etc/ssl/certs/ca-bundle.crt",
-      "/etc/ssl/certs/ca-certificates.crt",
-      "/etc/pki/tls/certs/ca-bundle.crt",
-      "/etc/ssl/cert.pem",
-    ]) {
-      if (
-        candidate &&
-        path.isAbsolute(candidate) &&
-        (yield* fs.exists(candidate).pipe(Effect.orElseSucceed(() => false)))
-      ) {
-        caBundlePath = candidate;
-        break;
-      }
-    }
-  }
+  const caBundlePath = yield* resolveLinuxCaBundlePath(platform, baseEnv);
   const profile: AntigravityProfile = {
     platform,
     geminiHome,
@@ -792,7 +851,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         ),
       );
   }
-  if (input.isolatedSourceProfileDirectory !== undefined) {
+  if (input.skipUserConfigLinks === true) {
     // Helper sessions (e.g. thread title generation) rely on `agy`'s native OS keyring directly;
     // never copy or sync plaintext OAuth token files across profile directories.
     return profile;

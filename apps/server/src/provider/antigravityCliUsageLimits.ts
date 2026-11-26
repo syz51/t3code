@@ -12,6 +12,7 @@ import {
   makeUsageLimits,
   resolveUsageLimitsAfterProbe,
 } from "@t3tools/provider-core/server/usageLimits";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -283,12 +284,14 @@ const STRIPPED_CLI_ENV_KEYS = new Set([
   "DISPLAY",
   "WAYLAND_DISPLAY",
   "GEMINI_HOME",
-  "SSH_CONNECTION",
-  "SSH_CLIENT",
-  "SSH_TTY",
   "AGY_ACP_FORCE_FILE_STORAGE",
   "AGY_ACP_CCPA_PROJECT",
   "AGY_ACP_ENABLE_OAUTH",
+  "AGY_CLI_DISABLE_AUTO_UPDATE",
+  "AGENT_BOARD_HOOKS",
+  "BROWSER",
+  "T3_ANTIGRAVITY_AUTH_URL",
+  "CHROME_CRASHPAD_PIPE_NAME",
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
@@ -300,10 +303,9 @@ const STRIPPED_CLI_ENV_KEYS = new Set([
   "CLOUDSDK_CORE_PROJECT",
   "CLAUDECODE",
   "ELECTRON_RUN_AS_NODE",
-  "TMPDIR",
-  "TEMP",
-  "TMP",
 ]);
+
+const DARWIN_SSH_ENV_KEYS = new Set(["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]);
 
 export interface AntigravityCliUsageProbe {
   readonly probe: (options?: {
@@ -330,16 +332,24 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
     cwd: string,
   ) => Effect.Effect<Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">, E, Scope.Scope>;
   readonly cache?: AntigravityCliUsageCache;
+  readonly platform?: NodeJS.Platform;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const digest = yield* Digest.Digest;
+  const platform = input.platform ?? HostProcess.Platform.defaultValue();
   const cache = input.cache ?? makeAntigravityCliUsageCache();
   const ownedKeys = new Set<string>();
 
   const accountKeyAndFingerprint = Effect.gen(function* () {
     const email = yield* input.readAccountEmail;
     if (!email) {
+      if (input.authMethod === "oauth-personal") {
+        return {
+          key: "oauth-personal:native-keyring",
+          credentialFingerprint: "keyring:oauth-personal",
+        } as const;
+      }
       return {
         key: `${input.authMethod}:profile:${input.profileDirectory}`,
         credentialFingerprint: undefined,
@@ -357,9 +367,6 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       Effect.gen(function* () {
         const checkedAt = DateTime.formatIso(yield* DateTime.now);
         const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
-        const usageTempDir = yield* fs.makeTempDirectoryScoped({
-          prefix: "t3-antigravity-usage-tmp-",
-        });
         const prepared = yield* input.prepareSpawn(cwd).pipe(Effect.option);
         if (Option.isNone(prepared)) {
           return makeUnavailableUsageLimits({
@@ -372,9 +379,10 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
 
         const headlessEnv: Record<string, string | undefined> = {};
         for (const [key, value] of Object.entries(spawn.env ?? {})) {
-          if (!STRIPPED_CLI_ENV_KEYS.has(key.toUpperCase())) {
-            headlessEnv[key] = value;
-          }
+          const upper = key.toUpperCase();
+          if (STRIPPED_CLI_ENV_KEYS.has(upper)) continue;
+          if (platform === "darwin" && DARWIN_SSH_ENV_KEYS.has(upper)) continue;
+          headlessEnv[key] = value;
         }
         const child = yield* spawner.spawn(
           ChildProcess.make(
@@ -391,11 +399,9 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               cwd,
               env: {
                 ...headlessEnv,
-                ...(usageTempDir.includes("\\")
-                  ? { TEMP: usageTempDir, TMP: usageTempDir }
-                  : { TMPDIR: usageTempDir }),
                 AGY_CLI_DISABLE_AUTO_UPDATE: "true",
                 AGENT_BOARD_HOOKS: "off",
+                BROWSER: "",
               },
               extendEnv: false,
               shell: false,
@@ -603,7 +609,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
     readonly usage: AntigravityCliUsageProbe;
     readonly enabled: boolean;
     readonly shouldRunBackgroundWork: Effect.Effect<boolean>;
-  }): Effect.fn.Return<P & { readonly onTokenRefreshed: Effect.Effect<void> }, never, Scope.Scope> {
+  }): Effect.fn.Return<P, never, Scope.Scope> {
     const overlayRef = yield* Ref.make<ServerProviderUsageLimits | undefined>(undefined);
     const lastPublishedRef = yield* Ref.make<ServerProvider | undefined>(undefined);
     const changesPubSub = yield* Effect.acquireRelease(
@@ -665,6 +671,15 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       if (
         latestBase.auth.status === "unauthenticated" &&
         probed.unavailable?.reason !== "unsupported"
+      ) {
+        return;
+      }
+      // On a background startup probe for an instance whose auth state is still unknown, do not
+      // surface a noisy "saved sign-in needs to be renewed" error if the user is not signed in.
+      if (
+        !force &&
+        latestBase.auth.status === "unknown" &&
+        probed.unavailable?.reason === "probeFailed"
       ) {
         return;
       }
@@ -815,15 +830,6 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       }
     });
 
-    const onTokenRefreshed = Effect.gen(function* () {
-      if (!input.enabled) return;
-      yield* input.usage.clearBackoff;
-      const current = yield* Ref.get(overlayRef);
-      if (yield* isStale(current)) {
-        yield* triggerBackgroundProbe();
-      }
-    });
-
     const snapshotForCwd = Effect.fn("AntigravityCliUsageLimits.snapshotForCwd")(function* (
       cwd: string,
       skills?: ServerProvider["skills"],
@@ -850,7 +856,6 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       onSignedOut: resetOverlay.pipe(Effect.andThen(input.provider.onSignedOut)),
       onAuthRequired: resetOverlay.pipe(Effect.andThen(input.provider.onAuthRequired)),
       snapshotForCwd,
-      onTokenRefreshed,
     };
   },
 );
