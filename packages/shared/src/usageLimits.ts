@@ -251,11 +251,18 @@ const nativeReport = (provider: ServerProvider): AccountReport => ({
 function accountKeyResolver(reports: Iterable<AccountReport>) {
   const reportList = Array.isArray(reports) ? reports : [...reports];
   const emailsByCredential = new Map<string, Set<string>>();
+  const credentialWorkspaces = new Map<string, Set<string>>();
   for (const report of reportList) {
     const emailKey = emailAccountKey(report.driver, report.email);
     const credKey = credentialAccountKey(report.driver, report.usageLimits);
-    if (emailKey && credKey) {
+    if (credKey && emailKey) {
       emailsByCredential.set(credKey, (emailsByCredential.get(credKey) ?? new Set()).add(emailKey));
+    }
+    if (credKey && report.workspaceId) {
+      credentialWorkspaces.set(
+        credKey,
+        (credentialWorkspaces.get(credKey) ?? new Set()).add(report.workspaceId),
+      );
     }
   }
   const baseKey = (report: AccountReport): string | null => {
@@ -279,7 +286,12 @@ function accountKeyResolver(reports: Iterable<AccountReport>) {
     if (report.workspaceId) return `${key}:${report.workspaceId}`;
     const known = workspaces.get(key);
     if (!known) return key;
-    return known.size === 1 ? `${key}:${[...known][0]}` : null;
+    if (known.size === 1) return `${key}:${[...known][0]}`;
+    const credKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (!credKey) return null;
+    const credKnown = credentialWorkspaces.get(credKey);
+    if (!credKnown) return credKey;
+    return credKnown.size === 1 ? `${key}:${[...credKnown][0]}` : null;
   };
 }
 
@@ -368,7 +380,11 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
   const planSources = new Map<string, LimitAccount>();
+  const nativeDisplayNames = new Map<string, string>();
   const merge = (key: string, next: LimitAccount) => {
+    if (next.environments.length > 0 && next.displayName && !nativeDisplayNames.has(key)) {
+      nativeDisplayNames.set(key, next.displayName);
+    }
     // Prefer hub redemption to clear its routing cooldown too; displayed balance still follows the freshest read.
     const previousHub = hubRedeems.get(key);
     if (
@@ -409,19 +425,21 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     ];
     const winner = fresher ? next : previous;
     const creditSource = creditSources.get(key);
+    const email = previous.email ?? next.email;
     // A hub e-mail names the account better than the driver's default instance name.
     const hubEmail = [previous, next].some(
       (account) => account.environments.length === 0 && account.email,
     );
-    const displayName = previous.displayName ?? next.displayName;
+    const rawDisplayName =
+      nativeDisplayNames.get(key) ?? (email ? null : (previous.displayName ?? next.displayName));
     accounts.set(key, {
       ...previous,
       displayName:
         hubEmail &&
-        displayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
+        rawDisplayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
           ? null
-          : displayName,
-      email: previous.email ?? next.email,
+          : rawDisplayName,
+      email,
       plan: planSources.get(key)?.plan ?? previous.plan ?? next.plan,
       accentColor: previous.accentColor ?? next.accentColor,
       environments,
@@ -1089,15 +1107,17 @@ export function collectProviderUsageLimits(
     email,
   } of native) {
     const key = resolveKey(nativeReport(provider));
+    const hubMatches =
+      key === null
+        ? []
+        : shownHubs
+            .flatMap((source) => source.accounts.map((account) => ({ source, account })))
+            .filter(({ account }) => resolveKey(account) === key);
+    const resolvedEmail = email ?? hubMatches.find(({ account }) => account.email)?.account.email;
     // Only a hub this instance reaches may redeem a credit for its thread.
-    const hubCredits = shownHubs
-      .flatMap((source) => source.accounts.map((account) => ({ source, account })))
+    const hubCredits = hubMatches
       .filter(
-        ({ account }) =>
-          key !== null &&
-          resolveKey(account) === key &&
-          account.usageLimits.resetCredits &&
-          !limitsNotice(account.usageLimits),
+        ({ account }) => account.usageLimits.resetCredits && !limitsNotice(account.usageLimits),
       )
       .sort(
         (a, b) =>
@@ -1128,7 +1148,7 @@ export function collectProviderUsageLimits(
           : { instanceId: credits?.provider.instanceId ?? provider.instanceId },
       ...(provider.displayName ? { displayName: provider.displayName } : {}),
       ...(provider.accentColor ? { accentColor: provider.accentColor } : {}),
-      ...(email ? { email } : {}),
+      ...(resolvedEmail ? { email: resolvedEmail } : {}),
       limits: shownCredits ? { ...limits, resetCredits: shownCredits } : limits,
     });
   }

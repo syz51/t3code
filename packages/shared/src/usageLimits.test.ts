@@ -588,6 +588,105 @@ describe("pools", () => {
         ]),
       ),
     ).toHaveLength(3);
+
+    // Multi-workspace email: a fingerprint tied to one workspace joins that workspace across
+    // environments, and a fingerprint with no workspace keeps deduplicating its own reports.
+    const ws1 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-ws1"),
+      auth: { status: "authenticated", email: "user@example.com", workspaceId: "ws-1" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "fp-ws1",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 10 }],
+      },
+    });
+    const ws2 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-ws2"),
+      auth: { status: "authenticated", email: "user@example.com", workspaceId: "ws-2" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "fp-ws2",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 20 }],
+      },
+    });
+    const anonWs1 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-anon"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "fp-ws1",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 30 }],
+      },
+    });
+    const multiWsAccounts = collectLimitAccounts(
+      new Map([
+        [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [ws1, ws2] } }],
+        [
+          EnvironmentId.make("env-b"),
+          { entry: { target: { label: "Desktop" } }, serverConfig: { providers: [anonWs1] } },
+        ],
+      ]),
+    );
+    expect(multiWsAccounts).toHaveLength(2);
+    expect(
+      multiWsAccounts.find((account) => account.key === "env-a:ag-ws1")?.limits.windows[0]
+        ?.usedPercent,
+    ).toBe(30);
+
+    // Hub accounts merged via credentialFingerprint keep email without leaking fallback filenames.
+    const hubWithEmail = {
+      id: "antigravity-user.json",
+      driver: antigravity,
+      email: "user@example.com",
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 15 }],
+      },
+    };
+    const hubWithoutEmail = {
+      id: "antigravity-fallback.json",
+      driver: antigravity,
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 5 }],
+      },
+    };
+    for (const hubPair of [
+      [hubWithoutEmail, hubWithEmail],
+      [hubWithEmail, hubWithoutEmail],
+    ]) {
+      const mergedHub = collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            {
+              ...laptop,
+              serverConfig: {
+                providers: [],
+                usageLimitSources: [{ ...source, accounts: hubPair }],
+              },
+            },
+          ],
+        ]),
+      );
+      expect(mergedHub).toHaveLength(1);
+      expect(mergedHub[0]).toMatchObject({ displayName: null, email: "user@example.com" });
+    }
+
+    // Native fingerprint-only report deduplicated with an email-bearing hub account inherits email.
+    const nativePlusHub = collectProviderUsageLimits(
+      staleWithoutEmail.instanceId,
+      [staleWithoutEmail],
+      [{ ...source, accounts: [hubWithEmail] }],
+      now,
+    );
+    expect(nativePlusHub?.accounts).toHaveLength(1);
+    expect(nativePlusHub?.accounts[0]).toMatchObject({ email: "user@example.com" });
   });
 
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
