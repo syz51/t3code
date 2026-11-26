@@ -217,16 +217,20 @@ export function collectExternalUsageLinks(
   return [...links.values()];
 }
 
-function accountKey(
+function emailAccountKey(
   driver: ServerProvider["driver"],
   email: string | undefined,
-  limits?: ServerProviderUsageLimits,
 ): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
-  if (normalizedEmail) return `${driver}:${normalizedEmail}`;
-  return limits?.credentialFingerprint
-    ? `${driver}:credential:${limits.credentialFingerprint}`
-    : null;
+  return normalizedEmail ? `${driver}:${normalizedEmail}` : null;
+}
+
+function credentialAccountKey(
+  driver: ServerProvider["driver"],
+  limits?: ServerProviderUsageLimits,
+): string | null {
+  const fingerprint = limits?.credentialFingerprint?.trim();
+  return fingerprint ? `${driver}:credential:${fingerprint}` : null;
 }
 
 interface AccountReport {
@@ -245,20 +249,49 @@ const nativeReport = (provider: ServerProvider): AccountReport => ({
 
 // Include every enabled login, even unreadable workspaces.
 function accountKeyResolver(reports: Iterable<AccountReport>) {
+  const reportList = Array.isArray(reports) ? reports : [...reports];
+  const emailsByCredential = new Map<string, Set<string>>();
+  const credentialWorkspaces = new Map<string, Set<string>>();
+  for (const report of reportList) {
+    const emailKey = emailAccountKey(report.driver, report.email);
+    const credKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (credKey && emailKey) {
+      emailsByCredential.set(credKey, (emailsByCredential.get(credKey) ?? new Set()).add(emailKey));
+    }
+    if (credKey && report.workspaceId) {
+      credentialWorkspaces.set(
+        credKey,
+        (credentialWorkspaces.get(credKey) ?? new Set()).add(report.workspaceId),
+      );
+    }
+  }
+  const baseKey = (report: AccountReport): string | null => {
+    const emailKey = emailAccountKey(report.driver, report.email);
+    if (emailKey) return emailKey;
+    const credKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (!credKey) return null;
+    const aliases = emailsByCredential.get(credKey);
+    return aliases?.size === 1 ? [...aliases][0]! : credKey;
+  };
   const workspaces = new Map<string, Set<string>>();
-  for (const report of reports) {
-    const key = accountKey(report.driver, report.email, report.usageLimits);
+  for (const report of reportList) {
+    const key = baseKey(report);
     if (key && report.workspaceId) {
       workspaces.set(key, (workspaces.get(key) ?? new Set()).add(report.workspaceId));
     }
   }
   return (report: AccountReport): string | null => {
-    const key = accountKey(report.driver, report.email, report.usageLimits);
+    const key = baseKey(report);
     if (!key) return null;
     if (report.workspaceId) return `${key}:${report.workspaceId}`;
     const known = workspaces.get(key);
     if (!known) return key;
-    return known.size === 1 ? `${key}:${[...known][0]}` : null;
+    if (known.size === 1) return `${key}:${[...known][0]}`;
+    const credKey = credentialAccountKey(report.driver, report.usageLimits);
+    if (!credKey) return null;
+    const credKnown = credentialWorkspaces.get(credKey);
+    if (!credKnown) return credKey;
+    return credKnown.size === 1 ? `${key}:${[...credKnown][0]}` : null;
   };
 }
 
@@ -347,7 +380,11 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
   const planSources = new Map<string, LimitAccount>();
+  const nativeDisplayNames = new Map<string, string>();
   const merge = (key: string, next: LimitAccount) => {
+    if (next.environments.length > 0 && next.displayName && !nativeDisplayNames.has(key)) {
+      nativeDisplayNames.set(key, next.displayName);
+    }
     // Prefer hub redemption to clear its routing cooldown too; displayed balance still follows the freshest read.
     const previousHub = hubRedeems.get(key);
     if (
@@ -388,18 +425,21 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     ];
     const winner = fresher ? next : previous;
     const creditSource = creditSources.get(key);
+    const email = previous.email ?? next.email;
     // A hub e-mail names the account better than the driver's default instance name.
     const hubEmail = [previous, next].some(
       (account) => account.environments.length === 0 && account.email,
     );
-    const displayName = previous.displayName ?? next.displayName;
+    const rawDisplayName =
+      nativeDisplayNames.get(key) ?? (email ? null : (previous.displayName ?? next.displayName));
     accounts.set(key, {
       ...previous,
       displayName:
         hubEmail &&
-        displayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
+        rawDisplayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
           ? null
-          : displayName,
+          : rawDisplayName,
+      email,
       plan: planSources.get(key)?.plan ?? previous.plan ?? next.plan,
       accentColor: previous.accentColor ?? next.accentColor,
       environments,
@@ -1022,7 +1062,7 @@ export function collectProviderUsageLimits(
   type NativeSnapshot = { provider: ServerProvider; limits: ServerProviderUsageLimits };
   const nativeByAccount = new Map<
     string,
-    { usage: NativeSnapshot; credits: NativeSnapshot | null }
+    { usage: NativeSnapshot; credits: NativeSnapshot | null; email: string | undefined }
   >();
   for (const provider of providersWithLimits(providers)) {
     if (!drivers.has(provider.driver) || !provider.usageLimits) continue;
@@ -1045,9 +1085,11 @@ export function collectProviderUsageLimits(
         Date.parse(snapshot.limits.checkedAt) > Date.parse(previousCredit.limits.checkedAt))
         ? snapshot
         : (previousCredit ?? null);
+    const usage = providerWins ? snapshot : previous.usage;
     nativeByAccount.set(key, {
-      usage: providerWins ? snapshot : previous.usage,
+      usage,
       credits,
+      email: usage.provider.auth.email ?? previous?.email ?? snapshot.provider.auth.email,
     });
   }
   const native = [...nativeByAccount.values()];
@@ -1062,17 +1104,20 @@ export function collectProviderUsageLimits(
   for (const {
     usage: { provider, limits },
     credits,
+    email,
   } of native) {
     const key = resolveKey(nativeReport(provider));
+    const hubMatches =
+      key === null
+        ? []
+        : shownHubs
+            .flatMap((source) => source.accounts.map((account) => ({ source, account })))
+            .filter(({ account }) => resolveKey(account) === key);
+    const resolvedEmail = email ?? hubMatches.find(({ account }) => account.email)?.account.email;
     // Only a hub this instance reaches may redeem a credit for its thread.
-    const hubCredits = shownHubs
-      .flatMap((source) => source.accounts.map((account) => ({ source, account })))
+    const hubCredits = hubMatches
       .filter(
-        ({ account }) =>
-          key !== null &&
-          resolveKey(account) === key &&
-          account.usageLimits.resetCredits &&
-          !limitsNotice(account.usageLimits),
+        ({ account }) => account.usageLimits.resetCredits && !limitsNotice(account.usageLimits),
       )
       .sort(
         (a, b) =>
@@ -1103,7 +1148,7 @@ export function collectProviderUsageLimits(
           : { instanceId: credits?.provider.instanceId ?? provider.instanceId },
       ...(provider.displayName ? { displayName: provider.displayName } : {}),
       ...(provider.accentColor ? { accentColor: provider.accentColor } : {}),
-      ...(provider.auth.email ? { email: provider.auth.email } : {}),
+      ...(resolvedEmail ? { email: resolvedEmail } : {}),
       limits: shownCredits ? { ...limits, resetCredits: shownCredits } : limits,
     });
   }
