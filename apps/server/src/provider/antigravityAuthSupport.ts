@@ -75,6 +75,9 @@ const removedEnvironmentKeys = new Set([
   "GEMINI_HOME",
   "AGY_ACP_FORCE_FILE_STORAGE",
   "AGY_CLI_DISABLE_AUTO_UPDATE",
+  "SSH_CONNECTION",
+  "SSH_CLIENT",
+  "SSH_TTY",
   "BROWSER",
   "PYTHONUNBUFFERED",
   // Inherited ELECTRON_RUN_AS_NODE would make Electron apps launched by agent shells exit as Node.
@@ -333,13 +336,10 @@ function antigravityEnvironment(
     baseEnv.SSL_CERT_DIR === undefined
       ? { SSL_CERT_FILE: profile.caBundlePath }
       : {}),
-    // The 1.5 CLI ignores AGY_ACP_FORCE_FILE_STORAGE and keeps Google sign-ins in one OS keyring
-    // entry for every profile, unless it believes it runs over SSH. Sign-in then uses `--login`.
-    ...(auth.authMethod === "oauth-personal"
-      ? { SSH_CONNECTION: baseEnv.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0" }
-      : {}),
+    // Fork: let the official `agy` CLI use its native OS keyring authentication without spoofing
+    // SSH_CONNECTION or forcing file-backed OAuth token storage, while keeping GEMINI_HOME isolated
+    // per profile for sessions, brain artifacts, hooks, MCP config, and skills.
     GEMINI_HOME: profile.geminiHome,
-    AGY_ACP_FORCE_FILE_STORAGE: "1",
     // agy's troubleshooting docs specify "true"; the interactive CLI keeps self-updating with "1".
     AGY_CLI_DISABLE_AUTO_UPDATE: "true",
     BROWSER: profile.browserCommand,
@@ -535,12 +535,6 @@ const ensurePrivatePosixDirectory = Effect.fn("ensurePrivatePosixDirectory")(fun
     );
 });
 
-const antigravityIsolatedAuthFiles = [
-  "antigravity-oauth-token",
-  "acp_token.json",
-  "installation_id",
-] as const;
-
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
   readonly baseEnv?: NodeJS.ProcessEnv;
@@ -549,7 +543,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly auth?: AntigravityAuthConfig;
   readonly userHome?: string;
   readonly tempDirectory?: string;
-  /** Copy only credentials from this profile and skip user config/hooks/MCP links. */
+  /** Skip user config/hooks/MCP links so helper sessions stay isolated while using native OS keyring auth. */
   readonly isolatedSourceProfileDirectory?: string;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
@@ -799,31 +793,8 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
       );
   }
   if (input.isolatedSourceProfileDirectory !== undefined) {
-    const sourceAcpDirectory = path.join(
-      path.resolve(input.isolatedSourceProfileDirectory),
-      "antigravity-acp",
-    );
-    for (const fileName of antigravityIsolatedAuthFiles) {
-      const sourcePath = path.join(sourceAcpDirectory, fileName);
-      const data = yield* fs.readFile(sourcePath).pipe(
-        Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
-        Effect.mapError(() =>
-          authSupportError("The Antigravity helper profile credentials could not be read."),
-        ),
-      );
-      if (data === undefined) continue;
-      const targetPath = path.join(acpDirectory, fileName);
-      yield* fs
-        .writeFile(targetPath, data)
-        .pipe(
-          Effect.mapError(() =>
-            authSupportError("The Antigravity helper profile credentials could not be copied."),
-          ),
-        );
-      if (platform !== "win32") {
-        yield* fs.chmod(targetPath, 0o600).pipe(Effect.ignore);
-      }
-    }
+    // Helper sessions (e.g. thread title generation) rely on `agy`'s native OS keyring directly;
+    // never copy or sync plaintext OAuth token files across profile directories.
     return profile;
   }
   yield* linkAntigravityUserConfig({ profileDirectory: geminiHome, userHome, platform });

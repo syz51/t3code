@@ -22,7 +22,6 @@ import * as FiberHandle from "effect/FiberHandle";
 import * as FileSystem from "effect/FileSystem";
 import * as Hex from "effect/encoding/Hex";
 import * as Option from "effect/Option";
-import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -280,31 +279,30 @@ export function getSharedAntigravityCliUsageCache(runtimeHandle: object): Antigr
   return created;
 }
 
-export function resolveAntigravityCliUsageTokenPath(
-  path: Path.Path,
-  isolatedHomeDirectory: string,
-): string {
-  return path.join(isolatedHomeDirectory, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-}
-
-const CLI_HOME_FILES = [
-  "antigravity-oauth-token",
-  "acp_token.json",
-  "installation_id",
-  "settings.json",
-] as const;
-
 const STRIPPED_CLI_ENV_KEYS = new Set([
   "DISPLAY",
   "WAYLAND_DISPLAY",
-  "HOME",
-  "USERPROFILE",
-  "HOMEDRIVE",
-  "HOMEPATH",
-  "XDG_CONFIG_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_DATA_HOME",
   "GEMINI_HOME",
+  "SSH_CONNECTION",
+  "SSH_CLIENT",
+  "SSH_TTY",
+  "AGY_ACP_FORCE_FILE_STORAGE",
+  "AGY_ACP_CCPA_PROJECT",
+  "AGY_ACP_ENABLE_OAUTH",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_QUOTA_PROJECT",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GCLOUD_PROJECT",
+  "CLOUDSDK_CORE_PROJECT",
+  "CLAUDECODE",
+  "ELECTRON_RUN_AS_NODE",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
 ]);
 
 export interface AntigravityCliUsageProbe {
@@ -328,30 +326,16 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly readAccountEmail: Effect.Effect<string | undefined>;
-  readonly prepareIsolatedSpawn: (cwd: string) => Effect.Effect<
-    {
-      readonly spawn: Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">;
-      readonly isolatedProfileDirectory: string;
-      readonly isolatedHomeDirectory?: string | undefined;
-      readonly onAfterExit?: Effect.Effect<void> | undefined;
-    },
-    E,
-    Scope.Scope
-  >;
+  readonly prepareSpawn: (
+    cwd: string,
+  ) => Effect.Effect<Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">, E, Scope.Scope>;
   readonly cache?: AntigravityCliUsageCache;
 }) {
   const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const digest = yield* Digest.Digest;
   const cache = input.cache ?? makeAntigravityCliUsageCache();
   const ownedKeys = new Set<string>();
-  const cliTokenPath = path.join(
-    input.profileDirectory,
-    "antigravity-acp",
-    "antigravity-oauth-token",
-  );
-  const legacyTokenPath = path.join(input.profileDirectory, "antigravity-acp", "acp_token.json");
 
   const accountKeyAndFingerprint = Effect.gen(function* () {
     const email = yield* input.readAccountEmail;
@@ -368,53 +352,15 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
     return { key: `${input.authMethod}:${credentialFingerprint}`, credentialFingerprint } as const;
   });
 
-  const hasSavedToken = Effect.gen(function* () {
-    if (yield* fs.exists(cliTokenPath).pipe(Effect.orElseSucceed(() => false))) return true;
-    return yield* fs.exists(legacyTokenPath).pipe(Effect.orElseSucceed(() => false));
-  });
-
-  const seedIsolatedCliHome = Effect.fnUntraced(function* (
-    isolatedHome: string,
-    isolatedProfileDirectory: string,
-  ) {
-    // `antigravity -p /usage` runs in CLI mode, which ignores GEMINI_HOME and --app-data-dir and
-    // always resolves its app data dir at <os.UserHomeDir()>/.gemini/antigravity-cli.
-    const geminiDir = path.join(isolatedHome, ".gemini");
-    const cliDir = path.join(geminiDir, "antigravity-cli");
-    const posix = path.sep !== "\\";
-    yield* fs.makeDirectory(cliDir, { recursive: true, mode: 0o700 });
-    if (posix) {
-      yield* fs.chmod(geminiDir, 0o700).pipe(Effect.ignore);
-      yield* fs.chmod(cliDir, 0o700).pipe(Effect.ignore);
-    }
-    const sourceDirs = [
-      path.join(isolatedProfileDirectory, "antigravity-acp"),
-      path.join(input.profileDirectory, "antigravity-acp"),
-    ];
-    for (const fileName of CLI_HOME_FILES) {
-      let data: Uint8Array | undefined;
-      for (const sourceDir of sourceDirs) {
-        data = yield* fs
-          .readFile(path.join(sourceDir, fileName))
-          .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined));
-        if (data !== undefined) break;
-      }
-      if (data === undefined) continue;
-      const targetPath = path.join(cliDir, fileName);
-      yield* fs.writeFile(targetPath, data);
-      if (posix) {
-        yield* fs.chmod(targetPath, 0o600).pipe(Effect.ignore);
-      }
-    }
-    return geminiDir;
-  });
-
   const runCliOnce = (credentialFingerprint: string | undefined) =>
     Effect.scoped(
       Effect.gen(function* () {
         const checkedAt = DateTime.formatIso(yield* DateTime.now);
         const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
-        const prepared = yield* input.prepareIsolatedSpawn(cwd).pipe(Effect.option);
+        const usageTempDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-usage-tmp-",
+        });
+        const prepared = yield* input.prepareSpawn(cwd).pipe(Effect.option);
         if (Option.isNone(prepared)) {
           return makeUnavailableUsageLimits({
             checkedAt,
@@ -422,18 +368,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
             message: "Could not start the Antigravity CLI to read usage limits.",
           });
         }
-        const { spawn, isolatedProfileDirectory, isolatedHomeDirectory, onAfterExit } =
-          prepared.value;
-        // LIFO finalizer runs after the child process exits and before the isolated profile is deleted.
-        if (onAfterExit) {
-          yield* Effect.addFinalizer(() => onAfterExit.pipe(Effect.ignore));
-        }
-
-        const isolatedHome = isolatedHomeDirectory ?? isolatedProfileDirectory;
-        const isolatedGeminiDir = yield* seedIsolatedCliHome(
-          isolatedHome,
-          isolatedProfileDirectory,
-        );
+        const spawn = prepared.value;
 
         const headlessEnv: Record<string, string | undefined> = {};
         for (const [key, value] of Object.entries(spawn.env ?? {})) {
@@ -456,13 +391,11 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               cwd,
               env: {
                 ...headlessEnv,
-                HOME: isolatedHome,
-                ...(path.sep === "\\" ? { USERPROFILE: isolatedHome } : {}),
-                GEMINI_HOME: isolatedGeminiDir,
-                AGY_ACP_FORCE_FILE_STORAGE: "1",
+                ...(usageTempDir.includes("\\")
+                  ? { TEMP: usageTempDir, TMP: usageTempDir }
+                  : { TMPDIR: usageTempDir }),
                 AGY_CLI_DISABLE_AUTO_UPDATE: "true",
                 AGENT_BOARD_HOOKS: "off",
-                SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 22",
               },
               extendEnv: false,
               shell: false,
@@ -567,7 +500,6 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
           reason: "unsupported",
         });
       }
-      if (!(yield* hasSavedToken)) return undefined;
 
       const { key, credentialFingerprint } = yield* accountKeyAndFingerprint;
       ownedKeys.add(key);
