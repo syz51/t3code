@@ -389,6 +389,10 @@ describe("readAntigravityUsage", () => {
             "gemini-pro-orchestrator-argon",
             "gemini-4-neon-xhigh",
             "gemini-4-hydrogen-xhigh",
+            "gemini-pro-orchestrator",
+            "gemini-3.8-flash-n",
+            "gemini-4-argon-r",
+            "gemini-4-argon-trial",
           ].entries()) {
             yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
               idx,
@@ -404,8 +408,8 @@ describe("readAntigravityUsage", () => {
             20,
             new Uint8Array(protoBytes(9, [...protoNumber(1, 1537), ...protoNumber(2, 30)])),
           ]);
-          // Gemini 4 Neon effort slots (MODEL_PLACEHOLDER_M532..M536) with no name in metadata.
-          for (const [offset, id] of [1532, 1534].entries()) {
+          // Gemini 4 Neon effort slots (MODEL_PLACEHOLDER_M532..M536) and Hydrogen slots with no name in metadata.
+          for (const [offset, id] of [1532, 1534, 1525, 1527].entries()) {
             yield* db.run("INSERT INTO steps VALUES (?, ?)", [
               21 + offset,
               new Uint8Array(
@@ -431,9 +435,15 @@ describe("readAntigravityUsage", () => {
           ["gemini-pro-orchestrator-argon", "gemini-4-argon"],
           ["gemini-4-neon-xhigh", "gemini-4-neon"],
           ["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen"],
+          ["gemini-pro-orchestrator", "gemini-4-carbon"],
+          ["gemini-3.8-flash-n", "gemini-3.8-flash"],
+          ["gemini-4-argon-r", "gemini-4-argon"],
+          ["gemini-4-argon-trial", "gemini-4-argon"],
           ["gemini-pro-orchestrator-neon", "gemini-4-neon"],
           ["gemini-4-neon", undefined],
           ["gemini-4-neon", undefined],
+          ["gemini-4-hydrogen", undefined],
+          ["gemini-4-hydrogen", undefined],
         ],
       );
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -555,6 +565,44 @@ describe("readAntigravityUsage", () => {
           ],
         );
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("learns one model for an id seen as both its bare and effort-suffixed name", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const dir = yield* tempDir;
+      yield* seedDatabase(path.join(dir, "effort-names.db"), (db) =>
+        Effect.gen(function* () {
+          yield* createTables(db);
+          // agy sometimes leaves field 19 empty and only the display name in field 21 names the model.
+          for (const [idx, [id, field, name]] of (
+            [
+              [1532, 19, "gemini-4-neon"],
+              [1532, 21, "Gemini 4 Neon (High)"],
+              [1318, 19, "gemini-3.8-flash"],
+              [1318, 21, "Gemini 3.8 Flash (High)"],
+            ] as const
+          ).entries()) {
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              idx,
+              new Uint8Array(protoBytes(1, [...protoNumber(3, id), ...protoText(field, name)])),
+            ]);
+          }
+          for (const [offset, id] of [1532, 1318].entries()) {
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              50 + offset,
+              new Uint8Array(protoBytes(9, [...protoNumber(1, id), ...protoNumber(2, 10)])),
+            ]);
+          }
+        }),
+      );
+      const result = yield* readAntigravityUsage(dir, 0);
+      assert.deepStrictEqual(result.errors, []);
+      assert.deepStrictEqual(
+        records(result).map(({ model, rateModel }) => rateModel ?? model),
+        ["gemini-4-neon", "gemini-3.8-flash"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("merges Antigravity aliases that bridge previously separate step records", () =>

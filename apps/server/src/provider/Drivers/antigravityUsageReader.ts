@@ -125,18 +125,25 @@ const MODEL_IDS: Record<number, string> = {
   1417: "gemini-4-argon",
   1418: "gemini-4-argon",
   1419: "gemini-4-argon",
+  1427: "gemini-4-carbon",
+  1437: "gemini-4-carbon",
+  1525: "gemini-4-hydrogen",
+  1526: "gemini-4-hydrogen",
+  1527: "gemini-4-hydrogen",
   1532: "gemini-4-neon",
   1533: "gemini-4-neon",
   1534: "gemini-4-neon",
   1535: "gemini-4-neon",
   1536: "gemini-4-neon",
   1537: "gemini-pro-orchestrator-neon",
+  1667: "gemini-pro-orchestrator",
+  1669: "gemini-4-hydrogen-orchestrator",
 };
 
 // Effort and routing variants share the base model's price.
 export const antigravityRateModel = (model: string) => {
   const base = model.replace(
-    /(?:-(?:extra-low|low|medium|high|xhigh|tiered|control|thinking|agent|orchestrator))+$/,
+    /(?:-(?:extra-low|low|medium|high|xhigh|tiered|control|thinking|agent|orchestrator|trial|n|r))+$/,
     "",
   );
   return /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model) ||
@@ -148,9 +155,11 @@ export const antigravityRateModel = (model: string) => {
         ? "gemini-4-neon"
         : base === "gemini-pro-orchestrator-g1-pro" || base === "gemini-pro-orchestrator-argon"
           ? "gemini-4-argon"
-          : base === "gemini-3-flash"
-            ? "gemini-3-flash-preview"
-            : base;
+          : model === "gemini-pro-orchestrator"
+            ? "gemini-4-carbon"
+            : base === "gemini-3-flash"
+              ? "gemini-3-flash-preview"
+              : base;
 };
 
 function withRateModel(record: UsageRecord): UsageRecord {
