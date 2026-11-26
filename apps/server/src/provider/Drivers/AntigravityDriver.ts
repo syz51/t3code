@@ -69,7 +69,9 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
 import {
   attachAntigravityCliUsageLimits,
+  getSharedAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
+  resolveAntigravityCliUsageTokenPath,
 } from "../antigravityCliUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
@@ -739,23 +741,22 @@ export const AntigravityDriver: ProviderDriver<
       profileDirectory,
       authMethod: auth.authMethod,
       readAccountEmail,
+      cache: getSharedAntigravityCliUsageCache(installation),
       prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
         cwd: string,
       ) {
-        const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
+        const isolatedHomeDirectory = yield* makeIsolatedProfileDirectory(
           "usage-profile-",
           "Could not create an isolated Antigravity usage profile.",
         );
-        const isolatedTokenPath = path.join(
-          isolatedProfileDirectory,
-          "antigravity-acp",
-          "antigravity-oauth-token",
-        );
+        const isolatedProfileDirectory = path.join(isolatedHomeDirectory, ".gemini");
+        const isolatedTokenPath = resolveAntigravityCliUsageTokenPath(path, isolatedHomeDirectory);
         const originalSource = yield* readCliTokenRecord(cliTokenPath);
         const { spawn } = yield* prepareSpawn(cwd, processEnvironment, isolatedProfileDirectory);
         return {
           spawn,
           isolatedProfileDirectory,
+          isolatedHomeDirectory,
           onAfterExit: syncRenewedCliToken({
             sourceTokenPath: cliTokenPath,
             isolatedTokenPath,

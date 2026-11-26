@@ -180,8 +180,10 @@ fork keeps **Usage → Limits** working for Antigravity via the official first-p
 `-p /usage --output-format json --print-timeout 15s` command in the fork-only module
 [antigravityCliUsageLimits.ts](../../apps/server/src/provider/antigravityCliUsageLimits.ts),
 attached in [AntigravityDriver.ts](../../apps/server/src/provider/Drivers/AntigravityDriver.ts)
-without modifying `AntigravityProvider.ts`. It runs in an isolated temp `GEMINI_HOME` with a
-5-minute per-instance cache (never on the 1-minute health check) and automatically yields if
+without modifying `AntigravityProvider.ts`. It runs in an isolated temp `HOME` (seeding
+`.gemini/antigravity-cli` from the profile's `antigravity-acp` credentials, since CLI mode ignores
+`GEMINI_HOME` and `--app-data-dir`) with a 5-minute shared per-account cache (never on the 1-minute
+health check) and automatically yields if
 upstream later re-adds native `usageLimits` to `AntigravityProvider`. If upstream does, remove the
 wrapper call in `AntigravityDriver.ts` and delete `antigravityCliUsageLimits.ts` and its test.
 
