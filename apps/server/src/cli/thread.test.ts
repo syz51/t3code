@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Runtime from "effect/Runtime";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as TestClock from "effect/testing/TestClock";
 import * as TestConsole from "effect/testing/TestConsole";
@@ -847,4 +848,240 @@ it.live("resolves a path inside a git worktree of the project's repository to th
     yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));
     assert.deepStrictEqual(yield* resolveFrom([sample], path.join(worktree, "pkg")), sample);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const cliTestLayer = Layer.mergeAll(
+  NodeServices.layer,
+  NodeCrypto.layer,
+  NetService.layer,
+  ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+);
+
+const makeRunningBaseDir = Effect.fn("test.makeRunningBaseDir")(function* (prefix: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const baseDir = yield* fs.makeTempDirectoryScoped({ prefix });
+  yield* persistServerRuntimeState({
+    path: path.join(baseDir, "userdata", "server-runtime.json"),
+    state: yield* makePersistedServerRuntimeState({
+      config: { host: "127.0.0.1", devUrl: undefined },
+      port: 3_773,
+    }),
+  });
+  return baseDir;
+});
+
+it.effect("interrupt prints a concise status line for each interrupt result status", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-interrupt-");
+    const calls: Array<{ readonly tool: string; readonly args: Record<string, unknown> }> = [];
+    const cases = [
+      {
+        result: { threadId, runId, status: "interrupt_requested" },
+        expected: "Interrupt requested.",
+      },
+      {
+        result: { threadId, runId: null, status: "no_active_run" },
+        expected: "No active run.",
+      },
+      {
+        result: { threadId, runId, status: "completed" },
+        expected: "Already completed.",
+      },
+      {
+        result: { threadId, runId, status: "failed" },
+        expected: "Already failed.",
+      },
+      {
+        result: { threadId, runId, status: "cancelled" },
+        expected: "Already cancelled.",
+      },
+      {
+        result: { threadId, runId, status: "interrupted" },
+        expected: "Already interrupted.",
+      },
+      {
+        result: { threadId, runId, status: "rolled_back" },
+        expected: "Already rolled_back.",
+      },
+    ] as const;
+
+    let index = 0;
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          calls.push({ tool, args });
+          const next = cases[index++];
+          return next === undefined
+            ? Effect.die(`unexpected ${tool} call`)
+            : Effect.succeed({ structuredContent: next.result });
+        },
+      }),
+    );
+
+    for (const testCase of cases) {
+      yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "interrupt",
+        threadId,
+        "--base-dir",
+        baseDir,
+      ]);
+      assert.strictEqual(
+        (yield* TestConsole.logLines).at(-1),
+        testCase.expected,
+        testCase.result.status,
+      );
+    }
+
+    assert.deepStrictEqual(
+      calls,
+      cases.map(() => ({ tool: "t3_thread_interrupt", args: { threadId } })),
+    );
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("interrupt --json prints the decoded OrchestratorMcpThreadInterruptResult JSON", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-interrupt-json-");
+    const responses = [
+      { threadId, runId, status: "interrupt_requested" },
+      { threadId, runId: null, status: "no_active_run" },
+    ] as const;
+    let index = 0;
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool) => {
+          if (tool !== "t3_thread_interrupt") return Effect.die(`unexpected ${tool} call`);
+          const next = responses[index++];
+          return next === undefined
+            ? Effect.die("extra t3_thread_interrupt call")
+            : Effect.succeed({ structuredContent: next });
+        },
+      }),
+    );
+
+    for (const expected of responses) {
+      yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "interrupt",
+        threadId,
+        "--json",
+        "--base-dir",
+        baseDir,
+      ]);
+      assert.deepStrictEqual(JSON.parse(String((yield* TestConsole.logLines).at(-1))), expected);
+    }
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("interrupt rejects an invalid thread id before opening a session", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-interrupt-invalid-");
+    using session = vi
+      .spyOn(McpBridge, "mcpToolSession")
+      .mockReturnValue(Effect.die("no session should open"));
+
+    const before = (yield* TestConsole.errorLines).length;
+    const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+      "interrupt",
+      "   ",
+      "--base-dir",
+      baseDir,
+    ]).pipe(Effect.flip);
+
+    assert.strictEqual(error._tag, "ThreadUsageError");
+    assert.strictEqual(error.message, "'   ' is not a thread id.");
+    assert.strictEqual(
+      (error as { readonly [Runtime.errorReported]?: boolean })[Runtime.errorReported],
+      false,
+    );
+    assert.deepStrictEqual((yield* TestConsole.errorLines).slice(before), [
+      "'   ' is not a thread id.",
+    ]);
+    assert.strictEqual(session.mock.calls.length, 0);
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("interrupt routes server and tool errors through reportThreadErrors", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const missingBaseDir = yield* fs.makeTempDirectoryScoped({
+      prefix: "t3-thread-interrupt-missing-",
+    });
+    const beforeMissing = (yield* TestConsole.errorLines).length;
+    const notRunning = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+      "interrupt",
+      threadId,
+      "--base-dir",
+      missingBaseDir,
+    ]).pipe(Effect.flip);
+    assert.strictEqual(notRunning._tag, "ThreadServerNotRunningError");
+    assert.deepStrictEqual((yield* TestConsole.errorLines).slice(beforeMissing), [
+      notRunning.message,
+    ]);
+
+    const baseDir = yield* makeRunningBaseDir("t3-thread-interrupt-errors-");
+    const cases: ReadonlyArray<{
+      readonly call: McpBridge.McpToolSession["call"];
+      readonly tag: string;
+      readonly message: string;
+    }> = [
+      {
+        call: () =>
+          Effect.succeed({
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  _tag: "OrchestratorMcpFailure",
+                  code: "thread_not_found",
+                  message: `Thread ${threadId} was not found.`,
+                }),
+              },
+            ],
+          }),
+        tag: "ThreadToolFailedError",
+        message: `Thread ${threadId} was not found.`,
+      },
+      {
+        call: () =>
+          Effect.fail(
+            new McpBridge.AcpMcpBridgeError({
+              message: "T3 Code MCP tools/call failed.",
+              rpcError: { code: -32602, message: "Tool 't3_thread_interrupt' not found" },
+            }),
+          ),
+        tag: "ThreadToolMissingError",
+        message: "This T3 Code server has no t3_thread_interrupt tool. Update T3 Code, then retry.",
+      },
+      {
+        call: () =>
+          Effect.succeed({ structuredContent: { threadId, runId: null, status: "bogus" } }),
+        tag: "ThreadToolFailedError",
+        message:
+          "The server sent an unexpected t3_thread_interrupt result. Update the t3 CLI to match the server.",
+      },
+    ];
+
+    for (const testCase of cases) {
+      using _session = vi
+        .spyOn(McpBridge, "mcpToolSession")
+        .mockReturnValue(Effect.succeed({ call: testCase.call }));
+      const before = (yield* TestConsole.errorLines).length;
+      const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "interrupt",
+        threadId,
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, testCase.tag);
+      assert.strictEqual(error.message, testCase.message);
+      assert.strictEqual(
+        (error as { readonly [Runtime.errorReported]?: boolean })[Runtime.errorReported],
+        false,
+      );
+      assert.deepStrictEqual((yield* TestConsole.errorLines).slice(before), [testCase.message]);
+    }
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
 );

@@ -165,6 +165,7 @@ without a sign-in:
 id=$(t3 thread start . "Find why the tests are slow")
 t3 thread send "$id" "Now fix it" --wait
 t3 thread show "$id"
+t3 thread interrupt "$id"
 t3 thread list
 ```
 
@@ -178,7 +179,8 @@ starts a thread through the MCP tools without choosing a workspace gets the
 same default. Its title is the message's first line, or `--title`; add
 `--generate-title` to have it named from the message, as threads started in the
 app are. `send` never interrupts: a busy thread gets the message as its next
-turn. Pass `-` as the message to read it from stdin.
+turn. Use `interrupt` to stop a thread's running turn. Pass `-` as the message
+to read it from stdin.
 
 To choose the model, pass `--provider <instance-id> --model <slug>`. Add
 `--option id=value` for each model option. For reasoning effort, Codex uses
