@@ -131,6 +131,7 @@ import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as ProjectEnrichmentService from "./project/ProjectEnrichmentService.ts";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as AntigravityInstallation from "./provider/AntigravityInstallation.ts";
+import * as AntigravitySessionRetention from "./provider/acp/AntigravitySessionRetention.ts";
 import * as ProviderInstallation from "./provider/providerInstallation.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as ProviderInstallationGate from "./provider/ProviderInstallationGate.ts";
@@ -242,6 +243,7 @@ import * as ThreadPullRequestService from "./orchestration-v2/ThreadPullRequestS
 import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
+import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ProjectionStoreV2 from "./orchestration-v2/ProjectionStore.ts";
 import { makePersistedServerRuntimeState } from "./serverRuntimeState.ts";
 import { closeNonPrivateNetworkConnections, loopbackUrlHostForAddress } from "./startupAccess.ts";
@@ -669,6 +671,16 @@ const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
       Layer.provide(RuntimeLayer.layerProjectService),
     ),
   ),
+  Layer.provide(AntigravitySessionRetention.layer),
+);
+
+const layerAntigravityLiveSessionProbe = Layer.effect(
+  AntigravitySessionRetention.LiveSessionProbe,
+  Effect.map(ProviderSessionManager.ProviderSessionManagerV2, (sessions) => sessions.isLive),
+);
+
+const layerAntigravityRetentionForMaintenance = Layer.fresh(AntigravitySessionRetention.layer).pipe(
+  Layer.provide(layerAntigravityLiveSessionProbe),
 );
 
 const layerOrchestrationApplication = Layer.merge(
@@ -743,6 +755,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   StorageCleanup.layer.pipe(Layer.provide(ProjectionStoreV2.layer)),
   DatabaseStorage.layer.pipe(
     Layer.provide(ProjectionMaintenance.layer),
+    Layer.provide(layerAntigravityRetentionForMaintenance),
     Layer.provide(layerServerRestart),
   ),
   layerThreadPullRequestWorker,
@@ -872,6 +885,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
 );
 
 const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
+  Layer.provide(AntigravitySessionRetention.layerLiveUsageArchiver),
   Layer.provideMerge(layerUsage),
   Layer.provideMerge(layerBackground),
   // The same layer the event sink uses; memoized, subscriptions and batch ranking share it.

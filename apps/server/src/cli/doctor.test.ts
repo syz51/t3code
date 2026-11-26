@@ -1,18 +1,21 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, it } from "@effect/vitest";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import * as TestConsole from "effect/testing/TestConsole";
 
 import * as BootService from "../cloud/bootService.ts";
 import { runDoctor } from "./doctor.ts";
 import { DatabaseMaintenance } from "../persistence/DatabaseMaintenance.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { acquireServerOwnership } from "../serverOwnership.ts";
 import { makePersistedServerRuntimeState } from "../serverRuntimeState.ts";
@@ -225,5 +228,93 @@ it.effect("warns how long reclaiming can take and reports each step with its ela
       ["0:00", "1:05", "12:46", "12:47"],
       "each compaction step must print one line with the elapsed time as it starts",
     );
+  }).pipe(Effect.provide(layerHost)),
+);
+
+it.effect("reports and prunes expired Antigravity sessions on --dry-run and --fix", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.UTC(2026, 10, 26, 12, 0, 0));
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-doctor-agy-" });
+    const dbPath = path.join(stateDir, "statev2.sqlite");
+    const serverRuntimeStatePath = path.join(stateDir, "server-runtime.json");
+
+    const oldIso = "2020-01-01T00:00:00.000Z";
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    yield* Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, deleted_at, payload_json
+        ) VALUES (
+          'mcp:doctor-expired', 'project:test', 'Expired', 'antigravity',
+          'full-access', 'default', ${oldIso}, ${oldIso}, NULL,
+          ${JSON.stringify({ settledAt: oldIso })}
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_provider_threads (
+          provider_thread_id, thread_id, provider, status, updated_at, payload_json
+        ) VALUES (
+          'pt:doctor-expired', 'mcp:doctor-expired', 'antigravity', 'idle', ${oldIso},
+          ${JSON.stringify({
+            driver: "antigravity",
+            nativeThreadRef: { driver: "antigravity", nativeId: sessionId, strength: "strong" },
+          })}
+        )
+      `;
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+
+    const acpDir = path.join(stateDir, "providers", "antigravity", "profile-a", "antigravity-acp");
+    const sessionDb = path.join(acpDir, "conversations", `${sessionId}.db`);
+    const sysGen = path.join(acpDir, "brain", sessionId, ".system_generated");
+    const artifact = path.join(acpDir, "brain", sessionId, "summary.md");
+    yield* fs.makeDirectory(path.dirname(sessionDb), { recursive: true });
+    yield* fs.makeDirectory(sysGen, { recursive: true });
+    yield* fs.writeFileString(sessionDb, "");
+    yield* fs.writeFileString(path.join(sysGen, "log.txt"), "internal");
+    yield* fs.writeFileString(artifact, "keep me");
+
+    const maintenanceStub = Layer.mergeAll(
+      Layer.mock(BootService.BootService)({
+        withStopped: (operation) => operation,
+      }),
+      Layer.succeed(DatabaseMaintenance, {
+        inspect: () =>
+          Effect.succeed({
+            databaseBytes: 4096,
+            reclaimableBytes: 0,
+            incrementalVacuumEnabled: true,
+            legacyDatabaseBytes: null,
+            legacyOnlyRecords: null,
+          }),
+        compact: () =>
+          Effect.succeed({
+            beforeBytes: 4096,
+            afterBytes: 4096,
+            deletedEventCount: 0,
+            deletedReceiptCount: 0,
+            compactedTurnItemCount: 0,
+          }),
+        removeLegacyDatabase: () => Effect.void,
+      }),
+    );
+
+    yield* runDoctor(
+      { dbPath, serverRuntimeStatePath },
+      { fix: true, dryRun: true, interactive: false },
+    ).pipe(Effect.provide(maintenanceStub));
+    assert.isTrue(yield* fs.exists(sessionDb), "--dry-run must not remove Antigravity files");
+
+    yield* runDoctor(
+      { dbPath, serverRuntimeStatePath },
+      { fix: true, dryRun: false, interactive: false },
+    ).pipe(Effect.provide(maintenanceStub));
+    assert.isFalse(yield* fs.exists(sessionDb));
+    assert.isFalse(yield* fs.exists(sysGen));
+    assert.isTrue(yield* fs.exists(artifact));
   }).pipe(Effect.provide(layerHost)),
 );

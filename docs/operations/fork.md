@@ -211,6 +211,27 @@ runs the same pass. They stop older history from growing; they do not make the f
   note saying how much was removed. Structured tool output, such as images, stays. Reasoning text
   becomes empty and shows as a "Thinking" row. Messages, diffs and checkpoints stay. Removed
   output cannot be recovered.
+- **Antigravity ACP session files.** The fork also runs
+  [AntigravitySessionRetention](../../apps/server/src/provider/acp/AntigravitySessionRetention.ts)
+  alongside the 6-hourly compaction pass, in `t3 doctor`, and immediately on `thread.deleted`
+  (`thread-content.purge`):
+  - **Deleted threads:** once no live session or open file handle remains, resolves linked
+    `invoke_subagent` / swarm child UUIDs (from `brain/<root>/.system_generated/subagents/`,
+    `brain/<root>/.system_generated/swarm/members.json`, and `conversations/<root>.db`), archives
+    their usage records into the persistent usage scan cache, and removes
+    `conversations/<id>.db*`, `brain/<id>/`, and `annotations/<id>.pbtxt` for both children and
+    parent.
+  - **Settled threads:** after **24 hours** for automated (`mcp:`, `subagent:`, `delegated-task:`)
+    threads and **7 days** for interactive threads, cascades full removal to child subagent
+    sessions and prunes the parent's `conversations/<id>.db*`, `annotations/<id>.pbtxt`,
+    `brain/<id>/.system_generated/`, and `brain/<id>/scratch/`. User-facing artifacts directly
+    under `brain/<id>/` stay until thread deletion. Reopening a pruned settled thread cleanly
+    starts a fresh Antigravity session using T3's portable context handoff.
+  - **Orphan sessions:** native session files unreferenced by `statev2.sqlite` or any protected
+    parent session are swept once older than **24 hours** and not held open by any process.
+  - **Safety guards:** active/unsettled threads, live in-process sessions, files with open OS
+    handles (`lsof`), and `.db` files whose usage records fail to scan or persist to the usage
+    cache are never removed.
 
 Related upstream work: issue #28903 (retention for events and turn items), PR #29806 (one-day
 event window) and PR #22548 (provider-turn updates).
