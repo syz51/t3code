@@ -412,9 +412,28 @@ update in a new session; without it, the update stops with the agent that starte
 The detached run waits 75 seconds, so the agent's last reply is saved, then asks the app to quit.
 When the app still runs after 90 seconds, it sends SIGTERM to the app's main process only: the
 process under `Contents/MacOS` that launchd owns, or the pid passed as an argument. Once the app
-and `statev2.sqlite` are free, it backs up the database with `VACUUM INTO` and moves the old app
-to `~/.t3-swap-backup/<time>-update/`, copies the new build into `/Applications` and opens it.
-When a step fails, it reopens the old app and the log says which step.
+and `statev2.sqlite` are free, it backs up the database with `VACUUM INTO` (verifying
+`PRAGMA quick_check = ok`) and moves the old app to `~/.t3-swap-backup/<time>-update/`, copies the
+new build into `/Applications` and opens it. When a step fails, it reopens the old app and the log
+says which step.
+
+- **Live database defragmentation.** Because `VACUUM INTO` already produces a verified compacted
+  snapshot while the app is stopped, the update reuses it to replace the live `statev2.sqlite`
+  whenever reclaiming intra-page B-tree slack saves at least **10%** (`T3_UPDATE_DEFRAG_MIN_PCT`)
+  and **64 MiB** (`T3_UPDATE_DEFRAG_MIN_MIB`). It clones the verified snapshot into place (clearing
+  the old `-wal`/`-shm` together and checking `PRAGMA quick_check = ok` before unlinking the old
+  file) while keeping the pre-swap backup in `~/.t3-swap-backup/<time>-update/statev2.sqlite`. Pass
+  `--no-defrag` (or `T3_UPDATE_DEFRAG=0`) to skip replacing the live database.
+- **Backup retention.** After the new app opens, the script prunes older
+  `<YYYYMMDD>-<HHMMSS>-update` backup folders directly under `~/.t3-swap-backup/`, keeping the
+  newest **`T3_UPDATE_KEEP=1`** by default (counting the folder created by the current run). Set
+  `T3_UPDATE_KEEP=<N>` (`N >= 1`) to keep more. Pruning orders strictly by folder name (never
+  modification time), never follows symlinks, never touches `latest`, its target, or non-`-update`
+  folders (such as the initial Nightly swap), and skips pruning if the update fails. `--dry-run`
+  lists the folders that would be pruned without changing anything.
+- **Staged build cleanup.** After `ditto` and launching the new app succeed, the script removes
+  the staged build directory (`~/.t3-fork/build` for default builds). Pass `--keep-build` to
+  preserve it (for example when building once and inspecting the bundle).
 
 To go back to the previous build, quit the app and move the old app from that backup folder to
 `/Applications`. Restore the database backup only when the newer build ran migrations the older
