@@ -292,13 +292,13 @@ describe("Antigravity model catalog", () => {
         ["plain", null],
       ]),
     );
-    const thinkingOf = (slug: string) =>
-      models.find((model) => model.slug === slug)?.capabilities?.optionDescriptors?.[0];
+    const modelOf = (slug: string) => models.find((model) => model.slug === slug);
+    const thinkingOf = (slug: string) => modelOf(slug)?.capabilities?.optionDescriptors?.[0];
 
     expect(thinkingOf("gemini")).toMatchObject({ id: "thinking_level", currentValue: "high" });
     expect(thinkingOf("claude")).toMatchObject({ id: "thinking_level", currentValue: "low" });
-    expect(thinkingOf("plain")).toBeUndefined();
-    expect(thinkingOf("unseen")).toBeUndefined();
+    expect(modelOf("plain")?.capabilities).toEqual({ optionDescriptors: [] });
+    expect(modelOf("unseen")?.capabilities).toBeNull();
   });
 
   it("keeps each model's probed thinking levels after a restart observes only the active model", () => {
@@ -352,6 +352,9 @@ describe("Antigravity model catalog", () => {
       models: buildAntigravityModelsFromSession(setup, new Map([["neon", deep]])),
     } satisfies ServerProvider;
 
+    expect(restarted.models.find((model) => model.slug === "carbon")?.capabilities).toBeNull();
+    expect(restarted.models.find((model) => model.slug === "fixed")?.capabilities).toBeNull();
+
     const merged = mergeProviderSnapshot(probed, restarted);
     const levelsOf = (slug: string) => {
       const descriptor = merged.models.find((model) => model.slug === slug)?.capabilities
@@ -361,7 +364,18 @@ describe("Antigravity model catalog", () => {
 
     expect(levelsOf("neon")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(levelsOf("carbon")).toEqual(["low", "medium", "high"]);
-    expect(levelsOf("fixed")).toEqual([]);
+    expect(merged.models.find((model) => model.slug === "fixed")?.capabilities).toEqual({
+      optionDescriptors: [],
+    });
+
+    const clearedNeon = mergeProviderSnapshot(merged, {
+      ...provider,
+      checkedAt: "2026-11-23T02:00:00.000Z",
+      models: buildAntigravityModelsFromSession({ configOptions: [models] }),
+    });
+    expect(clearedNeon.models.find((model) => model.slug === "neon")?.capabilities).toEqual({
+      optionDescriptors: [],
+    });
   });
 });
 
@@ -634,7 +648,10 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       );
       yield* harness.provider.onConfigOptionsUpdated(configOptions);
       expect((yield* nextSnapshot)[0]).toMatchObject({
-        models: buildAntigravityModelsFromSession({ configOptions }),
+        models: buildAntigravityModelsFromSession({ configOptions }, new Map(), {
+          defaultModel: "gemini-3.8-flash-high",
+          authoritative: false,
+        }),
         auth: before.auth,
         workspaceSnapshots: before.workspaceSnapshots,
         slashCommands: expectedCommands,
@@ -704,7 +721,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           currentValue: "high",
         });
         expect(carbon?.isDefault).toBeUndefined();
-        expect(carbon?.capabilities?.optionDescriptors).toEqual([]);
+        expect(carbon?.capabilities).toBeNull();
 
         // Updating an observed model's choices keeps its recorded default while still offered,
         // and falls back if the agent removes that default.

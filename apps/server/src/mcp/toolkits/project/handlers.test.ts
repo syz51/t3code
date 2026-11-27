@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - a directory junction needs no privilege on Windows.
 import * as NodeFSP from "node:fs/promises";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import { buildAntigravityModelsFromSession } from "../../../provider/AntigravityProvider.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -591,6 +592,122 @@ it.effect(
           { id: "ultracode", value: true },
         ],
       ]);
+    }),
+);
+
+it.effect(
+  "a launch accepts thought_level on an unobserved Antigravity model and rejects invalid authoritative options",
+  () =>
+    Effect.gen(function* () {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const antigravityId = ProviderInstanceId.make("antigravity");
+      const providers: ServerProvider[] = [
+        {
+          instanceId: antigravityId,
+          driver: ProviderDriverKind.make("antigravity"),
+          enabled: true,
+          installed: true,
+          status: "ready",
+          version: "1.5.12",
+          auth: { status: "authenticated" },
+          checkedAt: "2026-11-27T09:26:00.000Z",
+          models: buildAntigravityModelsFromSession(
+            {
+              configOptions: [
+                {
+                  id: "model",
+                  name: "Model",
+                  category: "model",
+                  type: "select",
+                  currentValue: "gemini-3.8-flash",
+                  options: [
+                    { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+                    { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+                    { value: "gemini-fixed", name: "Gemini Fixed" },
+                  ],
+                },
+                {
+                  id: "thought_level",
+                  name: "Thinking Level",
+                  category: "thought_level",
+                  type: "select",
+                  currentValue: "medium",
+                  options: [
+                    { value: "low", name: "Low" },
+                    { value: "medium", name: "Medium" },
+                    { value: "high", name: "High" },
+                  ],
+                },
+              ],
+            },
+            new Map([["gemini-fixed", null]]),
+          ),
+          slashCommands: [],
+          skills: [],
+        },
+      ];
+      const { projectId, dependencies } = clientLaunchHarness({
+        runtimeModeCeiling: "auto",
+        launched,
+        providers,
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(dependencies),
+          ),
+        ),
+      );
+      const launchWith = (model: string, options: NonNullable<ModelSelection["options"]>) =>
+        toolkit
+          .handle("t3_thread_launch", {
+            title: "Antigravity launch",
+            projectId,
+            modelSelection: {
+              instanceId: antigravityId,
+              model,
+              options,
+            },
+          })
+          .pipe(
+            Stream.unwrap,
+            Stream.runCollect,
+            Effect.map((result) => result.at(-1)?.result),
+            Effect.provide(dependencies),
+          );
+
+      // Unobserved after restart: thought_level must pass through instead of failing with "supported options: none".
+      yield* launchWith("gemini-4-neon", [{ id: "thought_level", value: "high" }]);
+      expect(launched.map((launch) => launch.modelSelection)).toEqual([
+        {
+          instanceId: antigravityId,
+          model: "gemini-4-neon",
+          options: [{ id: "thought_level", value: "high" }],
+        },
+      ]);
+
+      // Authoritatively empty descriptors still reject unknown options.
+      expect(
+        yield* launchWith("gemini-fixed", [{ id: "thought_level", value: "high" }]),
+      ).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Unknown option thought_level; supported options: none."),
+      });
+
+      // Authoritatively populated descriptors still reject unknown options and invalid choice values.
+      expect(
+        yield* launchWith("gemini-3.8-flash", [{ id: "reasoningEffort", value: "high" }]),
+      ).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Unknown option reasoningEffort"),
+      });
+      expect(
+        yield* launchWith("gemini-3.8-flash", [{ id: "thought_level", value: "ultra" }]),
+      ).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Option thought_level must be one of: low, medium, high."),
+      });
+      expect(launched).toHaveLength(1);
     }),
 );
 
