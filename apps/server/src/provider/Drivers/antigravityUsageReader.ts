@@ -190,23 +190,55 @@ function isConcreteModel(model: string): boolean {
   );
 }
 
-function rememberModel(models: Map<number, string | null>, id: number, model: string | null) {
+interface LearnedModel {
+  readonly model: string;
+  readonly fromSlug: boolean;
+}
+
+function rememberModel(
+  models: Map<number, LearnedModel | null>,
+  id: number,
+  entry: LearnedModel | null,
+) {
   const previous = models.get(id);
-  if (previous === undefined || previous === model) {
-    models.set(id, model);
+  if (previous === undefined) {
+    models.set(id, entry);
     return;
   }
-  if (previous === null || model === null) {
+  if (previous === null || entry === null) {
     models.set(id, null);
     return;
   }
+  if (previous.model === entry.model) {
+    if (!previous.fromSlug && entry.fromSlug) {
+      models.set(id, { model: previous.model, fromSlug: true });
+    }
+    return;
+  }
   // Generations for one numeric ID can omit the slug and fall back to a display name with effort.
-  const base = antigravityRateModel(previous);
-  models.set(id, base === antigravityRateModel(model) ? base : null);
+  const base = antigravityRateModel(previous.model);
+  models.set(
+    id,
+    base === antigravityRateModel(entry.model)
+      ? { model: base, fromSlug: previous.fromSlug || entry.fromSlug }
+      : null,
+  );
 }
+
+const MODEL_QUALITY = {
+  none: 0,
+  nonConcrete: 1,
+  borrowedDisplay: 2,
+  borrowedSlug: 3,
+  fallbackId: 4,
+  ownDisplay: 5,
+  learned: 6,
+  ownSlug: 7,
+} as const;
 
 interface Metadata {
   model: string;
+  modelFromSlug: boolean;
   modelId: number;
   timestampMs: number | null;
   usages: Fields[];
@@ -228,10 +260,16 @@ function metadata(bytes: Uint8Array, step: boolean): Metadata {
     const retryUsage = bytesAt(fields(retry), 2);
     if (retryUsage !== undefined) usages.push(fields(retryUsage.slice()));
   }
-  const names = [textAt(model, step ? 12 : 19), textAt(model, step ? 8 : 21)].map(modelName);
+  const slug = modelName(textAt(model, step ? 12 : 19));
+  const display = modelName(textAt(model, step ? 8 : 21));
+  const modelFromSlug = isConcreteModel(slug);
   return {
-    model:
-      names.find(isConcreteModel) ?? names.find((name) => name && !/^model[_-]/.test(name)) ?? "",
+    model: modelFromSlug
+      ? slug
+      : isConcreteModel(display)
+        ? display
+        : ([slug, display].find((name) => name && !/^model[_-]/.test(name)) ?? ""),
+    modelFromSlug,
     modelId:
       numberAt(model, step ? 1 : 3) || (primaryUsage === undefined ? 0 : numberAt(primaryUsage, 1)),
     timestampMs: step
@@ -499,10 +537,13 @@ const readDatabase = Effect.fn("readDatabase")(function* (
         )
       : [];
     return yield* decode(() => {
-      const models = new Map<number, string | null>();
+      const models = new Map<number, LearnedModel | null>();
       for (const { entry } of [...generations, ...steps]) {
         if (entry.modelId > 0 && isConcreteModel(entry.model))
-          rememberModel(models, entry.modelId, entry.model);
+          rememberModel(models, entry.modelId, {
+            model: entry.model,
+            fromSlug: entry.modelFromSlug,
+          });
       }
       return {
         candidates: usageCandidates(
@@ -537,12 +578,25 @@ function usageCandidates(
         const generation = source === "step" ? generationModels.get(idx) : undefined;
         // A retry can use a different model than its enclosing generation or step.
         const matches = (metadata: Metadata) => modelId === 0 || metadata.modelId === modelId;
-        const model =
-          matches(entry) && entry.model
-            ? entry.model
-            : generation && matches(generation)
-              ? generation.model
-              : "";
+        const ownMatch = matches(entry) && entry.model ? entry : undefined;
+        const borrowedMatch =
+          ownMatch === undefined && generation && matches(generation) && generation.model
+            ? generation
+            : undefined;
+        const matched = ownMatch ?? borrowedMatch;
+        const model = matched?.model ?? "";
+        const modelQuality =
+          matched === undefined
+            ? MODEL_QUALITY.none
+            : !isConcreteModel(model)
+              ? MODEL_QUALITY.nonConcrete
+              : ownMatch !== undefined
+                ? matched.modelFromSlug
+                  ? MODEL_QUALITY.ownSlug
+                  : MODEL_QUALITY.ownDisplay
+                : matched.modelFromSlug
+                  ? MODEL_QUALITY.borrowedSlug
+                  : MODEL_QUALITY.borrowedDisplay;
         const outputTokens = Math.max(numberAt(usage, 3), numberAt(usage, 9) + numberAt(usage, 10));
         const totals = {
           uncachedInputTokens: numberAt(usage, 2),
@@ -576,7 +630,7 @@ function usageCandidates(
         records.push({
           record,
           modelId,
-          modelQuality: isConcreteModel(model) ? 4 : model ? 1 : 0,
+          modelQuality,
           keys,
           timestampQuality: entry.timestampMs !== null ? 2 : trajectoryTimestamp !== null ? 1 : 0,
         });
@@ -599,7 +653,7 @@ const resolveAntigravityUsageCandidates = Effect.fnUntraced(function* <
 >(
   files: ReadonlyArray<Entry>,
   pending: ReadonlyArray<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }>,
-  models: ReadonlyMap<number, string | null>,
+  models: ReadonlyMap<number, LearnedModel | null>,
   sinceMs: number,
 ) {
   const identities = new Map<string, number>();
@@ -671,18 +725,35 @@ const resolveAntigravityUsageCandidates = Effect.fnUntraced(function* <
     for (const [index, candidate] of data.candidates.entries()) {
       const learned = models.get(candidate.modelId);
       const fallback = learned === null ? undefined : MODEL_IDS[candidate.modelId];
-      const model =
-        (candidate.modelQuality === 4 ? candidate.record.model : "") ||
-        learned ||
-        fallback ||
-        candidate.record.model ||
-        (candidate.modelId > 0 ? `antigravity-model-${candidate.modelId}` : "antigravity-unknown");
+      // Prefer the base MODEL_IDS slug when learned metadata only saw an effort display name.
+      const canonicalLearned =
+        learned && !learned.fromSlug && fallback && antigravityRateModel(learned.model) === fallback
+          ? fallback
+          : learned?.model;
+      const [model, modelQuality] =
+        candidate.modelQuality === MODEL_QUALITY.ownSlug
+          ? [candidate.record.model, candidate.modelQuality]
+          : canonicalLearned
+            ? [canonicalLearned, MODEL_QUALITY.learned]
+            : candidate.modelQuality === MODEL_QUALITY.ownDisplay
+              ? [candidate.record.model, candidate.modelQuality]
+              : fallback
+                ? [fallback, MODEL_QUALITY.fallbackId]
+                : candidate.modelQuality >= MODEL_QUALITY.borrowedDisplay
+                  ? [candidate.record.model, candidate.modelQuality]
+                  : candidate.record.model
+                    ? [candidate.record.model, candidate.modelQuality]
+                    : [
+                        candidate.modelId > 0
+                          ? `antigravity-model-${candidate.modelId}`
+                          : "antigravity-unknown",
+                        MODEL_QUALITY.none,
+                      ];
       append(
         {
           ...candidate,
           record: { ...candidate.record, model },
-          modelQuality:
-            candidate.modelQuality === 4 ? 4 : learned ? 3 : fallback ? 2 : candidate.modelQuality,
+          modelQuality,
         },
         fileIndex,
       );
@@ -711,7 +782,7 @@ export const readAntigravityUsageFiles = Effect.fn("readAntigravityUsageFiles")(
   const pathService = yield* Path.Path;
   const files: Array<{ path: string; size: number; mtimeMs: number; records: UsageRecord[] }> = [];
   const errors: string[] = [];
-  const models = new Map<number, string | null>();
+  const models = new Map<number, LearnedModel | null>();
   const pending: Array<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }> = [];
   const visited = new Set<string>();
   const reader = yield* makeSqliteReaderWorker;
@@ -791,7 +862,7 @@ export const readAntigravityUsage = Effect.fn("readAntigravityUsage")(function* 
       : conversationsDirectories;
   const files: Array<{ root: string; path: string; records: UsageRecord[] }> = [];
   const errors: string[] = [];
-  const models = new Map<number, string | null>();
+  const models = new Map<number, LearnedModel | null>();
   const pending: Array<{ data: NonNullable<CachedDatabase["data"]>; fileIndex: number }> = [];
   const visited = new Set<string>();
   const reader = yield* makeSqliteReaderWorker;

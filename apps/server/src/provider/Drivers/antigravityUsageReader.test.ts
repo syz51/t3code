@@ -605,6 +605,195 @@ describe("readAntigravityUsage", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect(
+    "keeps canonical slug when a step collides with an effort-display generation or a generation omits its slug",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const dir = yield* tempDir;
+        yield* seedDatabase(path.join(dir, "step-gen-collision.db"), (db) =>
+          Effect.gen(function* () {
+            yield* createTables(db);
+            // GEN 1 carries the canonical slug and usage; GEN 4 omits field 19 and only has field 21.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              1,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1532),
+                  ...protoText(19, "gemini-4-neon"),
+                  ...protoText(21, "Gemini 4 Neon (High)"),
+                  ...protoBytes(4, [
+                    ...protoNumber(1, 1532),
+                    ...protoNumber(2, 100),
+                    ...protoText(11, "req-gen-1"),
+                  ]),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              4,
+              new Uint8Array(
+                protoBytes(1, [...protoNumber(3, 1532), ...protoText(21, "Gemini 4 Neon (High)")]),
+              ),
+            ]);
+            // STEP 4 belongs to GEN 1 by reqId, but shares idx=4 with the slug-less GEN 4 row.
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              4,
+              new Uint8Array(
+                protoBytes(9, [
+                  ...protoNumber(1, 1532),
+                  ...protoNumber(2, 100),
+                  ...protoText(11, "req-gen-1"),
+                ]),
+              ),
+            ]);
+            // A generation row with usage whose own field 19 is empty still resolves to the canonical slug.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              5,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1532),
+                  ...protoText(21, "Gemini 4 Neon (High)"),
+                  ...protoBytes(4, [
+                    ...protoNumber(1, 1532),
+                    ...protoNumber(2, 200),
+                    ...protoText(11, "req-gen-5"),
+                  ]),
+                ]),
+              ),
+            ]);
+            // A generation's own slug beats a different slug borrowed via step idx collision.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              6,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoText(19, "gemini-4-neon"),
+                  ...protoBytes(4, [...protoNumber(2, 300), ...protoText(11, "req-gen-6")]),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              7,
+              new Uint8Array(protoBytes(1, protoText(19, "gemini-4-neon-xhigh"))),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              7,
+              new Uint8Array(
+                protoBytes(9, [...protoNumber(2, 300), ...protoText(11, "req-gen-6")]),
+              ),
+            ]);
+          }),
+        );
+        const result = yield* readAntigravityUsage(dir, 0);
+        assert.deepStrictEqual(result.errors, []);
+        assert.deepStrictEqual(
+          records(result).map(({ dedupeKey, model, rateModel }) => [dedupeKey, model, rateModel]),
+          [
+            ["antigravity:11:req-gen-1", "gemini-4-neon", undefined],
+            ["antigravity:11:req-gen-5", "gemini-4-neon", undefined],
+            ["antigravity:11:req-gen-6", "gemini-4-neon", undefined],
+          ],
+        );
+
+        // Standalone DB with only a display-name-only row for a known MODEL_IDS slot still uses the base slug.
+        const standaloneDir = yield* tempDir;
+        yield* seedDatabase(path.join(standaloneDir, "standalone-display-only.db"), (db) =>
+          Effect.gen(function* () {
+            yield* createTables(db);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              0,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1532),
+                  ...protoText(21, "Gemini 4 Neon (High)"),
+                  ...protoBytes(4, [
+                    ...protoNumber(1, 1532),
+                    ...protoNumber(2, 50),
+                    ...protoText(11, "req-standalone"),
+                  ]),
+                ]),
+              ),
+            ]);
+          }),
+        );
+        const standalone = yield* readAntigravityUsage(standaloneDir, 0);
+        assert.deepStrictEqual(standalone.errors, []);
+        assert.deepStrictEqual(
+          records(standalone).map(({ model, rateModel }) => [model, rateModel]),
+          [["gemini-4-neon", undefined]],
+        );
+
+        // A suffixed canonical slug in field 19 is preserved across step-only rows for that modelId,
+        // and an idx-colliding step's borrowed slug cannot overwrite the owning generation's model.
+        const edgeDir = yield* tempDir;
+        yield* seedDatabase(path.join(edgeDir, "slug-and-borrow.db"), (db) =>
+          Effect.gen(function* () {
+            yield* createTables(db);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              0,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1026),
+                  ...protoText(19, "claude-opus-4-6-thinking"),
+                  ...protoBytes(4, [
+                    ...protoNumber(1, 1026),
+                    ...protoNumber(2, 40),
+                    ...protoText(11, "req-thinking-gen"),
+                  ]),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              10,
+              new Uint8Array(
+                protoBytes(9, [
+                  ...protoNumber(1, 1026),
+                  ...protoNumber(2, 45),
+                  ...protoText(11, "req-thinking-step"),
+                ]),
+              ),
+            ]);
+            // GEN 2 has only a display name (no field 19, modelId 1532); STEP 3 shares its reqId
+            // without a modelId and collides by idx=3 with an unrelated GEN 3 carrying another slug.
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              2,
+              new Uint8Array(
+                protoBytes(1, [
+                  ...protoNumber(3, 1532),
+                  ...protoText(21, "Gemini 4 Neon (High)"),
+                  ...protoBytes(4, [
+                    ...protoNumber(1, 1532),
+                    ...protoNumber(2, 60),
+                    ...protoText(11, "req-display-owner"),
+                  ]),
+                ]),
+              ),
+            ]);
+            yield* db.run("INSERT INTO gen_metadata VALUES (?, ?)", [
+              3,
+              new Uint8Array(protoBytes(1, protoText(19, "gemini-4-neon-xhigh"))),
+            ]);
+            yield* db.run("INSERT INTO steps VALUES (?, ?)", [
+              3,
+              new Uint8Array(
+                protoBytes(9, [...protoNumber(2, 60), ...protoText(11, "req-display-owner")]),
+              ),
+            ]);
+          }),
+        );
+        const edge = yield* readAntigravityUsage(edgeDir, 0);
+        assert.deepStrictEqual(edge.errors, []);
+        assert.deepStrictEqual(
+          records(edge).map(({ dedupeKey, model, rateModel }) => [dedupeKey, model, rateModel]),
+          [
+            ["antigravity:11:req-thinking-step", "claude-opus-4-6-thinking", "claude-opus-4-6"],
+            ["antigravity:11:req-thinking-gen", "claude-opus-4-6-thinking", "claude-opus-4-6"],
+            ["antigravity:11:req-display-owner", "gemini-4-neon", undefined],
+          ],
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("merges Antigravity aliases that bridge previously separate step records", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
