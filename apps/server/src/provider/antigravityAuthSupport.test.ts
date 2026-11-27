@@ -1252,3 +1252,69 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       }),
   );
 });
+
+it.layer(NodeServices.layer)("Antigravity native keyring auth guard", (it) => {
+  it.effect(
+    "keeps provider source free of antigravity-oauth-token and SSH_CONNECTION/AGY_ACP_FORCE_FILE_STORAGE injection",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const providerRoot = yield* path.fromFileUrl(new URL(".", import.meta.url));
+        const allowedStripFiles = new Set([
+          "antigravityAuthSupport.ts",
+          "antigravityCliUsageLimits.ts",
+        ]);
+        const stripVarPattern = /\b(?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)\b/;
+        const allowedStripLinePattern =
+          /^\s*(?:\/\/|\/\*)|^\s*["'](?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)["'],?\s*(?:\/\/.*)?$|\bnew\s+Set\s*\(\s*\[\s*(?:["'][A-Z0-9_]+["'](?:\s*,\s*["'][A-Z0-9_]+["'])*,?\s*)?\]\s*\)/;
+        const isTestOnlyEntry = (name: string) => /test/i.test(name) || name.endsWith(".spec.ts");
+
+        const pending = [""];
+        const scannedFiles: Array<string> = [];
+        const violations: Array<string> = [];
+
+        while (true) {
+          const relativeDir = pending.pop();
+          if (relativeDir === undefined) break;
+          const fullDir = relativeDir ? path.join(providerRoot, relativeDir) : providerRoot;
+          const entries = yield* fs.readDirectory(fullDir);
+          for (const entry of entries) {
+            const relativePath = relativeDir ? `${relativeDir}/${entry}` : entry;
+            const fullPath = path.join(fullDir, entry);
+            const stat = yield* fs.stat(fullPath);
+            if (stat.type === "Directory") {
+              if (!isTestOnlyEntry(entry)) {
+                pending.push(relativePath);
+              }
+              continue;
+            }
+            if (!entry.endsWith(".ts") || entry.endsWith(".d.ts") || isTestOnlyEntry(entry)) {
+              continue;
+            }
+            scannedFiles.push(relativePath);
+            const lines = (yield* fs.readFileString(fullPath)).split(/\r?\n/);
+            for (const [index, line] of lines.entries()) {
+              const lineNumber = index + 1;
+              if (line.includes("antigravity-oauth-token")) {
+                violations.push(
+                  `${relativePath}:${lineNumber}: references antigravity-oauth-token`,
+                );
+              }
+              if (!stripVarPattern.test(line)) {
+                continue;
+              }
+              if (!allowedStripFiles.has(relativePath) || !allowedStripLinePattern.test(line)) {
+                violations.push(`${relativePath}:${lineNumber}: ${line.trim()}`);
+              }
+            }
+          }
+        }
+
+        expect(scannedFiles).toContain("antigravityAuthSupport.ts");
+        expect(scannedFiles).toContain("antigravityCliUsageLimits.ts");
+        expect(scannedFiles).toContain("Drivers/AntigravityDriver.ts");
+        expect(violations).toEqual([]);
+      }),
+  );
+});
