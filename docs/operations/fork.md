@@ -184,7 +184,11 @@ The fork lets the official first-party `agy` CLI use its native OS keyring authe
 spoofing `SSH_CONNECTION`, setting `AGY_ACP_FORCE_FILE_STORAGE=1`, or cloning plaintext
 `antigravity-oauth-token` files into temporary profile directories. `GEMINI_HOME` remains isolated
 per T3 profile for sessions, brain artifacts, hooks, MCP config, and skills, and isolated helper
-profiles (`text-profile-*`) skip user hooks/MCP/rules links without copying credentials.
+profiles (`text-profile-*`) skip user hooks/MCP/rules links without copying credentials. After each
+upstream merge,
+`git grep -n 'antigravity-oauth-token\|AGY_ACP_FORCE_FILE_STORAGE\|SSH_CONNECTION' -- apps/server/src/provider ':!*test*'`
+must match only the stripping sets and comment in `antigravityAuthSupport.ts` and
+`antigravityCliUsageLimits.ts` (also enforced in CI by `antigravityAuthSupport.test.ts`).
 
 Upstream removed direct HTTP calls to Google's internal Antigravity quota APIs (`#43026`). The
 fork keeps **Usage → Limits** working for Antigravity via the official first-party CLI's
