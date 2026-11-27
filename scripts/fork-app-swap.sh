@@ -39,17 +39,56 @@ plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"; }
 # pgrep -f takes a regex, and app names contain parentheses.
 # shellcheck disable=SC2009
 running_from() { ps -axo command= | grep -F "$1/Contents/" | grep -v grep || true; }
+verify_signed_build() {
+  local target="$1"
+  local expected_id="$2"
+  local verify_out dvvv req_out designated authority
+  if ! verify_out="$(codesign --verify --deep --strict "$target" 2>&1)"; then
+    fail "$target failed codesign --verify --deep --strict (refusing to install): $verify_out"
+  fi
+  if ! dvvv="$(codesign -dvvv "$target" 2>&1)"; then
+    fail "cannot inspect signature of $target: $dvvv"
+  fi
+  if printf '%s\n' "$dvvv" | grep -qE '^Signature=adhoc$|^CodeDirectory .*adhoc'; then
+    fail "$target is ad-hoc signed; sign it on the build host before installing"
+  fi
+  authority="$(printf '%s\n' "$dvvv" | sed -n 's/^Authority=//p' | head -1)"
+  [[ -n "$authority" ]] || fail "$target has no signing Authority; refusing to install"
+  printf '%s\n' "$dvvv" | grep -qxF "Identifier=$expected_id" ||
+    fail "$target signature Identifier does not match $expected_id"
+  printf '%s\n' "$dvvv" | grep -qE '^Info\.plist entries=[0-9]+' ||
+    fail "$target Info.plist is not bound by its signature"
+  printf '%s\n' "$dvvv" | grep -qE '^Sealed Resources version=' ||
+    fail "$target has no sealed resources in its signature"
+  if ! req_out="$(codesign -d -r- "$target" 2>&1)"; then
+    fail "cannot read designated requirement of $target: $req_out"
+  fi
+  designated="$(printf '%s\n' "$req_out" | sed -n 's/^designated => //p' | head -1)"
+  [[ -n "$designated" ]] || fail "$target has no designated requirement (ad-hoc or unsigned)"
+  if printf '%s\n' "$designated" | grep -qE '\bcdhash\b'; then
+    fail "$target designated requirement pins a cdhash instead of a certificate ($designated)"
+  fi
+  if ! printf '%s\n' "$designated" | grep -qF "identifier \"$expected_id\"" ||
+    ! printf '%s\n' "$designated" | grep -qE '\bcertificate\b'; then
+    fail "$target designated requirement does not pin identifier \"$expected_id\" and certificate ($designated)"
+  fi
+  fork_authority="$authority"
+}
 
 [[ -d "$fork_app" ]] || fail "no fork app at $fork_app; build it first"
 [[ -d "$nightly_app" ]] || fail "no Nightly app at $nightly_app"
 fork_version="$(plist "$fork_app" CFBundleShortVersionString)"
 nightly_version="$(plist "$nightly_app" CFBundleShortVersionString)"
 [[ "$fork_version" == *-fork.* ]] || fail "$fork_app is version $fork_version, not a fork build"
-[[ "$(plist "$fork_app" CFBundleIdentifier)" == "$(plist "$nightly_app" CFBundleIdentifier)" ]] ||
+fork_bundle_id="$(plist "$fork_app" CFBundleIdentifier)"
+[[ "$fork_bundle_id" == "$(plist "$nightly_app" CFBundleIdentifier)" ]] ||
   fail "the fork app and Nightly have different bundle ids"
 [[ ! -e "$fork_target" ]] || fail "$fork_target already exists; roll back or remove it first"
+fork_authority=""
+verify_signed_build "$fork_app" "$fork_bundle_id"
 
 echo "Fork build: $fork_app ($fork_version)"
+echo "Signed by:  $fork_authority"
 echo "Nightly:    $nightly_app ($nightly_version)"
 echo "Database:   $state_db"
 echo "Backup:     $backup_dir"

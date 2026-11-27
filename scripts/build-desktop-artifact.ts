@@ -3652,6 +3652,77 @@ export const validateMacPackagedPayload = Effect.fn("desktopArtifact.validateMac
   },
 );
 
+export function shouldSignMacForkBuild(input: {
+  readonly hostPlatform: string;
+  readonly platform: typeof BuildPlatform.Type;
+  readonly target: string;
+  readonly signed: boolean;
+  readonly appVersion: string;
+}): boolean {
+  return (
+    input.hostPlatform === "darwin" &&
+    input.platform === "mac" &&
+    input.target === "dir" &&
+    !input.signed &&
+    input.appVersion.includes("-fork.")
+  );
+}
+
+export const preflightMacForkSigning = Effect.fn("desktopArtifact.preflightMacForkSigning")(
+  function* (input: {
+    readonly repoRoot: string;
+    readonly identity?: string;
+    readonly verbose?: boolean;
+  }) {
+    const path = yield* Path.Path;
+    const signScript = path.join(input.repoRoot, "scripts/fork-app-sign.sh");
+    const args = [
+      signScript,
+      "--check-identity",
+      ...(input.identity ? ["--identity", input.identity] : []),
+    ];
+    yield* runCommand(ChildProcess.make("bash", args), {
+      label: "verify macOS fork signing identity",
+      verbose: input.verbose ?? false,
+    });
+  },
+);
+
+export const signMacForkPackagedApps = Effect.fn("desktopArtifact.signMacForkPackagedApps")(
+  function* (input: {
+    readonly repoRoot: string;
+    readonly stageDistDir: string;
+    readonly verbose?: boolean;
+  }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const signScript = path.join(input.repoRoot, "scripts/fork-app-sign.sh");
+    const appPaths: string[] = [];
+    for (const entry of yield* fs.readDirectory(input.stageDistDir)) {
+      if (!entry.startsWith("mac")) continue;
+      const outputDir = path.join(input.stageDistDir, entry);
+      const apps = yield* fs.readDirectory(outputDir).pipe(Effect.orElseSucceed(() => []));
+      for (const app of apps) {
+        if (app.endsWith(".app")) {
+          appPaths.push(path.join(outputDir, app));
+        }
+      }
+    }
+    if (appPaths.length === 0) {
+      return yield* new MacPackagedAppMissingError({ stageDistDir: input.stageDistDir });
+    }
+    for (const appPath of appPaths) {
+      yield* runCommand(ChildProcess.make("bash", [signScript, appPath]), {
+        label: `sign macOS fork app ${path.basename(appPath)}`,
+        verbose: input.verbose ?? false,
+      });
+    }
+    yield* Effect.log(
+      `[desktop-artifact] Signed macOS fork build (${String(appPaths.length)} app bundle(s)).`,
+    );
+  },
+);
+
 export class LinuxPackagedAppMissingError extends Schema.TaggedError<LinuxPackagedAppMissingError>()(
   "LinuxPackagedAppMissingError",
   { stageDistDir: Schema.String },
@@ -3757,6 +3828,16 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
 
   const appVersion =
     options.version ?? resolveTaggedSourceVersion(repoRoot, serverPackageJson.version);
+  const signMacForkBuild = shouldSignMacForkBuild({
+    hostPlatform,
+    platform: options.platform,
+    target: options.target,
+    signed: options.signed,
+    appVersion,
+  });
+  if (signMacForkBuild) {
+    yield* preflightMacForkSigning({ repoRoot, verbose: options.verbose });
+  }
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
@@ -4190,6 +4271,9 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
   // x64 builds on arm64 runners; the arm64 check covers the shared JS bundle.
   if (options.platform === "mac" && options.arch === "arm64" && hostPlatform === "darwin") {
     yield* validateMacPackagedPayload({ stageDistDir, verbose: options.verbose });
+  }
+  if (signMacForkBuild) {
+    yield* signMacForkPackagedApps({ repoRoot, stageDistDir, verbose: options.verbose });
   }
 
   const copiedArtifacts = yield* copyDesktopBuildArtifacts(

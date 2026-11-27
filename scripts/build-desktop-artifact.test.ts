@@ -50,6 +50,9 @@ import {
   LinuxBrowserSecretHostError,
   LinuxPackagedAppMissingError,
   MacPackagedAppMissingError,
+  preflightMacForkSigning,
+  shouldSignMacForkBuild,
+  signMacForkPackagedApps,
   stageBrowserSecret,
   validateLinuxPackagedPayload,
   validateMacPackagedPayload,
@@ -2010,5 +2013,75 @@ it.effect.skipIf(!symlinksSupported)("preserves relative links when replacing di
     yield* copyDesktopBuildArtifacts(stage, output, true);
     assert.equal(yield* fs.readLink(path.join(output, app, "Current")), "New.plist");
     assert.equal(yield* fs.readFileString(path.join(output, app, "Current")), "rebuilt-app");
+  }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+);
+
+it("selects local macOS fork signing only for unsigned macOS dir -fork. builds on darwin", () => {
+  assert.isTrue(
+    shouldSignMacForkBuild({
+      hostPlatform: "darwin",
+      platform: "mac",
+      target: "dir",
+      signed: false,
+      appVersion: "0.1.13-fork.20261126",
+    }),
+  );
+  assert.isFalse(
+    shouldSignMacForkBuild({
+      hostPlatform: "darwin",
+      platform: "mac",
+      target: "dmg",
+      signed: false,
+      appVersion: "0.1.13-fork.20261126",
+    }),
+  );
+  assert.isFalse(
+    shouldSignMacForkBuild({
+      hostPlatform: "darwin",
+      platform: "mac",
+      target: "dir",
+      signed: true,
+      appVersion: "0.1.13-fork.20261126",
+    }),
+  );
+  assert.isFalse(
+    shouldSignMacForkBuild({
+      hostPlatform: "darwin",
+      platform: "mac",
+      target: "dir",
+      signed: false,
+      appVersion: "0.1.13-nightly.20261126.1",
+    }),
+  );
+  assert.isFalse(
+    shouldSignMacForkBuild({
+      hostPlatform: "linux",
+      platform: "mac",
+      target: "dir",
+      signed: false,
+      appVersion: "0.1.13-fork.20261126",
+    }),
+  );
+});
+
+it.effect.skipIf(HostProcess.Platform.defaultValue() !== "darwin")(
+  "fails loudly when preflightMacForkSigning runs without a matching identity",
+  () =>
+    Effect.gen(function* () {
+      const repoRoot = NodePath.resolve(import.meta.dirname, "..");
+      const exit = yield* Effect.exit(
+        preflightMacForkSigning({ repoRoot, identity: "T3 Code Fork Missing Identity Test" }),
+      );
+      assert.isTrue(Exit.isFailure(exit));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("fails with MacPackagedAppMissingError when signMacForkPackagedApps finds no app", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const repoRoot = NodePath.resolve(import.meta.dirname, "..");
+    const stageDistDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-sign-empty-" });
+    const exit = yield* Effect.exit(signMacForkPackagedApps({ repoRoot, stageDistDir }));
+    assert.isTrue(Exit.isFailure(exit));
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
 );
