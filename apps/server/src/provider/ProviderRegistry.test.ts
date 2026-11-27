@@ -2312,6 +2312,186 @@ it.layer(
           assert.deepStrictEqual(afterFailure.models, []);
         }
       });
+
+      it.effect("retains cached Antigravity optionDescriptors across restarts", () =>
+        Effect.gen(function* () {
+          const instanceId = ProviderInstanceId.make("antigravity");
+          const driver = ProviderDriverKind.make("antigravity");
+          const thoughtLevel = createModelCapabilities({
+            optionDescriptors: [
+              selectDescriptor("thought_level", "Thinking Level", [
+                { id: "low", label: "Low" },
+                { id: "high", label: "High", isDefault: true },
+              ]),
+            ],
+          });
+          const emptyCapabilities = createModelCapabilities({ optionDescriptors: [] });
+          const cachedProvider = {
+            instanceId,
+            driver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated", type: "oauth-personal", label: "Google account" },
+            checkedAt: "2026-11-27T09:00:00.000Z",
+            version: "1.5.12",
+            models: [
+              {
+                slug: "gemini-4-neon",
+                name: "Gemini 4 Neon",
+                isCustom: false,
+                capabilities: thoughtLevel,
+              },
+              {
+                slug: "gemini-fixed",
+                name: "Gemini Fixed",
+                isCustom: false,
+                capabilities: emptyCapabilities,
+              },
+            ],
+            slashCommands: [],
+            skills: [],
+          } as const satisfies ServerProvider;
+
+          const restartedUnobserved = {
+            ...cachedProvider,
+            checkedAt: "2026-11-27T09:26:00.000Z",
+            models: [
+              {
+                slug: "gemini-4-neon",
+                name: "Gemini 4 Neon",
+                isCustom: false,
+                capabilities: null,
+              },
+              {
+                slug: "gemini-fixed",
+                name: "Gemini Fixed",
+                isCustom: false,
+                capabilities: null,
+              },
+            ],
+          } satisfies ServerProvider;
+          const merged = ProviderRegistry.mergeProviderSnapshot(
+            cachedProvider,
+            restartedUnobserved,
+          );
+          assert.deepStrictEqual(
+            merged.models.find((model) => model.slug === "gemini-4-neon")?.capabilities,
+            thoughtLevel,
+          );
+          assert.deepStrictEqual(
+            merged.models.find((model) => model.slug === "gemini-fixed")?.capabilities,
+            emptyCapabilities,
+          );
+
+          const clearedByAuthoritativeProbe = ProviderRegistry.mergeProviderSnapshot(merged, {
+            ...cachedProvider,
+            checkedAt: "2026-11-27T09:30:00.000Z",
+            models: [
+              {
+                slug: "gemini-4-neon",
+                name: "Gemini 4 Neon",
+                isCustom: false,
+                capabilities: emptyCapabilities,
+              },
+            ],
+          });
+          assert.deepStrictEqual(
+            clearedByAuthoritativeProbe.models[0]?.capabilities,
+            emptyCapabilities,
+          );
+
+          const initialRestartSnapshot = {
+            ...cachedProvider,
+            status: "warning",
+            auth: { status: "unknown" },
+            checkedAt: "2026-11-27T09:22:00.000Z",
+            models: [],
+          } as const satisfies ServerProvider;
+          const snapshotRef = yield* Ref.make<ServerProvider>(initialRestartSnapshot);
+          const changes = yield* PubSub.unbounded<ServerProvider>();
+          const instance = {
+            instanceId,
+            driverKind: driver,
+            continuationIdentity: { driverKind: driver, continuationKey: "antigravity:default" },
+            displayName: undefined,
+            enabled: true,
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: driver,
+                    packageName: null,
+                  }),
+                ),
+              getSnapshot: Ref.get(snapshotRef),
+              refresh: Ref.get(snapshotRef),
+              streamChanges: Stream.fromPubSub(changes),
+              applyUsageLimits: () => Effect.void,
+            },
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          } satisfies ProviderInstance;
+          const layerInstanceRegistry = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
+              listInstances: Effect.succeed([instance]),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+            },
+          );
+          const configLayer = ServerConfig.layerTest(process.cwd(), {
+            prefix: "t3-antigravity-restart-cache-",
+          }).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
+          yield* Effect.gen(function* () {
+            const config = yield* ServerConfig.ServerConfig;
+            const cachePath = yield* resolveProviderStatusCachePath({
+              cacheDir: config.providerStatusCacheDir,
+              instanceId,
+            });
+            yield* writeProviderStatusCache({ filePath: cachePath, provider: cachedProvider });
+
+            const scope = yield* Scope.make();
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const services = yield* Layer.build(
+              ProviderRegistry.layer.pipe(
+                Layer.provide(layerUnusedMutator),
+                Layer.provideMerge(layerInstanceRegistry),
+                Layer.provideMerge(layerBackgroundPolicyAlwaysRun),
+              ),
+            ).pipe(Scope.provide(scope));
+            const registry = yield* ProviderRegistry.ProviderRegistry.pipe(
+              Effect.provide(services),
+            );
+
+            const afterBoot = (yield* registry.getProviders)[0];
+            assert.deepStrictEqual(
+              afterBoot?.models.find((model) => model.slug === "gemini-4-neon")?.capabilities,
+              thoughtLevel,
+            );
+
+            const sessionPublished = yield* awaitPersistedProvider(
+              registry,
+              restartedUnobserved.checkedAt,
+            );
+            yield* Ref.set(snapshotRef, restartedUnobserved);
+            yield* PubSub.publish(changes, restartedUnobserved);
+            yield* Fiber.join(sessionPublished);
+
+            const afterSession = (yield* registry.getProviders)[0];
+            assert.deepStrictEqual(
+              afterSession?.models.find((model) => model.slug === "gemini-4-neon")?.capabilities,
+              thoughtLevel,
+            );
+            assert.deepStrictEqual(
+              afterSession?.models.find((model) => model.slug === "gemini-fixed")?.capabilities,
+              emptyCapabilities,
+            );
+          }).pipe(Effect.provide(configLayer));
+        }),
+      );
     });
 
     describe("Antigravity saved account", () => {

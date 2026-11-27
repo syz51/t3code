@@ -59,6 +59,7 @@ type ThinkingConfig = NonNullable<ReturnType<typeof antigravityThinkingConfig>>;
 export type AntigravityThinkingLevels = ReadonlyMap<string, ThinkingConfig | null>;
 
 function thinkingCapabilities(config: ThinkingConfig | null | undefined) {
+  if (config === undefined) return null;
   const descriptor = config
     ? acpProviderOptionDescriptors({ configOptions: [config], modeState: undefined })[0]
     : undefined;
@@ -144,7 +145,8 @@ export function buildAntigravityModelsFromSession(
         ...(entry.value === defaultModel
           ? { isDefault: true, aliases: [ANTIGRAVITY_DEFAULT_MODEL] }
           : {}),
-        // Levels differ per model; an unobserved model reports none so the registry keeps its cached ones.
+        // Levels differ per model; an unobserved model leaves capabilities null so the registry
+        // keeps cached ones and option validation does not reject options before observation.
         capabilities: thinkingCapabilities(observed),
       },
     ];

@@ -50,6 +50,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import { buildAntigravityModelsFromSession } from "../provider/AntigravityProvider.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -5623,6 +5624,144 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(yield* resolveRuntimeMode("full-access", "inherit", muse), "full-access");
         assert.equal(yield* resolveRuntimeMode("auto", undefined, muse), "approval-required");
       }),
+    );
+  });
+
+  describe("validateModelOptions", () => {
+    const antigravityProvider = (models: ServerProvider["models"]): ServerProvider => ({
+      instanceId: ProviderInstanceId.make("antigravity"),
+      driver: ProviderDriverKind.make("antigravity"),
+      status: "ready",
+      enabled: true,
+      installed: true,
+      version: "1.5.12",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-11-27T09:26:00.000Z",
+      models,
+      slashCommands: [],
+      skills: [],
+    });
+
+    it.effect(
+      "does not reject thought_level on an unobserved Antigravity model after restart",
+      () =>
+        Effect.gen(function* () {
+          const models = buildAntigravityModelsFromSession({
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "gemini-3.8-flash",
+                options: [
+                  { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+                  { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+                ],
+              },
+              {
+                id: "thought_level",
+                name: "Thinking Level",
+                category: "thought_level",
+                type: "select",
+                currentValue: "medium",
+                options: [
+                  { value: "low", name: "Low" },
+                  { value: "medium", name: "Medium" },
+                  { value: "high", name: "High" },
+                ],
+              },
+            ],
+          });
+          const provider = antigravityProvider(models);
+          const neon = models.find((model) => model.slug === "gemini-4-neon");
+          assert.equal(neon?.capabilities, null);
+
+          const validated = yield* OrchestratorMcpService.validateModelOptions(
+            provider,
+            "gemini-4-neon",
+            [{ id: "thought_level", value: "high" }],
+          );
+          assert.deepEqual(validated, [{ id: "thought_level", value: "high" }]);
+        }),
+    );
+
+    it.effect(
+      "rejects unknown options and invalid choices when authoritative descriptors exist",
+      () =>
+        Effect.gen(function* () {
+          const models = buildAntigravityModelsFromSession(
+            {
+              configOptions: [
+                {
+                  id: "model",
+                  name: "Model",
+                  category: "model",
+                  type: "select",
+                  currentValue: "gemini-4-neon",
+                  options: [
+                    { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+                    { value: "gemini-fixed", name: "Gemini Fixed" },
+                  ],
+                },
+                {
+                  id: "thought_level",
+                  name: "Thinking Level",
+                  category: "thought_level",
+                  type: "select",
+                  currentValue: "high",
+                  options: [
+                    { value: "low", name: "Low" },
+                    { value: "medium", name: "Medium" },
+                    { value: "high", name: "High" },
+                  ],
+                },
+              ],
+            },
+            new Map([["gemini-fixed", null]]),
+          );
+          const provider = antigravityProvider(models);
+
+          assert.deepEqual(
+            yield* OrchestratorMcpService.validateModelOptions(provider, "gemini-4-neon", [
+              { id: "thought_level", value: "high" },
+            ]),
+            [{ id: "thought_level", value: "high" }],
+          );
+
+          const unknownOnObserved = yield* OrchestratorMcpService.validateModelOptions(
+            provider,
+            "gemini-4-neon",
+            [{ id: "reasoningEffort", value: "high" }],
+          ).pipe(Effect.flip);
+          assert.equal(unknownOnObserved.code, "invalid_request");
+          assert.include(
+            unknownOnObserved.message,
+            "Unknown option reasoningEffort; supported options: thought_level.",
+          );
+
+          const invalidChoice = yield* OrchestratorMcpService.validateModelOptions(
+            provider,
+            "gemini-4-neon",
+            [{ id: "thought_level", value: "ultra" }],
+          ).pipe(Effect.flip);
+          assert.equal(invalidChoice.code, "invalid_request");
+          assert.include(
+            invalidChoice.message,
+            "Option thought_level must be one of: low, medium, high.",
+          );
+
+          const rejectedOnFixed = yield* OrchestratorMcpService.validateModelOptions(
+            provider,
+            "gemini-fixed",
+            [{ id: "thought_level", value: "high" }],
+          ).pipe(Effect.flip);
+          assert.equal(rejectedOnFixed.code, "invalid_request");
+          assert.include(
+            rejectedOnFixed.message,
+            "Unknown option thought_level; supported options: none.",
+          );
+        }),
     );
   });
 });

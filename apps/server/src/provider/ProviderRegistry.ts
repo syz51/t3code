@@ -169,6 +169,9 @@ const makeManualProviderMaintenanceCapabilities = (provider: ProviderDriverKind)
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
   (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
+const hasDefinedOptionDescriptors = (model: ServerProvider["models"][number]): boolean =>
+  model.capabilities?.optionDescriptors !== undefined;
+
 const MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER = 16;
 
 function dropProviderWorkspaceSnapshot(provider: ServerProvider, cwd: string): ServerProvider {
@@ -298,6 +301,7 @@ const mergeProviderModels = (
     return retainablePreviousModels;
   }
 
+  const isAntigravity = provider.driver === ProviderDriverKind.make("antigravity");
   const previousBySlug = new Map(previousModels.map((model) => [model.slug, model] as const));
   const preserveDefault =
     nextModels.length > 0 && !nextModels.some((model) => model.isDefault === true);
@@ -306,7 +310,9 @@ const mergeProviderModels = (
     if (!previousModel) {
       return model;
     }
-    const retainCapabilities = !hasModelCapabilities(model) && hasModelCapabilities(previousModel);
+    const retainCapabilities = isAntigravity
+      ? !hasDefinedOptionDescriptors(model) && hasDefinedOptionDescriptors(previousModel)
+      : !hasModelCapabilities(model) && hasModelCapabilities(previousModel);
     const retainDefault = preserveDefault && previousModel.isDefault === true;
     if (!retainCapabilities && !retainDefault) {
       return model;
