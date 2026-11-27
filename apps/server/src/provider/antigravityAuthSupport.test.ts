@@ -1266,8 +1266,9 @@ it.layer(NodeServices.layer)("Antigravity native keyring auth guard", (it) => {
           "antigravityCliUsageLimits.ts",
         ]);
         const stripVarPattern = /\b(?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)\b/;
-        const envAssignmentPattern =
-          /(?:^|[\s{,])["']?(?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)["']?\s*:|\[["'](?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)["']\]\s*=|\.(?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)\s*=|\b(?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)=/;
+        const allowedStripLinePattern =
+          /^\s*(?:\/\/|\/\*)|^\s*["'](?:AGY_ACP_FORCE_FILE_STORAGE|SSH_CONNECTION)["'],?\s*(?:\/\/.*)?$|\bnew\s+Set\s*\(\s*\[\s*(?:["'][A-Z0-9_]+["'](?:\s*,\s*["'][A-Z0-9_]+["'])*,?\s*)?\]\s*\)/;
+        const isTestOnlyEntry = (name: string) => /test/i.test(name) || name.endsWith(".spec.ts");
 
         const pending = [""];
         const scannedFiles: Array<string> = [];
@@ -1283,17 +1284,12 @@ it.layer(NodeServices.layer)("Antigravity native keyring auth guard", (it) => {
             const fullPath = path.join(fullDir, entry);
             const stat = yield* fs.stat(fullPath);
             if (stat.type === "Directory") {
-              if (entry !== "testFixtures") {
+              if (!isTestOnlyEntry(entry)) {
                 pending.push(relativePath);
               }
               continue;
             }
-            if (
-              !entry.endsWith(".ts") ||
-              entry.endsWith(".test.ts") ||
-              entry.endsWith(".spec.ts") ||
-              entry.endsWith(".d.ts")
-            ) {
+            if (!entry.endsWith(".ts") || entry.endsWith(".d.ts") || isTestOnlyEntry(entry)) {
               continue;
             }
             scannedFiles.push(relativePath);
@@ -1308,7 +1304,7 @@ it.layer(NodeServices.layer)("Antigravity native keyring auth guard", (it) => {
               if (!stripVarPattern.test(line)) {
                 continue;
               }
-              if (!allowedStripFiles.has(relativePath) || envAssignmentPattern.test(line)) {
+              if (!allowedStripFiles.has(relativePath) || !allowedStripLinePattern.test(line)) {
                 violations.push(`${relativePath}:${lineNumber}: ${line.trim()}`);
               }
             }
