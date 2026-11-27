@@ -15,7 +15,7 @@
     },
     "apps/desktop": {
       "name": "@t3tools/desktop",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "dependencies": {
         "@clerk/electron": "catalog:",
         "@clerk/electron-passkeys": "catalog:",
@@ -178,7 +178,7 @@
     },
     "apps/server": {
       "name": "t3",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "bin": {
         "t3": "./dist/bin.mjs",
       },
@@ -252,7 +252,7 @@
     },
     "apps/web": {
       "name": "@t3tools/web",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "dependencies": {
         "@base-ui/react": "^1.9.0",
         "@betteroffice/docx": "0.5.1",
@@ -465,7 +465,7 @@
     },
     "packages/contracts": {
       "name": "@t3tools/contracts",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "dependencies": {
         "effect": "catalog:",
       },
@@ -1041,6 +1041,7 @@
     "gt-i18n@1.0.40": "patches/gt-i18n@1.0.40.patch",
     "mdast-util-to-hast@13.2.1": "patches/mdast-util-to-hast@13.2.1.patch",
     "@alchemy.run/test@2.0.0-beta.85": "patches/@alchemy.run__test@2.0.0-beta.85.patch",
+    "@vitest/browser@5.1.1": "patches/@vitest__browser@5.1.1.patch",
     "micromark@4.0.2": "patches/micromark@4.0.2.patch",
     "@clerk/expo-native-components@0.4.8": "patches/@clerk__expo-native-components@0.4.8.patch",
     "expo-modules-core@58.1.0": "patches/expo-modules-core@58.1.0.patch",
@@ -1109,6 +1110,7 @@
     "@vercel/routing-utils": {
       "path-to-regexp": "6.3.0",
     },
+    "@vitest/browser": "5.1.1",
     "alchemy": "catalog:",
     "app-builder-lib": "26.16.1",
     "dbus-next": "0.10.2",

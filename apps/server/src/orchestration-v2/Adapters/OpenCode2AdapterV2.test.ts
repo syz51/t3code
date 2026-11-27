@@ -589,6 +589,50 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("creates the session without the thread title so OpenCode titles it", () =>
+    Effect.gen(function* () {
+      const runtime = yield* openCode2ReplayRuntime([
+        ...opening,
+        out("agent.list", "<any>"),
+        reply("agent.list", agentList),
+        out("session.create", {
+          location: { directory: WORK },
+          model: { providerID: "opencode", id: "big-pickle" },
+          permissions: supervisedRules,
+          title: null,
+        }),
+        replyData("session.create", sessionInfo({ permissions: supervisedRules })),
+      ]);
+      const created = yield* runtime
+        .ensureThread({
+          threadId,
+          title: "Seed prompt",
+          modelSelection: bigPickle,
+          runtimePolicy: policy("approval-required"),
+        })
+        .pipe(Effect.forkScoped);
+      yield* TestClock.adjust("250 millis");
+      assert.equal((yield* Fiber.join(created)).nativeThreadRef?.nativeId, SESSION);
+    }),
+  );
+
+  it.effect("does not write a seed title into the session before the first turn", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      const seeded = turnInput(thread);
+      yield* runtime.startTurn({
+        ...seeded,
+        appThread: { ...seeded.appThread, title: "Seed prompt" },
+      });
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+    }),
+  );
+
   it.effect("renames the session before the first turn after the thread was renamed", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
@@ -606,7 +650,8 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         appThread: {
           ...turnInput(thread).appThread,
           title: "Prime factors of 391",
-        } as OrchestrationV2AppThread,
+          titleRenamed: true,
+        },
       };
       const first = yield* terminalOf(runtime).pipe(Effect.forkScoped);
       yield* runtime.startTurn(renamed);
@@ -930,7 +975,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       });
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(started);
-      assert.equal((yield* Fiber.join(terminal))?.status, "interrupted");
+      assert.include(yield* Fiber.join(terminal), { status: "interrupted", promptDropped: true });
       assert.lengthOf(prompts, 0);
     }),
   );
