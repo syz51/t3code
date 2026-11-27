@@ -15,6 +15,13 @@ import {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
+import {
+  compactDynamicToolOutput,
+  htmlRenderFromToolItem,
+  mcpAppFromToolItem,
+  toolOutputImages,
+} from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -30,6 +37,7 @@ import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as WireProjection from "./WireProjection.ts";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 
 const database = SqlitePersistence.layerMemory;
@@ -404,11 +412,12 @@ function commandEvent(
   key: string,
   status: "running" | "completed",
   output: unknown,
+  toolName = "view_image",
 ): OrchestrationV2DomainEvent {
   const tool =
     typeof output === "string"
       ? { type: "command_execution" as const, input: `run ${key}`, output }
-      : { type: "dynamic_tool" as const, toolName: "view_image", input: {}, output };
+      : { type: "dynamic_tool" as const, toolName, input: {}, output };
   return {
     id: EventId.make(`event:settled:${threadId}:${key}`),
     type: "turn-item.updated",
@@ -456,11 +465,14 @@ it.effect("trims tool output and clears reasoning of threads settled for seven d
         commandEvent(settledId, createdAt, "structured", "completed", [
           { type: "text", text: output },
         ]),
+        commandEvent(settledId, createdAt, "structured-small", "completed", [
+          { type: "text", text: "short" },
+        ]),
       ],
     });
-    const structuredBefore = (yield* projections.getThreadProjection(settledId)).turnItems.find(
-      (item) => item.type === "dynamic_tool",
-    );
+    const smallStructuredBefore = (yield* projections.getThreadProjection(
+      settledId,
+    )).turnItems.find((item) => item.id.endsWith(":structured-small"));
     const activeId = ThreadId.make("thread:active");
     yield* sink.write({
       events: [
@@ -487,7 +499,7 @@ it.effect("trims tool output and clears reasoning of threads settled for seven d
     const recent = yield* projections.getThreadProjection(recentId);
     yield* TestClock.adjust("25 hours");
 
-    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 2);
+    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 3);
     const items = (yield* projections.getThreadProjection(settledId)).turnItems;
     const outputOf = (key: string) => {
       const item = items.find((entry) => entry.id.endsWith(`:${key}`));
@@ -500,14 +512,337 @@ it.effect("trims tool output and clears reasoning of threads settled for seven d
     assert.equal(outputOf("stuck"), output);
     const reasoning = items.find((item) => item.type === "reasoning");
     assert.equal(reasoning?.type === "reasoning" ? reasoning.text : null, "");
+    const structuredAfter = items.find((item) => item.id.endsWith(":structured"));
+    assert.equal(structuredAfter?.type, "dynamic_tool");
+    const structuredBlock =
+      structuredAfter?.type === "dynamic_tool" && Array.isArray(structuredAfter.output)
+        ? (structuredAfter.output[0] as { type: string; text: string })
+        : undefined;
+    assert.equal(structuredBlock?.type, "text");
+    assert.isTrue(structuredBlock?.text.startsWith("head:" + "x".repeat(4091)));
+    assert.isTrue(structuredBlock?.text.endsWith("x".repeat(4091) + ":tail"));
+    assert.include(structuredBlock?.text ?? "", "removed 31818 characters");
     assert.deepEqual(
-      items.find((item) => item.type === "dynamic_tool"),
-      structuredBefore,
+      items.find((item) => item.id.endsWith(":structured-small")),
+      smallStructuredBefore,
     );
     assert.deepEqual(yield* projections.getThreadProjection(recentId), recent);
     assert.deepEqual(yield* projections.getThreadProjection(activeId), active);
 
     assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 0);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "compacts structured dynamic_tool object and array outputs while preserving UI metadata",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const threadId = ThreadId.make("thread:structured");
+      const createdAt = yield* DateTime.now;
+      const settled = {
+        ...makeThread(threadId, createdAt),
+        settledOverride: "settled" as const,
+        settledAt: createdAt,
+      };
+      const fileContent = "start:" + "f".repeat(30_000) + ":end";
+      const imageBase64 = "A".repeat(40_000);
+      const wideMessages = Array.from({ length: 120 }, (_, index) => ({
+        id: `msg-${index}`,
+        role: "assistant",
+        text: `message ${index}: ` + "m".repeat(250),
+      }));
+      const threadReadStructured = {
+        thread: { threadId: "thread:referenced" },
+        messages: wideMessages,
+      };
+      const mcpAppRef = {
+        attachmentId: "att-app-1",
+        server: "demo",
+        tool: "chart",
+        resourceUri: "ui://demo/chart",
+      };
+      const htmlRenderRef = {
+        attachmentId: "att-html-1",
+        title: "Report",
+        height: 400,
+      };
+
+      yield* sink.write({
+        events: [
+          { ...threadCreated(settled, createdAt), id: EventId.make("e:structured:thread") },
+          commandEvent(
+            threadId,
+            createdAt,
+            "read-file",
+            "completed",
+            {
+              type: "text",
+              file: { filePath: "/repo/index.ts", content: fileContent, numLines: 900 },
+            },
+            "Read",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "images",
+            "completed",
+            [
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: imageBase64 },
+              },
+              { type: "image", mimeType: "image/jpeg", data: imageBase64 },
+              { type: "text", text: "captured screenshot" },
+            ],
+            "cua_repl.js",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "mcp-duplicate",
+            "completed",
+            {
+              content: JSON.stringify(threadReadStructured),
+              structuredContent: threadReadStructured,
+            },
+            "mcp__t3-code__t3_thread_read",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "wide-object",
+            "completed",
+            { pull_request: { number: 42 }, comments: wideMessages },
+            "codex_apps.github.fetch_pr",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "wide-error",
+            "completed",
+            { isError: true, comments: wideMessages },
+            "codex_apps.github.fetch_pr",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "mcp-app",
+            "completed",
+            {
+              [MCP_APP_OUTPUT_KEY]: mcpAppRef,
+              result: [{ type: "image", mimeType: "image/png", data: imageBase64 }],
+            },
+            "demo.chart",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "multi-text-blocks",
+            "completed",
+            [
+              { type: "text", text: "block-1\n" + "b".repeat(8000) },
+              { type: "text", text: "block-2\n" + "c".repeat(8000) },
+              { type: "text", text: "block-3\n" + "d".repeat(8000) },
+            ],
+            "cua_repl.js",
+          ),
+          commandEvent(
+            threadId,
+            createdAt,
+            "html-render",
+            "completed",
+            { htmlRender: htmlRenderRef, logs: "z".repeat(30_000) },
+            "t3-code.html_render",
+          ),
+        ],
+      });
+
+      yield* TestClock.adjust("8 days");
+      assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 8);
+
+      const items = (yield* projections.getThreadProjection(threadId)).turnItems;
+      const itemOf = (key: string) => {
+        const found = items.find((entry) => entry.id.endsWith(`:${key}`));
+        assert.equal(found?.type, "dynamic_tool");
+        if (found?.type !== "dynamic_tool") throw new Error(`Missing dynamic_tool ${key}`);
+        return found;
+      };
+
+      // Read-style nested object keeps metadata and trims file.content.
+      const readItem = itemOf("read-file");
+      const readOut = readItem.output as {
+        type: string;
+        file: { filePath: string; content: string; numLines: number };
+      };
+      assert.equal(readOut.file.filePath, "/repo/index.ts");
+      assert.equal(readOut.file.numLines, 900);
+      assert.isTrue(readOut.file.content.startsWith("start:" + "f".repeat(4090)));
+      assert.isTrue(readOut.file.content.endsWith("f".repeat(4090) + ":end"));
+      assert.include(readOut.file.content, "removed 21818 characters");
+
+      // Embedded base64 images become text notices so clients do not request missing assets.
+      const imageItem = itemOf("images");
+      assert.deepEqual(toolOutputImages(imageItem.output), []);
+      assert.isTrue(Array.isArray(imageItem.output));
+      const imageBlocks = imageItem.output as Array<{ type: string; text: string }>;
+      assert.equal(imageBlocks.length, 3);
+      assert.include(imageBlocks[0]?.text ?? "", "removed an image (image/png, 40000 base64");
+      assert.include(imageBlocks[1]?.text ?? "", "removed an image (image/jpeg, 40000 base64");
+      assert.equal(imageBlocks[2]?.text, "captured screenshot");
+
+      // MCP content + structuredContent drops the huge duplicate and preserves thread metadata.
+      const mcpDupItem = itemOf("mcp-duplicate");
+      assert.isAtMost(JSON.stringify(mcpDupItem.output).length, 17_408);
+      assert.deepEqual(compactDynamicToolOutput(mcpDupItem.output), {
+        thread: { threadId: "thread:referenced" },
+      });
+
+      // Wide object with no single huge string still compacts under the limit.
+      const wideItem = itemOf("wide-object");
+      assert.equal(typeof wideItem.output, "string");
+      assert.isAtMost((wideItem.output as string).length, 17_408);
+      assert.include(wideItem.output as string, "T3 Code removed");
+
+      // Error flag is preserved across wide-object compaction.
+      const wideErrorItem = itemOf("wide-error");
+      assert.isAtMost(JSON.stringify(wideErrorItem.output).length, 17_408);
+      assert.equal(compactDynamicToolOutput(wideErrorItem.output)?.isError, true);
+
+      // MCP app reference stays intact while its bulky result is compacted.
+      const mcpAppItem = itemOf("mcp-app");
+      assert.deepEqual(mcpAppFromToolItem(mcpAppItem), mcpAppRef);
+      assert.isAtMost(JSON.stringify(mcpAppItem.output).length, 17_408);
+
+      // Multi-block text arrays flatten to readable text instead of escaped JSON.
+      const multiBlockItem = itemOf("multi-text-blocks");
+      assert.equal(typeof multiBlockItem.output, "string");
+      assert.isTrue((multiBlockItem.output as string).startsWith("block-1\n"));
+      assert.isAtMost((multiBlockItem.output as string).length, 17_408);
+      assert.include(multiBlockItem.output as string, "T3 Code removed");
+
+      // HTML render reference stays intact for timeline rendering and attachment retention.
+      const htmlRenderItem = itemOf("html-render");
+      assert.deepEqual(htmlRenderFromToolItem(htmlRenderItem), htmlRenderRef);
+      assert.isAtMost(JSON.stringify(htmlRenderItem.output).length, 17_408);
+
+      // Every compacted item projects cleanly for both wire snapshots and on-demand detail fetches.
+      for (const item of items) {
+        const wire = WireProjection.projectTurnItemForWire(item);
+        const detail = WireProjection.projectTurnItemForDetail(item);
+        assert.equal(wire.id, item.id);
+        assert.equal(detail.id, item.id);
+      }
+
+      // Idempotent on a second pass.
+      assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 0);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("backfills already-settled threads past the v1 watermark without rescanning", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const sql = yield* SqlClient.SqlClient;
+    const createdAt = yield* DateTime.now;
+    const oldThreadId = ThreadId.make("thread:backfill-old");
+    const oldSettled = {
+      ...makeThread(oldThreadId, createdAt),
+      settledOverride: "settled" as const,
+      settledAt: createdAt,
+    };
+    yield* sink.write({
+      events: [
+        { ...threadCreated(oldSettled, createdAt), id: EventId.make("e:bf:old") },
+        commandEvent(
+          oldThreadId,
+          createdAt,
+          "img",
+          "completed",
+          [{ type: "image", mimeType: "image/jpeg", data: "B".repeat(50_000) }],
+          "cua_repl.js",
+        ),
+      ],
+    });
+
+    // Simulate a database already compacted past oldThreadId under the v1 text-only watermark.
+    yield* TestClock.adjust("1 day");
+    const v1WatermarkAt = yield* DateTime.now;
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_metadata (
+        projection_name, schema_version, last_sequence, updated_at
+      )
+      VALUES (
+        'turn-items-compacted-before',
+        ${ProjectionStore.ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION},
+        0,
+        ${DateTime.formatIso(v1WatermarkAt)}
+      )
+    `;
+
+    const newerThreadId = ThreadId.make("thread:backfill-new");
+    const newerSettled = {
+      ...makeThread(newerThreadId, v1WatermarkAt),
+      settledOverride: "settled" as const,
+      settledAt: v1WatermarkAt,
+    };
+    yield* sink.write({
+      events: [
+        { ...threadCreated(newerSettled, v1WatermarkAt), id: EventId.make("e:bf:new") },
+        commandEvent(
+          newerThreadId,
+          v1WatermarkAt,
+          "img",
+          "completed",
+          [{ type: "image", mimeType: "image/png", data: "C".repeat(50_000) }],
+          "cua_repl.js",
+        ),
+      ],
+    });
+
+    // At +7.5 days, oldThreadId is >=7d old (behind v1 watermark) while newerThreadId is 6.5d old.
+    yield* TestClock.adjust("156 hours");
+    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 1);
+
+    const oldItem = (yield* projections.getThreadProjection(oldThreadId)).turnItems[0];
+    assert.equal(oldItem?.type, "dynamic_tool");
+    assert.deepEqual(
+      oldItem?.type === "dynamic_tool" ? toolOutputImages(oldItem.output) : null,
+      [],
+    );
+    const v2Watermark = yield* sql<{ readonly updated_at: string }>`
+      SELECT updated_at FROM orchestration_v2_projection_metadata
+      WHERE projection_name = 'turn-items-compacted-before-v2'
+    `;
+    assert.equal(v2Watermark.length, 1);
+
+    // A second immediate pass does not rescan turn items of already-backfilled threads.
+    let turnItemScans = 0;
+    const countTurnItemScans: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      if (query.includes("FROM orchestration_v2_projection_turn_items")) {
+        turnItemScans += 1;
+      }
+      return Effect.succeed(statement);
+    };
+    const secondPass = yield* maintenance
+      .pruneEventStore()
+      .pipe(Effect.provideService(Statement.CurrentTransformer, countTurnItemScans));
+    assert.equal(secondPass.compactedTurnItemCount, 0);
+    assert.equal(turnItemScans, 0);
+
+    // Once newerThreadId ages past 7 days, only it is compacted.
+    yield* TestClock.adjust("1 day");
+    assert.equal((yield* maintenance.pruneEventStore()).compactedTurnItemCount, 1);
+    const newerItem = (yield* projections.getThreadProjection(newerThreadId)).turnItems[0];
+    assert.equal(newerItem?.type, "dynamic_tool");
+    assert.deepEqual(
+      newerItem?.type === "dynamic_tool" ? toolOutputImages(newerItem.output) : null,
+      [],
+    );
   }).pipe(Effect.provide(layerTest)),
 );
 

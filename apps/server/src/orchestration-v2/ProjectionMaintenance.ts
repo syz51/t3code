@@ -1,10 +1,13 @@
 import type { ThreadId } from "@t3tools/contracts";
+import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { compactDynamicToolOutput, compactT3McpToolOutput } from "@t3tools/shared/toolOutput";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as SqlError from "effect/sql/SqlError";
@@ -89,12 +92,263 @@ const SUPERSEDED_THROUGH = "event-log-superseded-through";
 // Command-id retries replay their own events; keep recent updates for them.
 const SUPERSEDED_GRACE = Duration.hours(1);
 const SETTLED_THREAD_AGE = Duration.days(7);
-const TURN_ITEMS_COMPACTED_BEFORE = "turn-items-compacted-before";
+// Versioned so upgrading from text-only compaction backfills older settled threads once.
+const TURN_ITEMS_COMPACTED_BEFORE = "turn-items-compacted-before-v2";
 const KEPT_OUTPUT_CHARS = 8192;
 const COMPACTED_OUTPUT_MIN_CHARS = 2 * KEPT_OUTPUT_CHARS + 1024;
+const STRUCTURED_KEPT_CHARS = 4096;
+const STRUCTURED_STRING_MIN_CHARS = 2 * STRUCTURED_KEPT_CHARS + 1024;
+const DATA_URL_MIN_CHARS = 1024;
+const MAX_STRUCTURED_DEPTH = 32;
 // Each rewritten row is parsed several times; bound one statement's work by bytes.
 const UPDATE_PAGE_BYTES = 4 * 1024 * 1024;
 const SETTLED_ITEM_STATUSES = ["completed", "failed", "interrupted", "cancelled"] as const;
+const DATA_URL_BASE64_PATTERN = /^data:([^;,]{1,128})(?:;[^,]{0,128})?;base64,/i;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Predicate.isObject(value) && !Array.isArray(value);
+}
+
+function trimTextEnds(text: string, keptChars: number, minChars: number): string {
+  if (text.length <= minChars) return text;
+  if (keptChars <= 0) {
+    return `[T3 Code removed ${text.length} characters of this output once the thread had been settled for 7 days.]`;
+  }
+  let headEnd = keptChars;
+  const headLast = text.charCodeAt(headEnd - 1);
+  if (headLast >= 0xd800 && headLast <= 0xdbff) headEnd -= 1;
+  let tailStart = text.length - keptChars;
+  const tailFirst = text.charCodeAt(tailStart);
+  if (tailFirst >= 0xdc00 && tailFirst <= 0xdfff) tailStart += 1;
+  const removed = tailStart - headEnd;
+  if (removed <= 0) return text;
+  return (
+    text.slice(0, headEnd) +
+    `\n\n[T3 Code removed ${removed} characters of this output once the thread had been settled for 7 days.]\n\n` +
+    text.slice(tailStart)
+  );
+}
+
+function compactDataUrl(text: string): string | null {
+  if (text.length <= DATA_URL_MIN_CHARS) return null;
+  const match = DATA_URL_BASE64_PATTERN.exec(text);
+  if (match === null) return null;
+  return `[T3 Code removed a ${match[1]} data URL (${text.length} characters) once the thread had been settled for 7 days.]`;
+}
+
+// Replaces embedded base64 blocks with text notices rather than empty image blocks:
+// clients treat image blocks without `data` as server assets and request them via AssetAccess.
+function compactBinaryBlock(value: Record<string, unknown>): { type: "text"; text: string } | null {
+  if (value.type === "image") {
+    const source = isPlainRecord(value.source) ? value.source : undefined;
+    const data = source === undefined ? value.data : source.data;
+    if (typeof data !== "string" || data.length === 0) return null;
+    const mimeType = source === undefined ? value.mimeType : source.media_type;
+    const label =
+      typeof mimeType === "string" && mimeType.trim() !== "" ? `${mimeType.trim()}, ` : "";
+    return {
+      type: "text",
+      text: `[T3 Code removed an image (${label}${data.length} base64 characters) once the thread had been settled for 7 days.]`,
+    };
+  }
+  if (
+    value.type === "document" &&
+    isPlainRecord(value.source) &&
+    value.source.type === "base64" &&
+    typeof value.source.data === "string" &&
+    value.source.data.length > 0
+  ) {
+    const mimeType = value.source.media_type;
+    const label =
+      typeof mimeType === "string" && mimeType.trim() !== "" ? `${mimeType.trim()}, ` : "";
+    return {
+      type: "text",
+      text: `[T3 Code removed a document (${label}${value.source.data.length} base64 characters) once the thread had been settled for 7 days.]`,
+    };
+  }
+  if (
+    value.type === "resource" &&
+    isPlainRecord(value.resource) &&
+    typeof value.resource.blob === "string" &&
+    value.resource.blob.length > 0
+  ) {
+    const details = [
+      typeof value.resource.uri === "string" && value.resource.uri.trim() !== ""
+        ? value.resource.uri.trim()
+        : undefined,
+      typeof value.resource.mimeType === "string" && value.resource.mimeType.trim() !== ""
+        ? value.resource.mimeType.trim()
+        : undefined,
+      `${value.resource.blob.length} base64 characters`,
+    ].filter((part): part is string => part !== undefined);
+    return {
+      type: "text",
+      text: `[T3 Code removed a binary resource (${details.join(", ")}) once the thread had been settled for 7 days.]`,
+    };
+  }
+  return null;
+}
+
+function compactStructuredValue(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return (
+      compactDataUrl(value) ??
+      trimTextEnds(value, STRUCTURED_KEPT_CHARS, STRUCTURED_STRING_MIN_CHARS)
+    );
+  }
+  if (depth >= MAX_STRUCTURED_DEPTH) return value;
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((entry) => {
+      const compacted = compactStructuredValue(entry, depth + 1);
+      if (compacted !== entry) changed = true;
+      return compacted;
+    });
+    return changed ? next : value;
+  }
+  if (!isPlainRecord(value)) return value;
+  const binaryNotice = compactBinaryBlock(value);
+  if (binaryNotice !== null) return binaryNotice;
+  let changed = false;
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const compacted = compactStructuredValue(entry, depth + 1);
+    if (compacted !== entry) changed = true;
+    next[key] = compacted;
+  }
+  return changed ? next : value;
+}
+
+function wrapWithPreservedMetadata(
+  sourceText: string,
+  preserved: Record<string, unknown> | undefined,
+): unknown {
+  if (preserved === undefined) {
+    return trimTextEnds(sourceText, KEPT_OUTPUT_CHARS, COMPACTED_OUTPUT_MIN_CHARS);
+  }
+  const hasNonErrorMetadata = Object.keys(preserved).some((key) => key !== "isError");
+  const isError = preserved.isError === true;
+  const build = (content: string) =>
+    hasNonErrorMetadata
+      ? { ...(isError ? { isError: true } : {}), content, structuredContent: preserved }
+      : { ...(isError ? { isError: true } : {}), content };
+  for (let kept = STRUCTURED_KEPT_CHARS; ; kept = Math.floor(kept / 2)) {
+    const wrapped = build(trimTextEnds(sourceText, kept, kept === 0 ? 0 : 2 * kept + 1024));
+    const serialized = JSON.stringify(wrapped);
+    if (serialized !== undefined && serialized.length <= COMPACTED_OUTPUT_MIN_CHARS) {
+      return wrapped;
+    }
+    if (kept === 0) return wrapped;
+  }
+}
+
+function hasNonEmptyContent(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  return Array.isArray(value) && value.length > 0;
+}
+
+function plainTextFromBlocks(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts: Array<string> = [];
+    for (const entry of value) {
+      if (!isPlainRecord(entry) || entry.type !== "text" || typeof entry.text !== "string") {
+        return null;
+      }
+      parts.push(entry.text);
+    }
+    return parts.join("\n");
+  }
+  if (isPlainRecord(value) && "content" in value) {
+    return plainTextFromBlocks(value.content);
+  }
+  return null;
+}
+
+function compactStructuredToolOutput(
+  output: unknown,
+  toolName: string | null,
+): { readonly changed: boolean; readonly value: unknown } {
+  if (output === null || typeof output !== "object") return { changed: false, value: output };
+  const originalSerialized = JSON.stringify(output);
+  if (originalSerialized === undefined || originalSerialized.length <= COMPACTED_OUTPUT_MIN_CHARS) {
+    return { changed: false, value: output };
+  }
+  // Keep MCP app references intact so clients and attachment retention keep resolving them.
+  if (isPlainRecord(output) && MCP_APP_OUTPUT_KEY in output && "result" in output) {
+    const result = output.result;
+    const compactedResult =
+      typeof result === "string"
+        ? trimTextEnds(result, KEPT_OUTPUT_CHARS, COMPACTED_OUTPUT_MIN_CHARS)
+        : compactStructuredToolOutput(result, toolName).value;
+    if (compactedResult === result) return { changed: false, value: output };
+    return { changed: true, value: { ...output, result: compactedResult } };
+  }
+  const preservedRaw = compactT3McpToolOutput(toolName, output) ?? compactDynamicToolOutput(output);
+  const preserved =
+    preservedRaw === undefined ? undefined : ({ ...preservedRaw } as Record<string, unknown>);
+
+  let compacted = compactStructuredValue(output);
+  let compactedJson = JSON.stringify(compacted);
+  if (compactedJson === undefined) return { changed: false, value: output };
+
+  // MCP tools often duplicate the same payload in `content` and `structuredContent`.
+  if (
+    compactedJson.length > COMPACTED_OUTPUT_MIN_CHARS &&
+    isPlainRecord(compacted) &&
+    "content" in compacted &&
+    "structuredContent" in compacted &&
+    hasNonEmptyContent(compacted.content)
+  ) {
+    const hasNonErrorMetadata =
+      preserved !== undefined && Object.keys(preserved).some((key) => key !== "isError");
+    const isError =
+      preserved?.isError === true || compacted.isError === true || compacted.is_error === true;
+    const slimmed = hasNonErrorMetadata
+      ? {
+          ...(isError ? { isError: true } : {}),
+          content: compacted.content,
+          structuredContent: preserved,
+        }
+      : isError
+        ? { isError: true, content: compacted.content }
+        : { content: compacted.content };
+    const slimmedJson = JSON.stringify(slimmed);
+    if (slimmedJson !== undefined) {
+      compacted = slimmed;
+      compactedJson = slimmedJson;
+    }
+  }
+
+  if (compactedJson.length > COMPACTED_OUTPUT_MIN_CHARS) {
+    const sourceText = plainTextFromBlocks(compacted) ?? compactedJson;
+    compacted = wrapWithPreservedMetadata(sourceText, preserved);
+    compactedJson = JSON.stringify(compacted) ?? compactedJson;
+  }
+
+  return compactedJson === originalSerialized
+    ? { changed: false, value: output }
+    : { changed: true, value: compacted };
+}
+
+function compactStructuredOutputJson(
+  outputJson: string,
+  toolName: string | null,
+): { readonly isText: boolean; readonly serialized: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(outputJson);
+  } catch {
+    return null;
+  }
+  const result = compactStructuredToolOutput(parsed, toolName);
+  if (!result.changed) return null;
+  if (typeof result.value === "string") {
+    return { isText: true, serialized: result.value };
+  }
+  const serialized = JSON.stringify(result.value);
+  return serialized === undefined ? null : { isText: false, serialized };
+}
 
 type MetadataRow = {
   readonly projection_name: string;
@@ -420,7 +674,7 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
     );
 
     // Threads settled and untouched for SETTLED_THREAD_AGE keep their transcript, but each long
-    // text tool output keeps only its ends and reasoning text is cleared. Clients render both.
+    // tool output (text or structured object/array) is compacted and reasoning text is cleared.
     const compactSettledTurnItems = Effect.fn("ProjectionMaintenance.compactSettledTurnItems")(
       function* (now: DateTime.Utc, betweenPages: Effect.Effect<void>) {
         const cutoff = DateTime.subtractDuration(now, SETTLED_THREAD_AGE);
@@ -430,14 +684,15 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
           FROM orchestration_v2_projection_metadata
           WHERE projection_name = ${TURN_ITEMS_COMPACTED_BEFORE}
         `.pipe(NodeSqliteClient.readOnly);
+        const previousIso = previous[0]?.updated_at ?? "";
         // Settling bumps updated_at, so a thread settled later enters a later window.
         const threads = yield* sql<{ readonly thread_id: string }>`
           SELECT thread_id FROM orchestration_v2_projection_threads
-          WHERE updated_at < ${cutoffIso} AND updated_at >= ${previous[0]?.updated_at ?? ""}
+          WHERE updated_at < ${cutoffIso} AND updated_at >= ${previousIso}
             AND json_extract(payload_json, '$.settledAt') IS NOT NULL
         `.pipe(NodeSqliteClient.readOnly);
         const output = sql`json_extract(payload_json, '$.output')`;
-        const compactable = sql`
+        const compactableTextOrReasoning = sql`
           status IN ${sql.in(SETTLED_ITEM_STATUSES)}
           AND (
             (type IN ('command_execution', 'dynamic_tool')
@@ -446,9 +701,39 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
             OR (type = 'reasoning' AND json_extract(payload_json, '$.text') <> '')
           )
         `;
+        const compactableStructured = sql`
+          status IN ${sql.in(SETTLED_ITEM_STATUSES)}
+          AND type = 'dynamic_tool'
+          AND length(payload_json) > ${COMPACTED_OUTPUT_MIN_CHARS}
+          AND json_type(payload_json, '$.output') IN ('object', 'array')
+          AND length(${output}) > ${COMPACTED_OUTPUT_MIN_CHARS}
+        `;
+        const batchByBytes = (
+          entries: ReadonlyArray<{ readonly turn_item_id: string; readonly size: number }>,
+        ) => {
+          const pages: Array<Array<string>> = [];
+          let pageBytes = 0;
+          for (const item of entries) {
+            const page = pages.at(-1);
+            if (
+              page === undefined ||
+              page.length >= PAGE_SIZE ||
+              pageBytes + item.size > UPDATE_PAGE_BYTES
+            ) {
+              pages.push([item.turn_item_id]);
+              pageBytes = item.size;
+            } else {
+              page.push(item.turn_item_id);
+              pageBytes += item.size;
+            }
+          }
+          return pages;
+        };
         let compacted = 0;
         for (const { thread_id: threadId } of threads) {
-          const items: Array<{ readonly turn_item_id: string; readonly size: number }> = [];
+          const textItems: Array<{ readonly turn_item_id: string; readonly size: number }> = [];
+          const structuredItems: Array<{ readonly turn_item_id: string; readonly size: number }> =
+            [];
           let cursor: { readonly ordinal: number; readonly id: string } | undefined;
           for (;;) {
             const rows = yield* sql<{
@@ -468,34 +753,41 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
             `.pipe(NodeSqliteClient.readOnly);
             const last = rows.at(-1);
             if (last !== undefined) {
-              const page = yield* sql<{ readonly turn_item_id: string; readonly size: number }>`
-                SELECT turn_item_id, length(payload_json) AS size
+              const page = yield* sql<{
+                readonly turn_item_id: string;
+                readonly size: number;
+                readonly structured: number;
+              }>`
+                SELECT
+                  turn_item_id,
+                  length(payload_json) AS size,
+                  CASE
+                    WHEN type = 'dynamic_tool'
+                      AND json_type(payload_json, '$.output') IN ('object', 'array')
+                    THEN 1
+                    ELSE 0
+                  END AS structured
                 FROM orchestration_v2_projection_turn_items
-                WHERE turn_item_id IN ${sql.in(rows.map((row) => row.turn_item_id))} AND ${compactable}
+                WHERE turn_item_id IN ${sql.in(rows.map((row) => row.turn_item_id))}
+                  AND ((${compactableTextOrReasoning}) OR (${compactableStructured}))
               `.pipe(NodeSqliteClient.readOnly);
-              items.push(...page);
+              for (const item of page) {
+                if (item.structured === 1) structuredItems.push(item);
+                else textItems.push(item);
+              }
               cursor = { ordinal: last.ordinal, id: last.turn_item_id };
             }
             yield* betweenPages;
             if (rows.length < PAGE_SIZE) break;
           }
-          const pages: Array<Array<string>> = [];
-          let pageBytes = 0;
-          for (const item of items) {
-            const page = pages.at(-1);
-            if (
-              page === undefined ||
-              page.length >= PAGE_SIZE ||
-              pageBytes + item.size > UPDATE_PAGE_BYTES
-            ) {
-              pages.push([item.turn_item_id]);
-              pageBytes = item.size;
-            } else {
-              page.push(item.turn_item_id);
-              pageBytes += item.size;
-            }
-          }
-          for (const ids of pages) {
+          const threadStillSettled = sql`
+            EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_threads AS thread
+              WHERE thread.thread_id = ${threadId} AND thread.updated_at < ${cutoffIso}
+                AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
+            )
+          `;
+          for (const ids of batchByBytes(textItems)) {
             // Rechecks the thread so one that resumed during the pass keeps its items.
             const updated = yield* sql<{ readonly turn_item_id: string }>`
               UPDATE orchestration_v2_projection_turn_items
@@ -512,21 +804,78 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
                 )
               END
               WHERE turn_item_id IN ${sql.in(ids)}
-                AND ${compactable}
+                AND ${compactableTextOrReasoning}
                 AND (type = 'reasoning' OR length(${output}) > ${COMPACTED_OUTPUT_MIN_CHARS})
-                AND EXISTS (
-                  SELECT 1 FROM orchestration_v2_projection_threads AS thread
-                  WHERE thread.thread_id = ${threadId} AND thread.updated_at < ${cutoffIso}
-                    AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
-                )
+                AND ${threadStillSettled}
               RETURNING turn_item_id
             `;
             compacted += updated.length;
             yield* Effect.yieldNow;
             yield* betweenPages;
           }
+          for (const ids of batchByBytes(structuredItems)) {
+            const rows = yield* sql<{
+              readonly turn_item_id: string;
+              readonly updated_at: string;
+              readonly tool_name: string | null;
+              readonly output_json: string | null;
+            }>`
+              SELECT
+                turn_item_id,
+                updated_at,
+                json_extract(payload_json, '$.toolName') AS tool_name,
+                ${output} AS output_json
+              FROM orchestration_v2_projection_turn_items
+              WHERE turn_item_id IN ${sql.in(ids)} AND ${compactableStructured}
+            `.pipe(NodeSqliteClient.readOnly);
+            yield* Effect.yieldNow;
+            const updates: Array<{
+              readonly turnItemId: string;
+              readonly updatedAt: string;
+              readonly isText: boolean;
+              readonly serialized: string;
+            }> = [];
+            for (const row of rows) {
+              if (row.output_json === null) continue;
+              const next = compactStructuredOutputJson(row.output_json, row.tool_name);
+              if (next !== null) {
+                updates.push({
+                  turnItemId: row.turn_item_id,
+                  updatedAt: row.updated_at,
+                  ...next,
+                });
+              }
+            }
+            if (updates.length > 0) {
+              compacted += yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  let count = 0;
+                  for (const update of updates) {
+                    const nextValue = update.isText
+                      ? sql`${update.serialized}`
+                      : sql`json(${update.serialized})`;
+                    const updated = yield* sql<{ readonly turn_item_id: string }>`
+                      UPDATE orchestration_v2_projection_turn_items
+                      SET payload_json = json_set(payload_json, '$.output', ${nextValue})
+                      WHERE turn_item_id = ${update.turnItemId}
+                        AND updated_at = ${update.updatedAt}
+                        AND ${compactableStructured}
+                        AND ${threadStillSettled}
+                      RETURNING turn_item_id
+                    `;
+                    count += updated.length;
+                  }
+                  return count;
+                }),
+              );
+              yield* Effect.yieldNow;
+            }
+            yield* betweenPages;
+          }
         }
-        yield* writeMetadata(TURN_ITEMS_COMPACTED_BEFORE, 0, cutoff);
+        if (previousIso === "" || cutoffIso > previousIso) {
+          yield* writeMetadata(TURN_ITEMS_COMPACTED_BEFORE, 0, cutoff);
+        }
         return compacted;
       },
     );

@@ -227,9 +227,17 @@ runs the same pass. They stop older history from growing; they do not make the f
   handles them).
 - **Settled threads.** For a settled thread unchanged for 7 days, each finished command or tool
   text output longer than 17,408 characters keeps its first and last 8,192 characters, with a
-  note saying how much was removed. Structured tool output, such as images, stays. Reasoning text
-  becomes empty and shows as a "Thinking" row. Messages, diffs and checkpoints stay. Removed
-  output cannot be recovered.
+  note saying how much was removed. Finished `dynamic_tool` structured object and array outputs
+  longer than 17,408 characters are also compacted: embedded base64 images, documents, binary
+  resources, and long `data:...;base64,...` URLs are replaced with text notices (avoiding broken
+  image asset fetches when inspecting the row), string fields longer than 9,216 characters keep
+  their first and last 4,096 characters, redundant `structuredContent` copies are dropped when
+  `content` carries the output, and outputs still larger than 17,408 characters are trimmed to
+  their ends while preserving T3 metadata (`htmlRender`, `t3McpApp`, `sentMessage`,
+  `preview_recording_stop`, `isError`, and thread/task references). The watermark is versioned
+  (`turn-items-compacted-before-v2`) so upgrading backfills already-settled threads once without
+  re-scanning them on later passes. Reasoning text becomes empty and shows as a "Thinking" row.
+  Messages, diffs and checkpoints stay. Removed output cannot be recovered.
 - **Antigravity ACP session files.** The fork also runs
   [AntigravitySessionRetention](../../apps/server/src/provider/acp/AntigravitySessionRetention.ts)
   alongside the 6-hourly compaction pass, in `t3 doctor`, and immediately on `thread.deleted`
