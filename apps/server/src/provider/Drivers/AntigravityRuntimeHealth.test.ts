@@ -70,6 +70,8 @@ const makeHarness = Effect.fn("AntigravityRuntimeHealthTest.makeHarness")(functi
         file,
         [
           "#!/bin/sh",
+          // Fork's CLI usage probe calls `-p /usage` on refresh; exit immediately instead of starting the ACP mock.
+          'if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then exit 1; fi',
           ...(threadLauncher
             ? [
                 `if [ -n "$T3CODE_THREAD_ID" ]; then export T3_ACP_AGENT_VERSION=1.5.12; exec ${shellQuote(node)} ${shellQuote(agent)} "$@"; fi`,
