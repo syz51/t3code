@@ -187,6 +187,7 @@
     "@types/ws@^8": "catalog:",
     "@vercel/config>zod": "4.6.7",
     "@vercel/routing-utils>path-to-regexp": "6.3.0",
+    "@vitest/browser": "5.1.1",
     "alchemy": "catalog:",
     "app-builder-lib": "26.16.1",
     "dbus-next": "0.10.2",
@@ -287,7 +288,8 @@
     "gt-react-native@11.4.18": "patches/gt-react-native@11.4.18.patch",
     "effect@4.1.5": "patches/effect@4.1.5.patch",
     "@generaltranslation/format@0.1.9": "patches/@generaltranslation__format@0.1.9.patch",
-    "gt-i18n@1.0.40": "patches/gt-i18n@1.0.40.patch"
+    "gt-i18n@1.0.40": "patches/gt-i18n@1.0.40.patch",
+    "@vitest/browser@5.1.1": "patches/@vitest__browser@5.1.1.patch"
   },
   "trustedDependencies": [
     "esbuild",

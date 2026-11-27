@@ -17,6 +17,7 @@ import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -41,15 +42,18 @@ import {
   antigravityAuthUsesBrowser,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
+  prepareAntigravityCliUsageEnv,
   prepareAntigravityProfile,
   resolveAntigravityInstanceDirectories,
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
   antigravityModelOptions,
+  antigravityServesT3Code,
   antigravitySessionMode,
   antigravityThinkingConfig,
   makeAntigravityAcpRuntime,
+  OPEN_MODEL_ACCESS_RELEASE,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -66,9 +70,13 @@ import {
 } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
-import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import {
+  AntigravityProbeIncompatibility,
+  makeAntigravityProvider,
+} from "../AntigravityProvider.ts";
 import {
   attachAntigravityCliUsageLimits,
+  getSharedAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
 } from "../antigravityCliUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -93,17 +101,6 @@ const RememberedRuntimeModes = Schema.fromJsonString(
 );
 const decodeRememberedRuntimeModes = Schema.decodeUnknownOption(RememberedRuntimeModes);
 const encodeRememberedRuntimeModes = Schema.encodeSync(RememberedRuntimeModes);
-const CliOAuthTokenFile = Schema.fromJsonString(
-  Schema.Struct({
-    token: Schema.Struct({
-      access_token: Schema.NonEmptyString,
-      refresh_token: Schema.optional(Schema.String),
-      expiry: Schema.optional(Schema.String),
-    }),
-    id_token_email: Schema.optional(Schema.String),
-  }),
-);
-const decodeCliOAuthTokenFile = Schema.decodeUnknownOption(CliOAuthTokenFile);
 const REFRESH_FAILED =
   "Could not refresh Antigravity models. The previous model list is unchanged.";
 const PYTHON_SOCKS_REQUIRED = "python-socks is required to use a SOCKS proxy";
@@ -253,6 +250,7 @@ export const AntigravityDriver: ProviderDriver<
           detail: authConfigIssue,
         });
       }
+      // Thread variables affect the child environment, while health and startup select the same provider executable.
       const executable = yield* installation.acquire(settings.binaryPath, processEnvironment).pipe(
         Effect.mapError(
           (cause) =>
@@ -270,9 +268,7 @@ export const AntigravityDriver: ProviderDriver<
         auth,
         userHome,
         tempDirectory: directories.runtimeTemp,
-        ...(isolatedProfileDirectory === undefined
-          ? {}
-          : { isolatedSourceProfileDirectory: profileDirectory }),
+        ...(isolatedProfileDirectory === undefined ? {} : { skipUserConfigLinks: true }),
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -326,6 +322,57 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    const runtimeIncompatibility = Effect.fn("AntigravityDriver.runtimeIncompatibility")(function* (
+      executable: AntigravityInstallation.AntigravityExecutable,
+      version: string | null | undefined,
+    ) {
+      if (!version) return;
+      const advisory = yield* installation.compatibility(version);
+      const action =
+        executable.source === "managed"
+          ? "Update it in Antigravity setup"
+          : `Update the Antigravity executable at ${executable.executablePath}`;
+      const refused = brokenRuntimeError({
+        instanceId,
+        name: "Antigravity",
+        version,
+        advisory,
+        action,
+      });
+      if (refused) return refused;
+      if (!antigravityServesT3Code(version)) {
+        return new ProviderSetupError({
+          instanceId,
+          operation: "runtime",
+          detail: `Antigravity ${version} only serves allowlisted editors, not T3 Code. ${action} to ${OPEN_MODEL_ACCESS_RELEASE.join(".")} or newer, then retry.`,
+        });
+      }
+    });
+
+    const externalExecutableIdentity = Effect.fn("AntigravityDriver.externalExecutableIdentity")(
+      function* (executablePath: string) {
+        const target = yield* fileSystem.realPath(executablePath);
+        const info = yield* fileSystem.stat(target);
+        return {
+          executablePath,
+          target,
+          device: info.dev,
+          inode: info.ino.valueOrUndefined,
+          size: info.size,
+          modifiedAt: info.mtime.valueOrUndefined?.getTime(),
+        };
+      },
+      Effect.orElseSucceed(() => undefined),
+    );
+    let nextExternalAttempt = 0;
+    let completedExternalAttempt = 0;
+    type ExternalExecutableIdentity = NonNullable<
+      Effect.Success<ReturnType<typeof externalExecutableIdentity>>
+    >;
+    let rejectedExternalRuntime:
+      | { readonly identity: ExternalExecutableIdentity; readonly version: string }
+      | undefined;
+
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
       input: AntigravityAdapterV2RuntimeInput & { readonly isolatedProfileDirectory?: string },
     ): Effect.fn.Return<
@@ -351,27 +398,24 @@ export const AntigravityDriver: ProviderDriver<
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
-        runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
         spawn,
       }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
-      // A custom or PATH executable has no version until it answers initialize.
       const startCompatible = Effect.fn("AntigravityDriver.startCompatible")(function* () {
+        // A launcher can select a different runtime based on the thread's environment.
+        const observeVersion = executable.version === null && threadEnvironment === undefined;
+        const attempt = observeVersion ? ++nextExternalAttempt : 0;
+        const identity = observeVersion
+          ? yield* externalExecutableIdentity(executable.executablePath)
+          : undefined;
         const version = (yield* runtime.initialize()).agentInfo?.version;
-        const advisory = version ? yield* installation.compatibility(version) : undefined;
-        const refused =
-          version &&
-          brokenRuntimeError({
-            instanceId,
-            name: "Antigravity",
-            version,
-            advisory,
-            action:
-              executable.source === "managed"
-                ? "Update it in Antigravity setup"
-                : `Update the Antigravity executable at ${executable.executablePath}`,
-          });
+        const refused = yield* runtimeIncompatibility(executable, version);
+        // An unversioned or late handshake cannot supersede a known version.
+        if (version && identity && attempt > completedExternalAttempt) {
+          completedExternalAttempt = attempt;
+          rejectedExternalRuntime = refused ? { identity, version } : undefined;
+        }
         if (refused) {
           return yield* new AcpErrors.AcpTransportError({ detail: refused.detail, cause: refused });
         }
@@ -578,8 +622,35 @@ export const AntigravityDriver: ProviderDriver<
             }),
         ),
       );
+      const previousRejection = rejectedExternalRuntime;
+      const identity =
+        executable.version === null && previousRejection
+          ? yield* externalExecutableIdentity(executable.executablePath)
+          : undefined;
+      const rememberedVersion =
+        rejectedExternalRuntime && Equal.equals(rejectedExternalRuntime.identity, identity)
+          ? rejectedExternalRuntime.version
+          : undefined;
+      const invalidatedVersion =
+        previousRejection &&
+        previousRejection === rejectedExternalRuntime &&
+        identity &&
+        rememberedVersion === undefined
+          ? previousRejection.version
+          : undefined;
+      if (invalidatedVersion !== undefined || executable.version !== null) {
+        rejectedExternalRuntime = undefined;
+      }
+      const version = executable.version ?? rememberedVersion;
+      if (version) {
+        const refused = yield* runtimeIncompatibility(executable, version);
+        if (refused) {
+          return yield* new AntigravityProbeIncompatibility({ version, detail: refused.detail });
+        }
+      }
       return {
         protocolVersion: 1,
+        ...(invalidatedVersion === undefined ? {} : { invalidatedVersion }),
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: true, audio: false, embeddedContext: true },
@@ -589,88 +660,10 @@ export const AntigravityDriver: ProviderDriver<
         agentInfo: {
           name: "antigravity-acp",
           title: "Google Antigravity",
-          version: executable.version ?? "unknown",
+          version: version ?? "unknown",
         },
       };
     });
-
-    const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
-    const cliTokenPath = path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token");
-    const readAccountEmail = Effect.gen(function* () {
-      if (auth.authMethod !== "oauth-personal" && auth.authMethod !== "oauth-business") {
-        return undefined;
-      }
-      if (yield* fileSystem.exists(tokenPath)) return undefined;
-      if (!(yield* fileSystem.exists(cliTokenPath))) return undefined;
-      const contents = yield* fileSystem.readFileString(cliTokenPath);
-      const email = Option.getOrUndefined(
-        decodeCliOAuthTokenFile(contents),
-      )?.id_token_email?.trim();
-      return email && email.length > 0 ? email : undefined;
-    }).pipe(Effect.orElseSucceed(() => undefined));
-
-    const readCliTokenRecord = (filePath: string) =>
-      fileSystem.readFileString(filePath).pipe(
-        Effect.map((contents) =>
-          decodeCliOAuthTokenFile(contents).pipe(
-            Option.map((decoded) => ({
-              contents,
-              refreshToken: decoded.token.refresh_token?.trim() || undefined,
-              expiryMs: Date.parse(decoded.token.expiry ?? ""),
-              email: decoded.id_token_email?.trim().toLowerCase() || undefined,
-            })),
-            Option.getOrUndefined,
-          ),
-        ),
-        Effect.orElseSucceed(() => undefined),
-      );
-
-    const syncRenewedCliToken = Effect.fn("AntigravityDriver.syncRenewedCliToken")(
-      function* (input: {
-        readonly sourceTokenPath: string;
-        readonly isolatedTokenPath: string;
-        readonly originalSource:
-          | {
-              readonly refreshToken: string | undefined;
-              readonly email: string | undefined;
-            }
-          | undefined;
-      }) {
-        if (input.originalSource === undefined) return false;
-        const isolated = yield* readCliTokenRecord(input.isolatedTokenPath);
-        if (isolated === undefined || !Number.isFinite(isolated.expiryMs)) return false;
-        const currentSource = yield* readCliTokenRecord(input.sourceTokenPath);
-        if (currentSource === undefined) return false;
-        if (
-          (input.originalSource.refreshToken !== undefined &&
-            currentSource.refreshToken !== input.originalSource.refreshToken) ||
-          (input.originalSource.email !== undefined &&
-            currentSource.email !== input.originalSource.email) ||
-          (isolated.email !== undefined &&
-            currentSource.email !== undefined &&
-            isolated.email !== currentSource.email)
-        ) {
-          return false;
-        }
-        if (
-          Number.isFinite(currentSource.expiryMs) &&
-          isolated.expiryMs <= currentSource.expiryMs
-        ) {
-          return false;
-        }
-        yield* writeFileStringAtomically({
-          filePath: input.sourceTokenPath,
-          contents: isolated.contents,
-        }).pipe(
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, path),
-        );
-        if ((yield* HostProcess.Platform) !== "win32") {
-          yield* fileSystem.chmod(input.sourceTokenPath, 0o600).pipe(Effect.ignore);
-        }
-        return true;
-      },
-    );
 
     const makeIsolatedProfileDirectory = Effect.fn(
       "AntigravityDriver.makeIsolatedProfileDirectory",
@@ -711,7 +704,6 @@ export const AntigravityDriver: ProviderDriver<
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
-      readAccountEmail,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>
@@ -735,37 +727,85 @@ export const AntigravityDriver: ProviderDriver<
           }),
       ),
     );
+    const hostPlatform = yield* HostProcess.Platform;
     const cliUsage = yield* makeAntigravityCliUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
-      readAccountEmail,
-      prepareIsolatedSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* (
-        cwd: string,
-      ) {
-        const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
-          "usage-profile-",
-          "Could not create an isolated Antigravity usage profile.",
+      readAccountEmail: baseProvider.snapshot.getSnapshot.pipe(
+        Effect.map((snapshot) => snapshot.auth.email),
+      ),
+      cache: getSharedAntigravityCliUsageCache(installation),
+      platform: hostPlatform,
+      prepareSpawn: Effect.fn("AntigravityDriver.prepareUsageSpawn")(function* () {
+        if (authConfigIssue !== null) {
+          return yield* new ProviderSetupError({
+            instanceId,
+            operation: "configure",
+            detail: authConfigIssue,
+          });
+        }
+        const executable = yield* installation
+          .acquire(settings.binaryPath, processEnvironment)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "resolve",
+                  detail: cause.detail,
+                  cause,
+                }),
+            ),
+          );
+        yield* fileSystem
+          .makeDirectory(directories.runtimeTemp, { recursive: true, mode: 0o700 })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          );
+        const runtimeTempDirectory = yield* Effect.acquireRelease(
+          fileSystem.makeTempDirectory({ directory: directories.runtimeTemp, prefix: "run-" }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "start",
+                  detail: "Could not create an Antigravity runtime temp directory.",
+                  cause,
+                }),
+            ),
+          ),
+          (directory) =>
+            fileSystem
+              .remove(directory, { recursive: true, force: true })
+              .pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("Could not remove an Antigravity runtime temp directory."),
+                ),
+              ),
         );
-        const isolatedTokenPath = path.join(
-          isolatedProfileDirectory,
-          "antigravity-acp",
-          "antigravity-oauth-token",
+        const env = yield* prepareAntigravityCliUsageEnv({
+          baseEnv: processEnvironment,
+          runtimeTempDirectory,
+          platform: hostPlatform,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
         );
-        const originalSource = yield* readCliTokenRecord(cliTokenPath);
-        const { spawn } = yield* prepareSpawn(cwd, processEnvironment, isolatedProfileDirectory);
         return {
-          spawn,
-          isolatedProfileDirectory,
-          onAfterExit: syncRenewedCliToken({
-            sourceTokenPath: cliTokenPath,
-            isolatedTokenPath,
-            originalSource,
-          }).pipe(Effect.ignore),
+          command: executable.executablePath,
+          env,
         };
       }),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.provideService(Digest.Digest, digest),
     );
@@ -817,23 +857,6 @@ export const AntigravityDriver: ProviderDriver<
         const isolatedProfileDirectory = yield* makeIsolatedProfileDirectory(
           "text-profile-",
           "Could not create an isolated Antigravity text generation profile.",
-        );
-        const isolatedTokenPath = path.join(
-          isolatedProfileDirectory,
-          "antigravity-acp",
-          "antigravity-oauth-token",
-        );
-        const originalSource = yield* readCliTokenRecord(cliTokenPath);
-        // Registered before makeRuntime so LIFO syncs after the child exits and before temp removal.
-        yield* Effect.addFinalizer(() =>
-          syncRenewedCliToken({
-            sourceTokenPath: cliTokenPath,
-            isolatedTokenPath,
-            originalSource,
-          }).pipe(
-            Effect.flatMap((synced) => (synced ? provider.onTokenRefreshed : Effect.void)),
-            Effect.ignore,
-          ),
         );
         return yield* makeRuntime({
           cwd,

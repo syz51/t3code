@@ -8,6 +8,7 @@ import { Command, Flag, GlobalFlag, Prompt } from "effect/cli";
 
 import * as BootService from "../cloud/bootService.ts";
 import * as DatabaseMaintenance from "../persistence/DatabaseMaintenance.ts";
+import * as AntigravitySessionRetention from "../provider/acp/AntigravitySessionRetention.ts";
 import * as ServerOwnership from "../serverOwnership.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
@@ -69,9 +70,16 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
   const databasePath = paths.dbPath;
   const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
   const status = yield* maintenance.inspect(databasePath);
+  const antigravity =
+    yield* AntigravitySessionRetention.inspectAntigravitySessionsOffline(databasePath);
   yield* Console.log(
     `Database: ${formatBytes(status.databaseBytes)}, ${formatBytes(status.reclaimableBytes)} reclaimable.`,
   );
+  if (antigravity.prunableSessions > 0) {
+    yield* Console.log(
+      `Antigravity sessions: ${antigravity.prunableSessions} expired (${formatBytes(antigravity.reclaimableBytes)} reclaimable).`,
+    );
+  }
   const legacyRecords = status.legacyOnlyRecords;
   if (status.legacyDatabaseBytes !== null) {
     yield* Console.log(
@@ -102,6 +110,16 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
             recommended:
               !status.incrementalVacuumEnabled ||
               status.reclaimableBytes >= DATABASE_COMPACTION_RECOMMENDED_BYTES,
+          },
+        ]),
+    ...(antigravity.prunableSessions === 0
+      ? []
+      : [
+          {
+            id: "antigravity" as const,
+            title: "Prune expired Antigravity session files",
+            description: `Frees ${formatBytes(antigravity.reclaimableBytes)} across ${antigravity.prunableSessions} expired or orphaned Antigravity session(s) while preserving user artifacts and cached usage history.`,
+            recommended: true,
           },
         ]),
     ...(status.legacyDatabaseBytes === null ||
@@ -158,9 +176,13 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
     );
     return;
   }
-  if (selected.includes("database")) {
+  const runDatabase = selected.includes("database");
+  const runAntigravity = selected.includes("antigravity");
+  if (runDatabase || runAntigravity) {
     const service = yield* BootService.BootService;
-    yield* Console.log("\nReclaiming database space. Each step is shown as it starts.");
+    if (runDatabase) {
+      yield* Console.log("\nReclaiming database space. Each step is shown as it starts.");
+    }
     const startedAt = yield* Clock.monotonicTimeNanos;
     const reportStep = (step: DatabaseMaintenance.DatabaseCompactStep) =>
       Clock.monotonicTimeNanos.pipe(
@@ -171,15 +193,28 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
     // Report the repair before restarting, which can fail independently.
     yield* service.withStopped(
       lockServerHome(paths).pipe(
-        Effect.andThen(maintenance.compact(databasePath, reportStep)),
-        Effect.tap((result) =>
-          Clock.monotonicTimeNanos.pipe(
-            Effect.flatMap((now) =>
-              Console.log(
+        Effect.andThen(
+          Effect.gen(function* () {
+            if (runDatabase) {
+              const result = yield* maintenance.compact(databasePath, reportStep);
+              const now = yield* Clock.monotonicTimeNanos;
+              yield* Console.log(
                 `Done in ${formatElapsed(now - startedAt)}: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed, ${result.compactedTurnItemCount} settled turn items trimmed.`,
-              ),
-            ),
-          ),
+              );
+            }
+            if (runAntigravity) {
+              const pruned =
+                yield* AntigravitySessionRetention.pruneAntigravitySessionsOffline(databasePath);
+              const totalPruned =
+                pruned.deletedSessions +
+                pruned.prunedSettledSessions +
+                pruned.removedSubagentSessions +
+                pruned.removedOrphanSessions;
+              yield* Console.log(
+                `Pruned ${totalPruned} Antigravity session(s), reclaimed ${formatBytes(pruned.reclaimedBytes)}.`,
+              );
+            }
+          }),
         ),
         Effect.scoped,
       ),

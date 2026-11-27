@@ -14,6 +14,7 @@ import {
   displayLimitWindows,
   cursorUsageWindowDetails,
   collectProviderUsageLimits,
+  hasProviderUsageLimits,
   sameUsageLimitCommandCoverage,
   withUsageLimitsCommands,
   collectLimitAccounts,
@@ -467,6 +468,226 @@ describe("pools", () => {
     );
     expect(accounts).toHaveLength(1);
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(30);
+  });
+
+  it("merges instances sharing credentialFingerprint when only one has auth.email", () => {
+    const antigravity = ProviderDriverKind.make("antigravity");
+    const staleWithoutEmail = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravity"),
+      displayName: "Antigravity",
+      auth: { status: "authenticated", type: "oauth-personal" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [
+          { ...window, id: "gemini-5h", usedPercent: 0 },
+          { ...weekly, id: "gemini-weekly", usedPercent: 18 },
+        ],
+      },
+    });
+    const freshWithEmail = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("antigravityTextGen"),
+      displayName: "Antigravity (Titles)",
+      auth: { status: "authenticated", type: "oauth-personal", email: "User@Example.com" },
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "email:shared-hash",
+        windows: [
+          { ...window, id: "gemini-5h", usedPercent: 5 },
+          { ...weekly, id: "gemini-weekly", usedPercent: 20 },
+        ],
+      },
+    });
+
+    for (const providers of [
+      [staleWithoutEmail, freshWithEmail],
+      [freshWithEmail, staleWithoutEmail],
+    ]) {
+      const accounts = collectLimitAccounts(
+        new Map([[EnvironmentId.make("pro"), { ...laptop, serverConfig: { providers } }]]),
+      );
+      expect(accounts).toHaveLength(1);
+      expect(accounts[0]?.email).toBe("User@Example.com");
+      expect(accounts[0]?.limits.checkedAt).toBe("2026-09-03T14:00:00.000Z");
+      const [pool] = collectLimitPools(accounts, now);
+      expect(pool?.accounts).toHaveLength(1);
+      expect(
+        pool?.windows.map((entry) => [entry.id, entry.members.length, entry.remainingPercent]),
+      ).toEqual([
+        ["gemini-5h", 1, 95],
+        ["gemini-weekly", 1, 80],
+      ]);
+
+      const report = collectProviderUsageLimits(staleWithoutEmail.instanceId, providers, [], now);
+      expect(report?.accounts).toHaveLength(1);
+      expect(report?.accounts[0]).toMatchObject({
+        email: "User@Example.com",
+        limits: { checkedAt: "2026-09-03T14:00:00.000Z" },
+      });
+    }
+
+    // Preserve email even when the fingerprint-only report is the fresher reading.
+    const fresherWithoutEmail = {
+      ...staleWithoutEmail,
+      usageLimits: {
+        ...staleWithoutEmail.usageLimits!,
+        checkedAt: "2026-09-03T15:00:00.000Z",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 12 }],
+      },
+    };
+    const reportFresherAnonymous = collectProviderUsageLimits(
+      fresherWithoutEmail.instanceId,
+      [fresherWithoutEmail, freshWithEmail],
+      [],
+      now,
+    );
+    expect(reportFresherAnonymous?.accounts).toHaveLength(1);
+    expect(reportFresherAnonymous?.accounts[0]).toMatchObject({
+      email: "User@Example.com",
+      limits: { checkedAt: "2026-09-03T15:00:00.000Z" },
+    });
+
+    // Do not alias across drivers or when a fingerprint maps to multiple distinct emails.
+    const otherDriver = provider({
+      driver: claude,
+      instanceId: ProviderInstanceId.make("claude"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "five_hour", usedPercent: 10 }],
+      },
+    });
+    expect(
+      collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            { ...laptop, serverConfig: { providers: [freshWithEmail, otherDriver] } },
+          ],
+        ]),
+      ),
+    ).toHaveLength(2);
+
+    const conflictingEmail = provider({
+      ...freshWithEmail,
+      instanceId: ProviderInstanceId.make("antigravity-other"),
+      auth: { status: "authenticated", type: "oauth-personal", email: "other@example.com" },
+    });
+    expect(
+      collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            {
+              ...laptop,
+              serverConfig: { providers: [staleWithoutEmail, freshWithEmail, conflictingEmail] },
+            },
+          ],
+        ]),
+      ),
+    ).toHaveLength(3);
+
+    // Multi-workspace email: a fingerprint tied to one workspace joins that workspace across
+    // environments, and a fingerprint with no workspace keeps deduplicating its own reports.
+    const ws1 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-ws1"),
+      auth: { status: "authenticated", email: "user@example.com", workspaceId: "ws-1" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "fp-ws1",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 10 }],
+      },
+    });
+    const ws2 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-ws2"),
+      auth: { status: "authenticated", email: "user@example.com", workspaceId: "ws-2" },
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "fp-ws2",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 20 }],
+      },
+    });
+    const anonWs1 = provider({
+      driver: antigravity,
+      instanceId: ProviderInstanceId.make("ag-anon"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "fp-ws1",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 30 }],
+      },
+    });
+    const multiWsAccounts = collectLimitAccounts(
+      new Map([
+        [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [ws1, ws2] } }],
+        [
+          EnvironmentId.make("env-b"),
+          { entry: { target: { label: "Desktop" } }, serverConfig: { providers: [anonWs1] } },
+        ],
+      ]),
+    );
+    expect(multiWsAccounts).toHaveLength(2);
+    expect(
+      multiWsAccounts.find((account) => account.key === "env-a:ag-ws1")?.limits.windows[0]
+        ?.usedPercent,
+    ).toBe(30);
+
+    // Hub accounts merged via credentialFingerprint keep email without leaking fallback filenames.
+    const hubWithEmail = {
+      id: "antigravity-user.json",
+      driver: antigravity,
+      email: "user@example.com",
+      usageLimits: {
+        checkedAt: "2026-09-03T14:00:00.000Z",
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 15 }],
+      },
+    };
+    const hubWithoutEmail = {
+      id: "antigravity-fallback.json",
+      driver: antigravity,
+      usageLimits: {
+        checkedAt,
+        credentialFingerprint: "email:shared-hash",
+        windows: [{ ...window, id: "gemini-5h", usedPercent: 5 }],
+      },
+    };
+    for (const hubPair of [
+      [hubWithoutEmail, hubWithEmail],
+      [hubWithEmail, hubWithoutEmail],
+    ]) {
+      const mergedHub = collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("pro"),
+            {
+              ...laptop,
+              serverConfig: {
+                providers: [],
+                usageLimitSources: [{ ...source, accounts: hubPair }],
+              },
+            },
+          ],
+        ]),
+      );
+      expect(mergedHub).toHaveLength(1);
+      expect(mergedHub[0]).toMatchObject({ displayName: null, email: "user@example.com" });
+    }
+
+    // Native fingerprint-only report deduplicated with an email-bearing hub account inherits email.
+    const nativePlusHub = collectProviderUsageLimits(
+      staleWithoutEmail.instanceId,
+      [staleWithoutEmail],
+      [{ ...source, accounts: [hubWithEmail] }],
+      now,
+    );
+    expect(nativePlusHub?.accounts).toHaveLength(1);
+    expect(nativePlusHub?.accounts[0]).toMatchObject({ email: "user@example.com" });
   });
 
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
@@ -1870,6 +2091,22 @@ describe("/usage-limits", () => {
     expect(mixed[2]).toBe(unrelated);
     expect(mixed[3]).toBe(disabled);
   });
+
+  it("does not offer the command to every provider while an HTTP quota source is down", () => {
+    const unrelated = provider({ driver: ProviderDriverKind.make("claudeAgent") });
+    const httpSource = {
+      id: UsageLimitSourceId.make("http-quota"),
+      kind: "http" as const,
+      label: "My quota server",
+      checkedAt: limits.checkedAt,
+      accounts: [],
+    };
+    const down = { ...httpSource, error: "Could not read the HTTP quota source." };
+    expect(withUsageLimitsCommands([unrelated], [httpSource])[0]).toBe(unrelated);
+    expect(withUsageLimitsCommands([unrelated], [down])[0]).toBe(unrelated);
+    expect(hasProviderUsageLimits(unrelated.driver, [unrelated], [down])).toBe(false);
+    expect(sameUsageLimitCommandCoverage([httpSource], [down])).toBe(true);
+  });
 });
 
 describe("sameUsageLimitCommandCoverage", () => {
@@ -1962,6 +2199,35 @@ describe("external usage settings", () => {
       [EnvironmentId.make("c"), host],
     ]);
     expect(collectLimitNotices(presentations)).toEqual(["Host · codex: Could not read limits."]);
+  });
+
+  it("names the providers a hub lists when it has no account T3 Code reads", () => {
+    const hub = (unreadProviders?: readonly string[]) =>
+      new Map([
+        [
+          EnvironmentId.make("a"),
+          {
+            entry: { target: { label: "Desktop" } },
+            serverConfig: {
+              providers: [],
+              usageLimitSources: [
+                {
+                  id: UsageLimitSourceId.make("hub"),
+                  kind: "cliproxy" as const,
+                  label: "Kimi hub",
+                  checkedAt: "2026-09-03T11:00:00.000Z",
+                  accounts: [],
+                  ...(unreadProviders ? { unreadProviders } : {}),
+                },
+              ],
+            },
+          },
+        ],
+      ]);
+    expect(collectLimitNotices(hub(["antigravity", "kimi-ai"]))).toEqual([
+      "Kimi hub: No Codex, Claude, or Grok accounts. Skipped antigravity, kimi-ai.",
+    ]);
+    expect(collectLimitNotices(hub())).toEqual(["Kimi hub: No accounts reported."]);
   });
 
   it("shows the reason an account's limits are unsupported, but not a bare unsupported", () => {

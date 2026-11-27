@@ -12,6 +12,7 @@ import {
   makeUsageLimits,
   resolveUsageLimitsAfterProbe,
 } from "@t3tools/provider-core/server/usageLimits";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -22,7 +23,6 @@ import * as FiberHandle from "effect/FiberHandle";
 import * as FileSystem from "effect/FileSystem";
 import * as Hex from "effect/encoding/Hex";
 import * as Option from "effect/Option";
-import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -268,6 +268,45 @@ export function makeAntigravityCliUsageCache(): AntigravityCliUsageCache {
   };
 }
 
+// Scoped to the runtime's service handle so same-runtime instances share a cache without
+// adding a fork-only service to upstream AntigravityDriverEnv or leaking across tests/restarts.
+const sharedCachesByRuntime = new WeakMap<object, AntigravityCliUsageCache>();
+
+export function getSharedAntigravityCliUsageCache(runtimeHandle: object): AntigravityCliUsageCache {
+  const existing = sharedCachesByRuntime.get(runtimeHandle);
+  if (existing !== undefined) return existing;
+  const created = makeAntigravityCliUsageCache();
+  sharedCachesByRuntime.set(runtimeHandle, created);
+  return created;
+}
+
+const STRIPPED_CLI_ENV_KEYS = new Set([
+  "DISPLAY",
+  "WAYLAND_DISPLAY",
+  "GEMINI_HOME",
+  "AGY_ACP_FORCE_FILE_STORAGE",
+  "AGY_ACP_CCPA_PROJECT",
+  "AGY_ACP_ENABLE_OAUTH",
+  "AGY_CLI_DISABLE_AUTO_UPDATE",
+  "AGENT_BOARD_HOOKS",
+  "BROWSER",
+  "T3_ANTIGRAVITY_AUTH_URL",
+  "CHROME_CRASHPAD_PIPE_NAME",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_QUOTA_PROJECT",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GCLOUD_PROJECT",
+  "CLOUDSDK_CORE_PROJECT",
+  "CLAUDECODE",
+  "ELECTRON_RUN_AS_NODE",
+]);
+
+const DARWIN_SSH_ENV_KEYS = new Set(["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]);
+
 export interface AntigravityCliUsageProbe {
   readonly probe: (options?: {
     readonly force?: boolean;
@@ -289,35 +328,30 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly readAccountEmail: Effect.Effect<string | undefined>;
-  readonly prepareIsolatedSpawn: (cwd: string) => Effect.Effect<
-    {
-      readonly spawn: Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">;
-      readonly isolatedProfileDirectory: string;
-      readonly onAfterExit?: Effect.Effect<void> | undefined;
-    },
-    E,
-    Scope.Scope
-  >;
+  readonly prepareSpawn: (
+    cwd: string,
+  ) => Effect.Effect<Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">, E, Scope.Scope>;
   readonly cache?: AntigravityCliUsageCache;
+  readonly platform?: NodeJS.Platform;
 }) {
   const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const digest = yield* Digest.Digest;
+  const platform = input.platform ?? HostProcess.Platform.defaultValue();
   const cache = input.cache ?? makeAntigravityCliUsageCache();
   const ownedKeys = new Set<string>();
-  const cliTokenPath = path.join(
-    input.profileDirectory,
-    "antigravity-acp",
-    "antigravity-oauth-token",
-  );
-  const legacyTokenPath = path.join(input.profileDirectory, "antigravity-acp", "acp_token.json");
 
   const accountKeyAndFingerprint = Effect.gen(function* () {
     const email = yield* input.readAccountEmail;
     if (!email) {
+      if (input.authMethod === "oauth-personal") {
+        return {
+          key: "oauth-personal:native-keyring",
+          credentialFingerprint: "keyring:oauth-personal",
+        } as const;
+      }
       return {
-        key: `profile:${input.profileDirectory}`,
+        key: `${input.authMethod}:profile:${input.profileDirectory}`,
         credentialFingerprint: undefined,
       } as const;
     }
@@ -325,12 +359,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       yield* digest.digest(Digest.sha256, new TextEncoder().encode(email.trim().toLowerCase())),
     );
     const credentialFingerprint = `email:${hash}`;
-    return { key: credentialFingerprint, credentialFingerprint } as const;
-  });
-
-  const hasSavedToken = Effect.gen(function* () {
-    if (yield* fs.exists(cliTokenPath).pipe(Effect.orElseSucceed(() => false))) return true;
-    return yield* fs.exists(legacyTokenPath).pipe(Effect.orElseSucceed(() => false));
+    return { key: `${input.authMethod}:${credentialFingerprint}`, credentialFingerprint } as const;
   });
 
   const runCliOnce = (credentialFingerprint: string | undefined) =>
@@ -338,7 +367,7 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
       Effect.gen(function* () {
         const checkedAt = DateTime.formatIso(yield* DateTime.now);
         const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
-        const prepared = yield* input.prepareIsolatedSpawn(cwd).pipe(Effect.option);
+        const prepared = yield* input.prepareSpawn(cwd).pipe(Effect.option);
         if (Option.isNone(prepared)) {
           return makeUnavailableUsageLimits({
             checkedAt,
@@ -346,13 +375,15 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
             message: "Could not start the Antigravity CLI to read usage limits.",
           });
         }
-        const { spawn, onAfterExit } = prepared.value;
-        // LIFO finalizer runs after the child process exits and before the isolated profile is deleted.
-        if (onAfterExit) {
-          yield* Effect.addFinalizer(() => onAfterExit.pipe(Effect.ignore));
-        }
+        const spawn = prepared.value;
 
-        const { DISPLAY: _display, WAYLAND_DISPLAY: _wayland, ...headlessEnv } = spawn.env ?? {};
+        const headlessEnv: Record<string, string | undefined> = {};
+        for (const [key, value] of Object.entries(spawn.env ?? {})) {
+          const upper = key.toUpperCase();
+          if (STRIPPED_CLI_ENV_KEYS.has(upper)) continue;
+          if (platform === "darwin" && DARWIN_SSH_ENV_KEYS.has(upper)) continue;
+          headlessEnv[key] = value;
+        }
         const child = yield* spawner.spawn(
           ChildProcess.make(
             spawn.command,
@@ -368,8 +399,9 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
               cwd,
               env: {
                 ...headlessEnv,
+                AGY_CLI_DISABLE_AUTO_UPDATE: "true",
                 AGENT_BOARD_HOOKS: "off",
-                SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 22",
+                BROWSER: "",
               },
               extendEnv: false,
               shell: false,
@@ -474,9 +506,9 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
           reason: "unsupported",
         });
       }
-      if (!(yield* hasSavedToken)) return undefined;
 
       const { key, credentialFingerprint } = yield* accountKeyAndFingerprint;
+      ownedKeys.add(key);
       const force = options?.force === true;
 
       while (true) {
@@ -503,7 +535,6 @@ export const makeAntigravityCliUsageProbe = Effect.fn("makeAntigravityCliUsagePr
 
         const pending = yield* Deferred.make<ServerProviderUsageLimits | undefined>();
         cache.inFlight.set(key, pending);
-        ownedKeys.add(key);
         if (force) cache.entries.delete(key);
 
         let result: ServerProviderUsageLimits | undefined;
@@ -578,7 +609,7 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
     readonly usage: AntigravityCliUsageProbe;
     readonly enabled: boolean;
     readonly shouldRunBackgroundWork: Effect.Effect<boolean>;
-  }): Effect.fn.Return<P & { readonly onTokenRefreshed: Effect.Effect<void> }, never, Scope.Scope> {
+  }): Effect.fn.Return<P, never, Scope.Scope> {
     const overlayRef = yield* Ref.make<ServerProviderUsageLimits | undefined>(undefined);
     const lastPublishedRef = yield* Ref.make<ServerProvider | undefined>(undefined);
     const changesPubSub = yield* Effect.acquireRelease(
@@ -640,6 +671,15 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       if (
         latestBase.auth.status === "unauthenticated" &&
         probed.unavailable?.reason !== "unsupported"
+      ) {
+        return;
+      }
+      // On a background startup probe for an instance whose auth state is still unknown, do not
+      // surface a noisy "saved sign-in needs to be renewed" error if the user is not signed in.
+      if (
+        !force &&
+        latestBase.auth.status === "unknown" &&
+        probed.unavailable?.reason === "probeFailed"
       ) {
         return;
       }
@@ -790,15 +830,6 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       }
     });
 
-    const onTokenRefreshed = Effect.gen(function* () {
-      if (!input.enabled) return;
-      yield* input.usage.clearBackoff;
-      const current = yield* Ref.get(overlayRef);
-      if (yield* isStale(current)) {
-        yield* triggerBackgroundProbe();
-      }
-    });
-
     const snapshotForCwd = Effect.fn("AntigravityCliUsageLimits.snapshotForCwd")(function* (
       cwd: string,
       skills?: ServerProvider["skills"],
@@ -825,7 +856,6 @@ export const attachAntigravityCliUsageLimits = Effect.fn("attachAntigravityCliUs
       onSignedOut: resetOverlay.pipe(Effect.andThen(input.provider.onSignedOut)),
       onAuthRequired: resetOverlay.pipe(Effect.andThen(input.provider.onAuthRequired)),
       snapshotForCwd,
-      onTokenRefreshed,
     };
   },
 );

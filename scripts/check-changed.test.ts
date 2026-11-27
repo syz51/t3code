@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect } from "vite-plus/test";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Option from "effect/Option";
 import { afterAll, assert, describe, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
@@ -19,6 +20,7 @@ import {
   comparisonBase,
   defaultConcurrency,
   docReaderTests,
+  formatTypecheckResult,
   gitLines,
   ignoredCheckInputs,
   runSteps,
@@ -233,6 +235,111 @@ describe("check:changed", () => {
   ])("tests every package when the shared test setup file %s changes", (file) => {
     assert.strictEqual(decide([file], readWorkspace(), false).outputs.test_packages, "");
   });
+
+  it("reports killed typecheck workers with package names and concurrency guidance", () => {
+    const output = [
+      "\x1b[34m~/apps/server$ effect-tsgo tsrs --noEmit\x1b[0m",
+      "\x1b[34m~/apps/web$ effect-tsgo tsrs --noEmit\x1b[0m",
+      "",
+      "\x1b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m",
+      "\x1b[97;1m    Vite+ Task Runner • Execution Summary\x1b[0m",
+      "\x1b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m",
+      "",
+      "\x1b[1mTask Details:\x1b[0m",
+      "\x1b[90m────────────────────────────────────────────────\x1b[0m",
+      "  \x1b[90m[1]\x1b[0m \x1b[97;1mt3#typecheck\x1b[0m: \x1b[34m~/apps/server$ effect-tsgo tsrs --noEmit\x1b[0m \x1b[31;1m✗\x1b[0m \x1b[31m(exit code: 137)\x1b[0m",
+      "      \x1b[90m→ Cache miss: no previous cache entry found\x1b[0m",
+      "  \x1b[90m·······················································\x1b[0m",
+      "  \x1b[90m[2]\x1b[0m \x1b[97;1m@t3tools/web#typecheck\x1b[0m: \x1b[34m~/apps/web$ effect-tsgo tsrs --noEmit\x1b[0m \x1b[31;1m✗\x1b[0m \x1b[31m(exit code: 143)\x1b[0m",
+      "      \x1b[90m→ Cache miss: no previous cache entry found\x1b[0m",
+      "\x1b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m",
+    ].join("\n");
+
+    const formatted = formatTypecheckResult(
+      { ok: false, exitCode: 1, output },
+      ["t3", "@t3tools/web"],
+      6,
+    );
+    assert.isFalse(formatted.ok);
+    expect(formatted.output).not.toContain("Vite+ Task Runner • Execution Summary");
+    expect(formatted.output).toContain("t3#typecheck (exit 137, SIGKILL)");
+    expect(formatted.output).toContain("@t3tools/web#typecheck (exit 143, SIGTERM)");
+    expect(formatted.output).toContain("killed (likely out of memory)");
+    expect(formatted.output).toContain("CHECK_CHANGED_CONCURRENCY=3");
+    expect(formatted.output).toContain("--concurrency 3");
+    expect(formatted.summaryNote).toContain("t3#typecheck");
+    expect(formatted.summaryNote).toContain("killed (likely out of memory)");
+    expect(formatted.summaryNote).toContain("CHECK_CHANGED_CONCURRENCY");
+    expect(formatted.summaryNote).toContain("--concurrency");
+  });
+
+  it("preserves real type error diagnostics without blaming OOM for aborted siblings", () => {
+    const output = [
+      "~/apps/web$ effect-tsgo tsrs --noEmit",
+      "src/app.tsx(12,5): error TS2322: Type 'number' is not assignable to type 'string'.",
+      "~/apps/server$ effect-tsgo tsrs --noEmit",
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "    Vite+ Task Runner • Execution Summary",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "Task Details:",
+      "────────────────────────────────────────────────",
+      "  [1] @t3tools/web#typecheck: ~/apps/web$ effect-tsgo tsrs --noEmit ✗ (exit code: 1)",
+      "      → Cache miss: no previous cache entry found",
+      "  ·······················································",
+      "  [2] t3#typecheck: ~/apps/server$ effect-tsgo tsrs --noEmit ✗ (exit code: 137)",
+      "      → Cache miss: no previous cache entry found",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ].join("\n");
+
+    const formatted = formatTypecheckResult(
+      { ok: false, exitCode: 1, output },
+      ["@t3tools/web", "t3"],
+      4,
+    );
+    assert.isFalse(formatted.ok);
+    expect(formatted.output).toContain(
+      "src/app.tsx(12,5): error TS2322: Type 'number' is not assignable to type 'string'.",
+    );
+    expect(formatted.output).toContain("Failed typecheck tasks: @t3tools/web#typecheck (exit 1)");
+    expect(formatted.output).not.toContain("likely out of memory");
+    assert.isUndefined(formatted.summaryNote);
+  });
+
+  it("strips the verbose Vite+ summary on a passing typecheck run", () => {
+    const output = [
+      "~/apps/web$ effect-tsgo tsrs --noEmit ◉ cache hit, replaying",
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "    Vite+ Task Runner • Execution Summary",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "  [1] @t3tools/web#typecheck: ~/apps/web$ effect-tsgo tsrs --noEmit ✓",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ].join("\n");
+
+    const formatted = formatTypecheckResult({ ok: true, exitCode: 0, output }, ["@t3tools/web"], 4);
+    assert.isTrue(formatted.ok);
+    assert.strictEqual(
+      formatted.output,
+      "~/apps/web$ effect-tsgo tsrs --noEmit ◉ cache hit, replaying",
+    );
+    assert.isUndefined(formatted.summaryNote);
+  });
+
+  it("reports outer vp kill signals even when no Vite+ summary was printed", () => {
+    const formatted = formatTypecheckResult(
+      { ok: false, signal: "SIGKILL", output: "" },
+      ["@t3tools/web"],
+      1,
+    );
+    assert.isFalse(formatted.ok);
+    expect(formatted.output).toContain("@t3tools/web");
+    expect(formatted.output).toContain("signal SIGKILL");
+    expect(formatted.output).toContain("killed (likely out of memory)");
+    expect(formatted.output).toContain("CHECK_CHANGED_CONCURRENCY");
+    expect(formatted.output).toContain("--concurrency");
+    expect(formatted.summaryNote).toContain("@t3tools/web");
+  });
 });
 
 // Hooks export GIT_DIR and GIT_INDEX_FILE, and user config or the default
@@ -438,8 +545,22 @@ function launcherFixture() {
     import path from 'node:path';
     const args = process.argv.slice(2);
     fs.writeFileSync(path.join(process.env.RECORDS, process.pid + '.json'), JSON.stringify({ args, cwd: process.cwd() }));
-    console.log('fixture stdout: ' + args[0]);
-    console.error('fixture stderr: ' + args[0]);
+    if (args[0] === 'run' && process.env.VP_RUN_STDOUT) {
+      process.stdout.write(process.env.VP_RUN_STDOUT);
+    } else {
+      console.log('fixture stdout: ' + args[0]);
+    }
+    if (args[0] === 'run' && process.env.VP_RUN_STDERR) {
+      process.stderr.write(process.env.VP_RUN_STDERR);
+    } else {
+      console.error('fixture stderr: ' + args[0]);
+    }
+    if (args[0] === 'run' && process.env.VP_RUN_SIGNAL) {
+      process.kill(process.pid, process.env.VP_RUN_SIGNAL);
+    }
+    if (args[0] === 'run' && process.env.VP_RUN_EXIT) {
+      process.exit(Number(process.env.VP_RUN_EXIT));
+    }
     process.exit(args[0] === process.env.FAIL_STEP ? 23 : 0);
   `,
   );
@@ -483,11 +604,11 @@ function launcherFixture() {
     root,
     source,
     write,
-    run(failStep = "") {
+    run(failStep = "", extraEnv: Record<string, string> = {}) {
       return NodeChildProcess.spawnSync(process.execPath, ["scripts/check-changed.ts", "HEAD"], {
         cwd: root,
         encoding: "utf8",
-        env: { ...env, TEMP: NodeOS.tmpdir(), RECORDS: records, FAIL_STEP: failStep },
+        env: { ...env, TEMP: NodeOS.tmpdir(), RECORDS: records, FAIL_STEP: failStep, ...extraEnv },
       });
     },
     calls: (): Array<{ args: Array<string>; cwd: string }> =>
@@ -558,3 +679,88 @@ it.each(["install", "lint"])("reports a failing %s step with its output", (step)
     NodeFS.existsSync(NodePath.join(project.root, "node_modules/.cache/check-changed.json")),
   ).toBe(false);
 });
+
+it("reports a killed typecheck worker in check:changed output", () => {
+  using project = launcherFixture();
+  project.write(project.source, "export const value = 2;\n");
+  const summary = [
+    "~/packages/example$ effect-tsgo tsrs --noEmit",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "    Vite+ Task Runner • Execution Summary",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "Task Details:",
+    "────────────────────────────────────────────────",
+    "  [1] example#typecheck: ~/packages/example$ effect-tsgo tsrs --noEmit ✗ (exit code: 137)",
+    "      → Cache miss: no previous cache entry found",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+  ].join("\n");
+  const result = project.run("", {
+    CHECK_CHANGED_CONCURRENCY: "4",
+    VP_RUN_STDOUT: summary,
+    VP_RUN_STDERR: " ",
+    VP_RUN_EXIT: "1",
+  });
+  expect(result.status, result.stdout + result.stderr).toBe(1);
+  const typecheckCall = project
+    .calls()
+    .find(({ args }) => args[0] === "run" && args.includes("typecheck"));
+  expect(typecheckCall?.args).toContain("--verbose");
+  expect(result.stdout).toContain("FAIL  typecheck (1 packages)");
+  expect(result.stdout).toContain("example#typecheck (exit 137, SIGKILL)");
+  expect(result.stdout).toContain("killed (likely out of memory)");
+  expect(result.stdout).toContain("CHECK_CHANGED_CONCURRENCY");
+  expect(result.stdout).toContain("--concurrency");
+  expect(result.stdout).toContain("KILLED: typecheck worker killed (likely out of memory)");
+  expect(
+    NodeFS.existsSync(NodePath.join(project.root, "node_modules/.cache/check-changed.json")),
+  ).toBe(false);
+});
+
+it("prints real typecheck diagnostics without an OOM warning", () => {
+  using project = launcherFixture();
+  project.write(project.source, "export const value = 2;\n");
+  const summary = [
+    "~/packages/example$ effect-tsgo tsrs --noEmit",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "    Vite+ Task Runner • Execution Summary",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "Task Details:",
+    "────────────────────────────────────────────────",
+    "  [1] example#typecheck: ~/packages/example$ effect-tsgo tsrs --noEmit ✗ (exit code: 1)",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+  ].join("\n");
+  const result = project.run("", {
+    VP_RUN_STDOUT: summary,
+    VP_RUN_STDERR:
+      "src/index.ts(1,1): error TS2322: Type 'number' is not assignable to 'string'.\n",
+    VP_RUN_EXIT: "1",
+  });
+  expect(result.status, result.stdout + result.stderr).toBe(1);
+  expect(result.stdout).toContain("error TS2322: Type 'number' is not assignable to 'string'.");
+  expect(result.stdout).toContain("Failed typecheck tasks: example#typecheck (exit 1)");
+  expect(result.stdout).not.toContain("likely out of memory");
+});
+
+it.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "reports a signal-killed typecheck process even when no summary was emitted",
+  () => {
+    using project = launcherFixture();
+    project.write(project.source, "export const value = 2;\n");
+    const result = project.run("", {
+      CHECK_CHANGED_CONCURRENCY: "4",
+      VP_RUN_STDOUT: " ",
+      VP_RUN_STDERR: " ",
+      VP_RUN_SIGNAL: "SIGKILL",
+    });
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    expect(result.stdout).toContain("example");
+    expect(result.stdout).toContain("signal SIGKILL");
+    expect(result.stdout).toContain("killed (likely out of memory)");
+    expect(result.stdout).toContain("CHECK_CHANGED_CONCURRENCY=2");
+    expect(result.stdout).toContain("--concurrency 2");
+  },
+);

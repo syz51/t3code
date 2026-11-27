@@ -22,6 +22,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   attachAntigravityCliUsageLimits,
+  getSharedAntigravityCliUsageCache,
   isAntigravityCliAuthPrompt,
   makeAntigravityCliUsageCache,
   makeAntigravityCliUsageProbe,
@@ -276,7 +277,7 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         profileDirectory: "/nonexistent",
         authMethod: "gemini-api-key",
         readAccountEmail: Effect.undefined,
-        prepareIsolatedSpawn: () =>
+        prepareSpawn: () =>
           Effect.sync(() => {
             spawns += 1;
             throw new Error("should not spawn");
@@ -288,28 +289,8 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
     }),
   );
 
-  it.effect("returns undefined without spawning when no local token file exists", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const profileDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-notoken-" });
-      let spawns = 0;
-      const probe = yield* makeAntigravityCliUsageProbe({
-        profileDirectory,
-        authMethod: "oauth-personal",
-        readAccountEmail: Effect.succeed("user@example.com"),
-        prepareIsolatedSpawn: () =>
-          Effect.sync(() => {
-            spawns += 1;
-            throw new Error("should not spawn");
-          }),
-      });
-      expect(yield* probe.probe()).toBeUndefined();
-      expect(spawns).toBe(0);
-    }),
-  );
-
   it.effect.skipIf(windowsHost)(
-    "caches across instances sharing an email, deduplicates in-flight calls, and runs onAfterExit before isolated dir removal",
+    "caches across instances sharing an email, deduplicates in-flight calls, and needs no local token file",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -318,18 +299,12 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-probe-" });
         const profileA = path.join(root, "profile-a");
         const profileB = path.join(root, "profile-b");
-        for (const profile of [profileA, profileB]) {
-          const acpDir = path.join(profile, "antigravity-acp");
-          yield* fs.makeDirectory(acpDir, { recursive: true });
-          yield* fs.writeFileString(path.join(acpDir, "antigravity-oauth-token"), "{}");
-        }
 
         const scriptPath = path.join(root, "fake-agy.sh");
         yield* fs.writeFileString(
           scriptPath,
           [
             "#!/bin/sh",
-            'printf "%s" "renewed" > "$GEMINI_HOME/marker.txt"',
             `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
             "",
           ].join("\n"),
@@ -338,33 +313,17 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
 
         const cache = makeAntigravityCliUsageCache();
         let spawnCount = 0;
-        let markerSeenOnAfterExit = false;
-        let lastIsolatedDir: string | undefined;
 
-        const makePrepare = (profile: string) => (_cwd: string) =>
-          Effect.gen(function* () {
+        const makePrepare = () => (_cwd: string) =>
+          Effect.sync(() => {
             spawnCount += 1;
-            const isolatedProfileDirectory = yield* fs.makeTempDirectoryScoped({
-              prefix: "t3-ag-iso-",
-            });
-            lastIsolatedDir = isolatedProfileDirectory;
             return {
-              isolatedProfileDirectory,
-              spawn: {
-                command: scriptPath,
-                env: {
-                  PATH: baseEnv.PATH ?? "/usr/bin:/bin",
-                  GEMINI_HOME: isolatedProfileDirectory,
-                  DISPLAY: ":0",
-                  WAYLAND_DISPLAY: "wayland-0",
-                },
+              command: scriptPath,
+              env: {
+                PATH: baseEnv.PATH ?? "/usr/bin:/bin",
+                DISPLAY: ":0",
+                WAYLAND_DISPLAY: "wayland-0",
               },
-              onAfterExit: Effect.gen(function* () {
-                const exists = yield* fs.exists(path.join(isolatedProfileDirectory, "marker.txt"));
-                if (exists && profile === profileA) {
-                  markerSeenOnAfterExit = true;
-                }
-              }).pipe(Effect.ignore),
             };
           });
 
@@ -372,14 +331,14 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
           profileDirectory: profileA,
           authMethod: "oauth-personal",
           readAccountEmail: Effect.succeed("User@Example.com"),
-          prepareIsolatedSpawn: makePrepare(profileA),
+          prepareSpawn: makePrepare(),
           cache,
         });
         const probeB = yield* makeAntigravityCliUsageProbe({
           profileDirectory: profileB,
           authMethod: "oauth-personal",
           readAccountEmail: Effect.succeed("user@example.com"),
-          prepareIsolatedSpawn: makePrepare(profileB),
+          prepareSpawn: makePrepare(),
           cache,
         });
 
@@ -388,10 +347,6 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
           concurrency: "unbounded",
         });
         expect(spawnCount).toBe(1);
-        expect(markerSeenOnAfterExit).toBe(true);
-        if (lastIsolatedDir) {
-          expect(yield* fs.exists(lastIsolatedDir)).toBe(false);
-        }
         expect(first?.windows).toHaveLength(4);
         expect(first?.credentialFingerprint).toMatch(/^email:[0-9a-f]{64}$/);
         expect(second).toEqual(first);
@@ -420,9 +375,6 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         const path = yield* Path.Path;
         const baseEnv = yield* HostProcess.Environment;
         const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-authprompt-" });
-        const acpDir = path.join(root, "antigravity-acp");
-        yield* fs.makeDirectory(acpDir, { recursive: true });
-        yield* fs.writeFileString(path.join(acpDir, "antigravity-oauth-token"), "{}");
 
         const scriptPath = path.join(root, "hang-on-auth.sh");
         yield* fs.writeFileString(
@@ -442,20 +394,13 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
           profileDirectory: root,
           authMethod: "oauth-personal",
           readAccountEmail: Effect.succeed("user@example.com"),
-          prepareIsolatedSpawn: (_cwd) =>
-            Effect.gen(function* () {
+          prepareSpawn: () =>
+            Effect.sync(() => {
               spawnCount += 1;
-              const isolatedProfileDirectory = yield* fs.makeTempDirectoryScoped({
-                prefix: "t3-ag-iso-auth-",
-              });
               return {
-                isolatedProfileDirectory,
-                spawn: {
-                  command: scriptPath,
-                  env: {
-                    PATH: baseEnv.PATH ?? "/usr/bin:/bin",
-                    GEMINI_HOME: isolatedProfileDirectory,
-                  },
+                command: scriptPath,
+                env: {
+                  PATH: baseEnv.PATH ?? "/usr/bin:/bin",
                 },
               };
             }),
@@ -479,17 +424,13 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
-    "evicts cached email entry on clearAccount even after logout deletes the token file",
+    "evicts cached email entry on clearAccount even after logout clears readAccountEmail",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const baseEnv = yield* HostProcess.Environment;
         const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-logout-" });
-        const acpDir = path.join(root, "antigravity-acp");
-        const tokenPath = path.join(acpDir, "antigravity-oauth-token");
-        yield* fs.makeDirectory(acpDir, { recursive: true });
-        yield* fs.writeFileString(tokenPath, "{}");
 
         const scriptPath = path.join(root, "ok-agy.sh");
         yield* fs.writeFileString(
@@ -502,26 +443,19 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         );
         yield* fs.chmod(scriptPath, 0o755);
 
-        let tokenPresent = true;
+        let signedIn = true;
         let spawnCount = 0;
         const probe = yield* makeAntigravityCliUsageProbe({
           profileDirectory: root,
           authMethod: "oauth-personal",
-          readAccountEmail: Effect.sync(() => (tokenPresent ? "user@example.com" : undefined)),
-          prepareIsolatedSpawn: (_cwd) =>
-            Effect.gen(function* () {
+          readAccountEmail: Effect.sync(() => (signedIn ? "user@example.com" : undefined)),
+          prepareSpawn: () =>
+            Effect.sync(() => {
               spawnCount += 1;
-              const isolatedProfileDirectory = yield* fs.makeTempDirectoryScoped({
-                prefix: "t3-ag-iso-logout-",
-              });
               return {
-                isolatedProfileDirectory,
-                spawn: {
-                  command: scriptPath,
-                  env: {
-                    PATH: baseEnv.PATH ?? "/usr/bin:/bin",
-                    GEMINI_HOME: isolatedProfileDirectory,
-                  },
+                command: scriptPath,
+                env: {
+                  PATH: baseEnv.PATH ?? "/usr/bin:/bin",
                 },
               };
             }),
@@ -530,16 +464,179 @@ it.layer(nodeLayer)("makeAntigravityCliUsageProbe", (it) => {
         expect((yield* probe.probe())?.windows).toHaveLength(4);
         expect(spawnCount).toBe(1);
 
-        // Logout deletes the token file before calling clearAccount.
-        tokenPresent = false;
-        yield* fs.remove(tokenPath);
+        // Logout clears readAccountEmail before calling clearAccount.
+        signedIn = false;
         yield* probe.clearAccount;
 
         // Re-signing into the same account immediately probes instead of returning stale cache.
-        tokenPresent = true;
-        yield* fs.writeFileString(tokenPath, "{}");
+        signedIn = true;
         expect((yield* probe.probe())?.windows).toHaveLength(4);
         expect(spawnCount).toBe(2);
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "preserves real HOME for native OS keyring and strips SSH, file-storage, GEMINI_HOME, and API keys",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseEnv = yield* HostProcess.Environment;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-clihome-" });
+
+        const dumpPath = path.join(root, "dump.txt");
+        const scriptPath = path.join(root, "inspect-agy.sh");
+        yield* fs.writeFileString(
+          scriptPath,
+          [
+            "#!/bin/sh",
+            "{",
+            '  printf "HOME=%s\\n" "${HOME:-}"',
+            '  printf "GEMINI_HOME=%s\\n" "${GEMINI_HOME:-}"',
+            '  printf "SSH_CONNECTION=%s\\n" "${SSH_CONNECTION:-}"',
+            '  printf "SSH_CLIENT=%s\\n" "${SSH_CLIENT:-}"',
+            '  printf "SSH_TTY=%s\\n" "${SSH_TTY:-}"',
+            '  printf "AGY_ACP_FORCE_FILE_STORAGE=%s\\n" "${AGY_ACP_FORCE_FILE_STORAGE:-}"',
+            '  printf "GEMINI_API_KEY=%s\\n" "${GEMINI_API_KEY:-}"',
+            '  printf "GOOGLE_API_KEY=%s\\n" "${GOOGLE_API_KEY:-}"',
+            '  printf "DISPLAY=%s\\n" "${DISPLAY:-}"',
+            '  printf "WAYLAND_DISPLAY=%s\\n" "${WAYLAND_DISPLAY:-}"',
+            '  printf "AGENT_BOARD_HOOKS=%s\\n" "${AGENT_BOARD_HOOKS:-}"',
+            '  printf "AGY_CLI_DISABLE_AUTO_UPDATE=%s\\n" "${AGY_CLI_DISABLE_AUTO_UPDATE:-}"',
+            `} > ${JSON.stringify(dumpPath)}`,
+            `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(scriptPath, 0o755);
+
+        const probe = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: path.join(root, "profile"),
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.undefined,
+          platform: "darwin",
+          prepareSpawn: () =>
+            Effect.succeed({
+              command: scriptPath,
+              env: {
+                PATH: baseEnv.PATH ?? "/usr/bin:/bin",
+                HOME: "/real/user/home",
+                GEMINI_HOME: "/wrong/gemini/home",
+                SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 22",
+                SSH_CLIENT: "127.0.0.1 1 22",
+                SSH_TTY: "/dev/pts/0",
+                AGY_ACP_FORCE_FILE_STORAGE: "1",
+                GEMINI_API_KEY: "should-strip",
+                GOOGLE_API_KEY: "should-strip",
+                DISPLAY: ":0",
+                WAYLAND_DISPLAY: "wayland-0",
+              },
+            }),
+        });
+
+        const result = yield* probe.probe();
+        expect(result?.windows).toHaveLength(4);
+        expect(result?.credentialFingerprint).toBe("keyring:oauth-personal");
+        const dump = yield* fs.readFileString(dumpPath);
+        expect(dump).toContain("HOME=/real/user/home\n");
+        expect(dump).toContain("GEMINI_HOME=\n");
+        expect(dump).toContain("SSH_CONNECTION=\n");
+        expect(dump).toContain("SSH_CLIENT=\n");
+        expect(dump).toContain("SSH_TTY=\n");
+        expect(dump).toContain("AGY_ACP_FORCE_FILE_STORAGE=\n");
+        expect(dump).toContain("GEMINI_API_KEY=\n");
+        expect(dump).toContain("GOOGLE_API_KEY=\n");
+        expect(dump).toContain("DISPLAY=\n");
+        expect(dump).toContain("WAYLAND_DISPLAY=\n");
+        expect(dump).toContain("AGENT_BOARD_HOOKS=off\n");
+        expect(dump).toContain("AGY_CLI_DISABLE_AUTO_UPDATE=true\n");
+      }),
+  );
+
+  it("shares cache instances per runtime handle via getSharedAntigravityCliUsageCache", () => {
+    const runtimeA = {};
+    const runtimeB = {};
+    const first = getSharedAntigravityCliUsageCache(runtimeA);
+    const second = getSharedAntigravityCliUsageCache(runtimeA);
+    const other = getSharedAntigravityCliUsageCache(runtimeB);
+    expect(second).toBe(first);
+    expect(other).not.toBe(first);
+  });
+
+  it.effect.skipIf(windowsHost)(
+    "separates shared cache entries by authMethod and tracks ownedKeys on cache hits for logout eviction",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseEnv = yield* HostProcess.Environment;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ag-authkey-" });
+        const profilePersonalA = path.join(root, "personal-a");
+        const profilePersonalB = path.join(root, "personal-b");
+        const profileBusiness = path.join(root, "business");
+
+        const scriptPath = path.join(root, "ok-agy.sh");
+        yield* fs.writeFileString(
+          scriptPath,
+          [
+            "#!/bin/sh",
+            `printf '%s\\n' '${LIVE_SHAPE_USAGE_JSON.replaceAll("'", `'\\''`)}'`,
+            "",
+          ].join("\n"),
+        );
+        yield* fs.chmod(scriptPath, 0o755);
+
+        const cache = makeAntigravityCliUsageCache();
+        let spawnCount = 0;
+        const makePrepare = () =>
+          Effect.sync(() => {
+            spawnCount += 1;
+            return {
+              command: scriptPath,
+              env: { PATH: baseEnv.PATH ?? "/usr/bin:/bin" },
+            };
+          });
+
+        let emailB: string | undefined = "shared@example.com";
+        const probePersonalA = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profilePersonalA,
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.succeed("shared@example.com"),
+          prepareSpawn: makePrepare,
+          cache,
+        });
+        const probePersonalB = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profilePersonalB,
+          authMethod: "oauth-personal",
+          readAccountEmail: Effect.sync(() => emailB),
+          prepareSpawn: makePrepare,
+          cache,
+        });
+        const probeBusiness = yield* makeAntigravityCliUsageProbe({
+          profileDirectory: profileBusiness,
+          authMethod: "oauth-business",
+          readAccountEmail: Effect.succeed("shared@example.com"),
+          prepareSpawn: makePrepare,
+          cache,
+        });
+
+        // Personal A populates cache; Personal B hits cache; Business does not collide with Personal.
+        expect((yield* probePersonalA.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(1);
+        expect((yield* probePersonalB.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(1);
+        expect((yield* probeBusiness.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(2);
+
+        // Personal B signs out (email becomes undefined); clearAccount must still evict the shared personal entry
+        // it only observed via cache hit, without evicting Business.
+        emailB = undefined;
+        yield* probePersonalB.clearAccount;
+        expect((yield* probeBusiness.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(2);
+        emailB = "shared@example.com";
+        expect((yield* probePersonalB.probe())?.windows).toHaveLength(4);
+        expect(spawnCount).toBe(3);
       }),
   );
 });

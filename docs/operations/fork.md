@@ -50,11 +50,14 @@ squash, so `fork` keeps upstream's history and the next merge finds the right ba
 [deliver the build](#deliver-the-build).
 
 Agent Context Budget fails when upstream grew the agent context since the last sync. The fork's
-own instruction edits make its budget differ from upstream's, so compare growth, not values. Run
-`git diff <old> upstream/main -- apps/server/src/provider/agentContextBudget.json`, where `<old>`
-is `git merge-base origin/fork upstream/main` taken before the merge. When no number grew more on
-the branch than in that diff, the growth is upstream's: add the `agent-context-increase` label to
-the PR.
+own instruction edits make its budget differ from upstream's, so compare growth, not values. Before
+opening the PR, run `git diff <old> upstream/main -- apps/server/src/provider/agentContextBudget.json`,
+where `<old>` is `git merge-base origin/fork upstream/main` taken before the merge. When upstream
+grew the budget and no number grew more on the branch than in that diff, the growth is upstream's:
+pass `--label agent-context-increase` to `gh pr create`. If the label is added after the PR is
+opened (or an `opened` run finishes before the label lands and fails), add the label and rerun the
+failed run (`gh run rerun <run-id> --failed`); the workflow reads the PR's live labels at run time,
+so no empty commit is needed.
 
 On macOS, some server tests fail locally because temporary paths resolve to `/private/var` or
 the file system ignores case. CI runs them on Linux; trust its result there.
@@ -98,7 +101,9 @@ the runners its callers pass. Each mapped line keeps upstream's label or timeout
 `# fork-mapped:` or `# fork-scaled:` comment, so a rerun rescales from upstream's value. The
 script also checks that Agent Context Budget compares with the PR's base branch, because `fork`
 lags `main` until the sync. Upstream's check reads the PR merge's first parent, which is that
-base.
+base. The fork also changes `agent-context-budget.yml` to read live PR labels via `gh api` (with
+`pull-requests: read`) instead of `github.event.pull_request.labels`, so `gh pr create --label`
+and reruns see the current labels; keep that change if an upstream edit conflicts there.
 
 A `runs-on` or `timeout-minutes` line conflicts when upstream edits it. In each conflict hunk,
 keep upstream's side, then rerun the script. Do not check out a whole workflow file from either
@@ -173,17 +178,25 @@ running thread on that Mac, the sync's own thread on the Air included.
 3. Finish everything else: the board task, the report and the final reply.
 4. Update the Air last, as the last command of the turn: `scripts/fork-app-update.sh --detach`.
 
-## Antigravity CLI usage limits
+## Antigravity native keyring auth & CLI usage limits
+
+The fork lets the official first-party `agy` CLI use its native OS keyring authentication without
+spoofing `SSH_CONNECTION`, setting `AGY_ACP_FORCE_FILE_STORAGE=1`, or cloning plaintext
+`antigravity-oauth-token` files into temporary profile directories. `GEMINI_HOME` remains isolated
+per T3 profile for sessions, brain artifacts, hooks, MCP config, and skills, and isolated helper
+profiles (`text-profile-*`) skip user hooks/MCP/rules links without copying credentials.
 
 Upstream removed direct HTTP calls to Google's internal Antigravity quota APIs (`#43026`). The
 fork keeps **Usage → Limits** working for Antigravity via the official first-party CLI's
 `-p /usage --output-format json --print-timeout 15s` command in the fork-only module
 [antigravityCliUsageLimits.ts](../../apps/server/src/provider/antigravityCliUsageLimits.ts),
 attached in [AntigravityDriver.ts](../../apps/server/src/provider/Drivers/AntigravityDriver.ts)
-without modifying `AntigravityProvider.ts`. It runs in an isolated temp `GEMINI_HOME` with a
-5-minute per-instance cache (never on the 1-minute health check) and automatically yields if
-upstream later re-adds native `usageLimits` to `AntigravityProvider`. If upstream does, remove the
-wrapper call in `AntigravityDriver.ts` and delete `antigravityCliUsageLimits.ts` and its test.
+without modifying `AntigravityProvider.ts`. It runs with the user's real `HOME` and native OS
+keyring (stripping `SSH_*`, `GEMINI_HOME`, `AGY_ACP_FORCE_FILE_STORAGE`, `DISPLAY`/`WAYLAND_DISPLAY`,
+and ambient API-key variables, with `AGENT_BOARD_HOOKS=off`) under a 5-minute shared cache (never on
+the 1-minute health check) and automatically yields if upstream later re-adds native `usageLimits`
+to `AntigravityProvider`. If upstream does, remove the wrapper call in `AntigravityDriver.ts` and
+delete `antigravityCliUsageLimits.ts` and its test.
 
 ## State retention
 
@@ -209,6 +222,27 @@ runs the same pass. They stop older history from growing; they do not make the f
   note saying how much was removed. Structured tool output, such as images, stays. Reasoning text
   becomes empty and shows as a "Thinking" row. Messages, diffs and checkpoints stay. Removed
   output cannot be recovered.
+- **Antigravity ACP session files.** The fork also runs
+  [AntigravitySessionRetention](../../apps/server/src/provider/acp/AntigravitySessionRetention.ts)
+  alongside the 6-hourly compaction pass, in `t3 doctor`, and immediately on `thread.deleted`
+  (`thread-content.purge`):
+  - **Deleted threads:** once no live session or open file handle remains, resolves linked
+    `invoke_subagent` / swarm child UUIDs (from `brain/<root>/.system_generated/subagents/`,
+    `brain/<root>/.system_generated/swarm/members.json`, and `conversations/<root>.db`), archives
+    their usage records into the persistent usage scan cache, and removes
+    `conversations/<id>.db*`, `brain/<id>/`, and `annotations/<id>.pbtxt` for both children and
+    parent.
+  - **Settled threads:** after **24 hours** for automated (`mcp:`, `subagent:`, `delegated-task:`)
+    threads and **7 days** for interactive threads, cascades full removal to child subagent
+    sessions and prunes the parent's `conversations/<id>.db*`, `annotations/<id>.pbtxt`,
+    `brain/<id>/.system_generated/`, and `brain/<id>/scratch/`. User-facing artifacts directly
+    under `brain/<id>/` stay until thread deletion. Reopening a pruned settled thread cleanly
+    starts a fresh Antigravity session using T3's portable context handoff.
+  - **Orphan sessions:** native session files unreferenced by `statev2.sqlite` or any protected
+    parent session are swept once older than **24 hours** and not held open by any process.
+  - **Safety guards:** active/unsettled threads, live in-process sessions, files with open OS
+    handles (`lsof`), and `.db` files whose usage records fail to scan or persist to the usage
+    cache are never removed.
 
 Related upstream work: issue #28903 (retention for events and turn items), PR #29806 (one-day
 event window) and PR #22548 (provider-turn updates).
@@ -500,9 +534,28 @@ update in a new session; without it, the update stops with the agent that starte
 The detached run waits 75 seconds, so the agent's last reply is saved, then asks the app to quit.
 When the app still runs after 90 seconds, it sends SIGTERM to the app's main process only: the
 process under `Contents/MacOS` that launchd owns, or the pid passed as an argument. Once the app
-and `statev2.sqlite` are free, it backs up the database with `VACUUM INTO` and moves the old app
-to `~/.t3-swap-backup/<time>-update/`, copies the new build into `/Applications` and opens it.
-When a step fails, it reopens the old app and the log says which step.
+and `statev2.sqlite` are free, it backs up the database with `VACUUM INTO` (verifying
+`PRAGMA quick_check = ok`) and moves the old app to `~/.t3-swap-backup/<time>-update/`, copies the
+new build into `/Applications` and opens it. When a step fails, it reopens the old app and the log
+says which step.
+
+- **Live database defragmentation.** Because `VACUUM INTO` already produces a verified compacted
+  snapshot while the app is stopped, the update reuses it to replace the live `statev2.sqlite`
+  whenever reclaiming intra-page B-tree slack saves at least **10%** (`T3_UPDATE_DEFRAG_MIN_PCT`)
+  and **64 MiB** (`T3_UPDATE_DEFRAG_MIN_MIB`). It clones the verified snapshot into place (clearing
+  the old `-wal`/`-shm` together and checking `PRAGMA quick_check = ok` before unlinking the old
+  file) while keeping the pre-swap backup in `~/.t3-swap-backup/<time>-update/statev2.sqlite`. Pass
+  `--no-defrag` (or `T3_UPDATE_DEFRAG=0`) to skip replacing the live database.
+- **Backup retention.** After the new app opens, the script prunes older
+  `<YYYYMMDD>-<HHMMSS>-update` backup folders directly under `~/.t3-swap-backup/`, keeping the
+  newest **`T3_UPDATE_KEEP=1`** by default (counting the folder created by the current run). Set
+  `T3_UPDATE_KEEP=<N>` (`N >= 1`) to keep more. Pruning orders strictly by folder name (never
+  modification time), never follows symlinks, never touches `latest`, its target, or non-`-update`
+  folders (such as the initial Nightly swap), and skips pruning if the update fails. `--dry-run`
+  lists the folders that would be pruned without changing anything.
+- **Staged build cleanup.** After `ditto` and launching the new app succeed, the script removes
+  the staged build directory (`~/.t3-fork/build` for default builds). Pass `--keep-build` to
+  preserve it (for example when building once and inspecting the bundle).
 
 To go back to the previous build, quit the app and move the old app from that backup folder to
 `/Applications`. Restore the database backup only when the newer build ran migrations the older

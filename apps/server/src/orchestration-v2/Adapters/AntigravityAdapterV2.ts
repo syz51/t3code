@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
@@ -37,6 +38,7 @@ import {
   describeAntigravitySubagentLaunches,
   readAntigravityChildrenAtWork,
   readAntigravityPendingReply,
+  readAntigravitySubagentTranscript,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
@@ -65,6 +67,7 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
+const isNativeAntigravitySessionId = Schema.is(Schema.String.check(Schema.isUUID(4)));
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -158,10 +161,40 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  const prunedSessionLoadError = Effect.fnUntraced(function* (sessionId: string | undefined) {
+    if (
+      profileDirectory === undefined ||
+      sessionId === undefined ||
+      !isNativeAntigravitySessionId(sessionId)
+    ) {
+      return undefined;
+    }
+    const conversationsDir = options.path.join(
+      profileDirectory,
+      "antigravity-acp",
+      "conversations",
+    );
+    const dbPath = options.path.join(conversationsDir, `${sessionId}.db`);
+    const hasConversationsDir = yield* options.fileSystem
+      .exists(conversationsDir)
+      .pipe(Effect.orElseSucceed(() => false));
+    if (!hasConversationsDir) return undefined;
+    const hasDb = yield* options.fileSystem.exists(dbPath).pipe(Effect.orElseSucceed(() => true));
+    if (hasDb) return undefined;
+    return new EffectAcpErrors.AcpRequestError({
+      method: "session/load",
+      code: -32002,
+      errorMessage: "Antigravity session database was pruned; starting a fresh session.",
+    });
+  });
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
+      const missingResumeError = yield* prunedSessionLoadError(input.resumeSessionId);
+      if (missingResumeError !== undefined) {
+        return yield* missingResumeError;
+      }
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -212,6 +245,22 @@ export function makeAntigravityAcpAdapterFlavor(
             return update === undefined ? Effect.void : updates.withPermit(handler(update));
           });
         },
+        loadSession: (sessionId, loadOptions) =>
+          prunedSessionLoadError(sessionId).pipe(
+            Effect.flatMap((missing) =>
+              missing !== undefined
+                ? Effect.fail(missing)
+                : runtime.loadSession(sessionId, loadOptions),
+            ),
+          ),
+        resumeSession: (sessionId, resumeOptions) =>
+          prunedSessionLoadError(sessionId).pipe(
+            Effect.flatMap((missing) =>
+              missing !== undefined
+                ? Effect.fail(missing)
+                : runtime.resumeSession(sessionId, resumeOptions),
+            ),
+          ),
         start: () =>
           runtime.start().pipe(
             Effect.tap(
@@ -335,6 +384,23 @@ export function makeAntigravityAcpAdapterFlavor(
               profileDirectory,
               rootSessionId: sessionId,
               toolCallIds: nativeTaskIds,
+            }),
+          readSubagentTranscript: ({
+            sessionId,
+            nativeTaskId,
+            childSessionId,
+            launch,
+            siblings,
+            finalize,
+          }) =>
+            readAntigravitySubagentTranscript({
+              profileDirectory,
+              rootSessionId: sessionId,
+              nativeTaskId,
+              childSessionId,
+              launch,
+              siblings,
+              finalize,
             }),
           hasPendingReply: (sessionId: string) =>
             readAntigravityPendingReply({

@@ -10,7 +10,7 @@ import { CLAUDE_SYNTHETIC_MODEL } from "../provider/Drivers/claudeUsage.ts";
 import { mergeUsageCopies } from "./usageAggregation.ts";
 import { GUARD_LENGTH, type TranscriptParsePosition } from "./usageTranscriptReader.ts";
 
-const USAGE_SCAN_CACHE_VERSION = 17 as const;
+const USAGE_SCAN_CACHE_VERSION = 18 as const;
 const SPEED_COMPATIBLE_SINCE_VERSION = 4;
 
 /**
@@ -18,8 +18,9 @@ const SPEED_COMPATIBLE_SINCE_VERSION = 4;
  * replace it, dropping saved usage for deleted transcripts. Separate files keep
  * the newer one; older files are removed once it is saved.
  */
-export const SCAN_CACHE_FILE_NAME = "usage-scan-cache-v17.json";
+export const SCAN_CACHE_FILE_NAME = "usage-scan-cache-v18.json";
 export const LEGACY_SCAN_CACHE_FILE_NAMES = [
+  "usage-scan-cache-v17.json",
   "usage-scan-cache-v16.json",
   "usage-scan-cache-v15.json",
   "usage-scan-cache-v14.json",
@@ -66,6 +67,7 @@ type SerializedRecord = readonly [
   rateModelIndex?: number | null,
   unresolvedServiceTierTurnId?: string | null,
   cacheCreation1hTokens?: number,
+  modelCalls?: number,
 ];
 
 interface SerializedFile {
@@ -125,11 +127,17 @@ function serializeFile(entry: CachedFile, tables: InternTables): SerializedFile 
     record.rateModel === undefined
       ? null
       : intern(tables.models, tables.modelIndex, record.rateModel),
-    ...(record.cacheCreation1hTokens !== undefined
-      ? ([record.unresolvedServiceTierTurnId ?? null, record.cacheCreation1hTokens] as const)
-      : record.unresolvedServiceTierTurnId !== undefined
-        ? ([record.unresolvedServiceTierTurnId] as const)
-        : ([] as const)),
+    ...(record.modelCalls !== undefined && record.modelCalls > 1
+      ? ([
+          record.unresolvedServiceTierTurnId ?? null,
+          record.cacheCreation1hTokens ?? 0,
+          record.modelCalls,
+        ] as const)
+      : record.cacheCreation1hTokens !== undefined
+        ? ([record.unresolvedServiceTierTurnId ?? null, record.cacheCreation1hTokens] as const)
+        : record.unresolvedServiceTierTurnId !== undefined
+          ? ([record.unresolvedServiceTierTurnId] as const)
+          : ([] as const)),
   ];
   return {
     s: entry.size,
@@ -177,6 +185,7 @@ function isRecordArray(value: unknown): value is readonly unknown[] {
 export function decodeScanCache(
   document: unknown,
   formats: ReadonlyMap<UsageProviderKind, TranscriptUsageFormat<unknown>>,
+  scanProviders?: ReadonlySet<UsageProviderKind>,
 ): ScanCache {
   const cache: ScanCache = new Map();
   const isValidState = makeStateValidators(formats);
@@ -222,6 +231,7 @@ export function decodeScanCache(
         rateModelIndex,
         unresolvedServiceTierTurnId,
         cacheCreation1h = 0,
+        modelCalls = 1,
       ] = row as SerializedRecord;
       const speed = typeof speedIndex === "number" ? SPEEDS[speedIndex] : undefined;
 
@@ -233,6 +243,9 @@ export function decodeScanCache(
         model === undefined ||
         (unresolvedServiceTierTurnId != null && typeof unresolvedServiceTierTurnId !== "string") ||
         !Number.isFinite(cacheCreation1h) ||
+        typeof modelCalls !== "number" ||
+        !Number.isFinite(modelCalls) ||
+        modelCalls < 0 ||
         (rateModelIndex != null && rateModel === undefined) ||
         !Number.isFinite(uncached) ||
         !Number.isFinite(cached) ||
@@ -248,6 +261,7 @@ export function decodeScanCache(
       // parser cannot remove their previously saved local placeholders.
       if (provider === "claude" && model === CLAUDE_SYNTHETIC_MODEL) continue;
 
+      const calls = Math.trunc(modelCalls);
       records.push({
         provider,
         timestampMs,
@@ -264,6 +278,7 @@ export function decodeScanCache(
         ...(cacheCreation1h > 0 ? { cacheCreation1hTokens: cacheCreation1h } : {}),
         reportedCostUsd: typeof reportedCostUsd === "number" ? reportedCostUsd : null,
         speed,
+        ...(calls > 1 ? { modelCalls: calls } : {}),
         ...(version >= 7 && unresolvedServiceTierTurnId != null
           ? { unresolvedServiceTierTurnId }
           : {}),
@@ -288,7 +303,8 @@ export function decodeScanCache(
     if (typeof entry.s !== "number" || typeof entry.m !== "number") continue;
     if (entry.p === undefined) continue;
     const format = formats.get(entry.p);
-    if (format === undefined) continue;
+    const isScanProvider = format === undefined && scanProviders?.has(entry.p) === true;
+    if (format === undefined && !isScanProvider) continue;
     if (!isRecordArray(entry.r) || !isRecordArray(entry.t)) continue;
     const malformedCount = entry.mr === undefined ? 0 : entry.mr;
     if (!Number.isSafeInteger(malformedCount) || malformedCount < 0) continue;
@@ -320,19 +336,23 @@ export function decodeScanCache(
     ) {
       continue;
     }
-    // Keep history for deleted rollouts, but re-parse incompatible reducer state.
-    // v13 adds Claude 1-hour cache writes; v14 uses Codex request ledgers.
-    // v15 repairs skipped Codex requests whose counters rewound; clean v14 entries stay served.
-    // v17 keys Grok turns by time, restoring turns previously dropped as repeats.
+    // Keep history for deleted rollouts, but re-parse incompatible reducer state:
+    // v13 1h cache writes, v14 Codex ledgers, v15 rewound Codex counters,
+    // v17 time-keyed Grok turns, v18 Grok modelCalls for per-call context tiers.
     const legacy =
-      (entry.p === "claude" && version < 13) ||
-      (entry.p === "grok" && version < 17) ||
-      (format.state !== undefined &&
-        (version < 6 ||
-          (entry.p === "codex" && (version < 14 || (version < 15 && malformedCount > 0)))));
+      !isScanProvider &&
+      ((entry.p === "claude" && version < 13) ||
+        (entry.p === "grok" && version < 18) ||
+        (format?.state !== undefined &&
+          (version < 6 ||
+            (entry.p === "codex" && (version < 14 || (version < 15 && malformedCount > 0))))));
     // A corrupt state disqualifies the entry: resuming with it would attach
     // appended usage to the wrong model or replay fork-copied history.
-    if (!legacy && !isValidState.get(entry.p)?.(entry.cs)) continue;
+    if (isScanProvider) {
+      if (entry.cs !== null) continue;
+    } else if (!legacy && !isValidState.get(entry.p)?.(entry.cs)) {
+      continue;
+    }
     // Before v16 a Codex baseline can lack the time of its latest move, or carry an older one,
     // and that time keeps a re-emitted older snapshot from billing twice. A grown file re-parses
     // whole instead of resuming.

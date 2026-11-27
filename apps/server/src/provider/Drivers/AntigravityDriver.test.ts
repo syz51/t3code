@@ -134,16 +134,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
         'if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then',
         ...(options.usageJson === undefined
           ? ["  exit 1"]
-          : [
-              ...(options.writeCliTokenOnLaunch === undefined
-                ? []
-                : [
-                    '  mkdir -p "$GEMINI_HOME/antigravity-acp"',
-                    `  printf '%s' ${shellQuote(options.writeCliTokenOnLaunch)} > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"`,
-                  ]),
-              `  printf '%s\\n' ${shellQuote(options.usageJson)}`,
-              "  exit 0",
-            ]),
+          : [`  printf '%s\\n' ${shellQuote(options.usageJson)}`, "  exit 0"]),
         "fi",
         ...(options.writeCliTokenOnLaunch === undefined
           ? []
@@ -355,6 +346,25 @@ const layerTest = ProviderHostLive.layer.pipe(
 
 it.layer(layerTest)("AntigravityDriver", (it) => {
   it.effect.skipIf(windowsHost)(
+    "reports an incompatible managed runtime during a health check",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.refresh();
+        const installed = yield* h.makeExecutable("1.5.0", { agentVersion: "1.5.0" });
+        h.controls.selected = installed;
+        const rejected = yield* h.refresh().pipe(Effect.flip);
+        expect(rejected.detail).toContain("Update it in Antigravity setup");
+
+        expect(yield* h.instance.snapshot.refresh).toMatchObject({
+          status: "error",
+          version: "1.5.0",
+          message: rejected.detail,
+        });
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
     "refreshes the selected executable and limits form capabilities to chat",
     () =>
       Effect.gen(function* () {
@@ -392,7 +402,8 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
             "antigravity-acp",
           ]);
           expect(launch.profileDirectory).toBe(h.profileDirectory);
-          expect(launch.forceFileStorage).toBe("1");
+          expect(launch.forceFileStorage).toBeUndefined();
+          expect(launch.environment.SSH_CONNECTION).toBeUndefined();
           expect(launch.extendEnv).toBe(false);
         }
         for (const launch of h.launches) expect(launch.credentialKeys).toEqual([]);
@@ -579,41 +590,52 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
       }),
   );
 
-  it.effect.skipIf(windowsHost)(
-    "refuses to open a session on a PATH executable older than 1.5",
-    () =>
-      Effect.gen(function* () {
-        const h = yield* makeHarness();
-        const old = yield* h.makeExecutable("runtime old", { agentVersion: "1.4.5" });
-        h.controls.selected = { ...old, source: "path", version: null };
-        const threadId = ThreadId.make("thread-antigravity-old-runtime");
-        const modelSelection = { instanceId: h.instance.instanceId, model: "gemini-test-low" };
-        const error = yield* Effect.scoped(
-          Effect.gen(function* () {
-            const workspace = yield* h.fs.makeTempDirectoryScoped({ prefix: "t3-ag-old-runtime-" });
-            const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-              runtimeMode: "approval-required",
-              interactionMode: "default",
-              cwd: workspace,
-            });
-            const session = yield* h.instance.orchestrationAdapter.openSession({
-              threadId,
-              providerSessionId: ProviderSessionId.make("provider-session-antigravity-old-runtime"),
-              modelSelection,
-              runtimePolicy,
-            });
-            yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
-          }),
-        ).pipe(Effect.flip);
-        const message = `Antigravity 1.4.5 does not work with this T3 Code release. Update the Antigravity executable at ${old.executablePath} to >=1.5.12 <2, then retry.`;
-        expect(knownProviderFailureMessage(error)).toBe(message);
-        expect((yield* h.refresh().pipe(Effect.flip)).detail).toBe(message);
-        const methods = (yield* h.readRequests).map((request) => request.method);
-        expect(methods).toContain("initialize");
-        expect(methods).not.toContain("session/new");
-        yield* h.assertClosed;
-      }),
-  );
+  for (const [agentVersion, expected] of [
+    ["1.4.5", "does not work with this T3 Code release"],
+    // 1.5.0 offers Claude and GPT only to allowlisted editors such as Zed.
+    ["1.5.0", "only serves allowlisted editors, not T3 Code"],
+  ] as const) {
+    it.effect.skipIf(windowsHost)(
+      `refuses to open a session on a PATH executable at ${agentVersion}`,
+      () =>
+        Effect.gen(function* () {
+          const h = yield* makeHarness();
+          const old = yield* h.makeExecutable("runtime old", { agentVersion });
+          h.controls.selected = { ...old, source: "path", version: null };
+          const threadId = ThreadId.make("thread-antigravity-old-runtime");
+          const modelSelection = { instanceId: h.instance.instanceId, model: "gemini-test-low" };
+          const error = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const workspace = yield* h.fs.makeTempDirectoryScoped({
+                prefix: "t3-ag-old-runtime-",
+              });
+              const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                cwd: workspace,
+              });
+              const session = yield* h.instance.orchestrationAdapter.openSession({
+                threadId,
+                providerSessionId: ProviderSessionId.make(
+                  "provider-session-antigravity-old-runtime",
+                ),
+                modelSelection,
+                runtimePolicy,
+              });
+              yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+            }),
+          ).pipe(Effect.flip);
+          const target = agentVersion === "1.4.5" ? ">=1.5.12 <2" : "1.5.1 or newer";
+          const message = `Antigravity ${agentVersion} ${expected}. Update the Antigravity executable at ${old.executablePath} to ${target}, then retry.`;
+          expect(knownProviderFailureMessage(error)).toBe(message);
+          expect((yield* h.refresh().pipe(Effect.flip)).detail).toBe(message);
+          const methods = (yield* h.readRequests).map((request) => request.method);
+          expect(methods).toContain("initialize");
+          expect(methods).not.toContain("session/new");
+          yield* h.assertClosed;
+        }),
+    );
+  }
 
   it.effect.skipIf(windowsHost)(
     "closes refresh processes and clears account metadata when Google sign-in is required",
@@ -816,22 +838,23 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
-    "syncs a renewed CLI token back from isolated text generation and reads auth.email from local token",
+    "uses native OS keyring auth for isolated text generation without cloning or syncing OAuth token files",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness();
         const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
         const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
         yield* h.fs.makeDirectory(acpDir, { recursive: true });
-        const expiredToken = JSON.stringify({
+        const staleToken = JSON.stringify({
           token: {
-            access_token: "expired-access",
+            access_token: "stale-access",
             token_type: "Bearer",
             refresh_token: "refresh-a",
             expiry: "2020-01-01T00:00:00Z",
           },
           id_token_email: "user@example.com",
         });
+        yield* h.fs.writeFileString(tokenPath, staleToken);
         const renewedToken = JSON.stringify({
           token: {
             access_token: "renewed-access",
@@ -845,12 +868,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           writeCliTokenOnLaunch: renewedToken,
         });
 
-        // 1. Explicit snapshot.refresh populates auth.email from the local CLI token file.
-        yield* h.fs.writeFileString(tokenPath, expiredToken);
-        const refreshed = yield* h.instance.snapshot.refresh;
-        expect(refreshed.auth.email).toBe("user@example.com");
-
-        // 2. Isolated text generation syncs its renewed token back to the owning profile on scope exit.
+        const launchesBefore = h.launches.length;
         yield* h.instance.textGeneration
           .generateThreadTitle({
             cwd: h.profileDirectory,
@@ -858,27 +876,14 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
             modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
           })
           .pipe(Effect.ignore);
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
-
-        // 3. Isolated text generation never overwrites a newer token already on disk.
-        const evenNewerToken = JSON.stringify({
-          token: {
-            access_token: "even-newer-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-a",
-            expiry: "2099-06-01T00:00:00Z",
-          },
-          id_token_email: "user@example.com",
-        });
-        yield* h.fs.writeFileString(tokenPath, evenNewerToken);
-        yield* h.instance.textGeneration
-          .generateThreadTitle({
-            cwd: h.profileDirectory,
-            message: "Name another thread",
-            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
-          })
-          .pipe(Effect.ignore);
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(evenNewerToken);
+        const helperLaunch = h.launches
+          .slice(launchesBefore)
+          .find((launch) => launch.tempDirectory !== undefined);
+        expect(helperLaunch).toBeDefined();
+        expect(helperLaunch?.forceFileStorage).toBeUndefined();
+        expect(helperLaunch?.environment.SSH_CONNECTION).toBeUndefined();
+        // Never syncs plaintext OAuth tokens back to disk.
+        expect(yield* h.fs.readFileString(tokenPath)).toBe(staleToken);
         yield* h.assertClosed;
       }),
   );
@@ -1041,35 +1046,17 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
-    "reads usage limits via isolated `agy -p /usage --output-format json` and syncs renewed tokens back",
+    "reads usage limits via native-keyring `agy -p /usage --output-format json` without SSH spoofing or token files",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness({
           environment: [
             { name: "DISPLAY", value: ":99" },
             { name: "WAYLAND_DISPLAY", value: "wayland-1" },
+            { name: "SSH_CONNECTION", value: "10.0.0.1 50000 10.0.0.2 22" },
+            { name: "AGY_ACP_FORCE_FILE_STORAGE", value: "1" },
+            { name: "GEMINI_API_KEY", value: "should-be-stripped" },
           ],
-        });
-        const acpDir = h.path.join(h.profileDirectory, "antigravity-acp");
-        const tokenPath = h.path.join(acpDir, "antigravity-oauth-token");
-        yield* h.fs.makeDirectory(acpDir, { recursive: true });
-        const initialToken = JSON.stringify({
-          token: {
-            access_token: "initial-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-usage",
-            expiry: "2020-01-01T00:00:00Z",
-          },
-          id_token_email: "usage-probe@example.com",
-        });
-        const renewedToken = JSON.stringify({
-          token: {
-            access_token: "renewed-usage-access",
-            token_type: "Bearer",
-            refresh_token: "refresh-usage",
-            expiry: "2099-01-01T00:00:00Z",
-          },
-          id_token_email: "usage-probe@example.com",
         });
         const usageJson = JSON.stringify({
           status: "SUCCESS",
@@ -1111,12 +1098,9 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         });
         h.controls.selected = yield* h.makeExecutable("runtime usage", {
           usageJson,
-          writeCliTokenOnLaunch: renewedToken,
         });
-        yield* h.fs.writeFileString(tokenPath, initialToken);
 
         const refreshed = yield* h.instance.snapshot.refresh;
-        expect(refreshed.usageLimits?.credentialFingerprint).toMatch(/^email:[0-9a-f]{64}$/);
         expect(refreshed.usageLimits?.windows).toEqual([
           {
             id: "3p-5h",
@@ -1155,18 +1139,22 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           "--print-timeout",
           "15s",
         ]);
-        expect(usageLaunch?.profileDirectory).toContain("usage-profile-");
-        expect(usageLaunch?.profileDirectory).not.toBe(h.profileDirectory);
-        expect(usageLaunch?.forceFileStorage).toBe("1");
+        expect(usageLaunch?.profileDirectory).toBeUndefined();
+        expect(usageLaunch?.forceFileStorage).toBeUndefined();
         expect(usageLaunch?.credentialKeys).toEqual([]);
         expect(usageLaunch?.environment.DISPLAY).toBeUndefined();
         expect(usageLaunch?.environment.WAYLAND_DISPLAY).toBeUndefined();
-        expect(usageLaunch?.environment.SSH_CONNECTION).toBe("127.0.0.1 1 127.0.0.1 22");
-        expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
-        if (usageLaunch?.profileDirectory) {
-          expect(yield* h.fs.exists(usageLaunch.profileDirectory)).toBe(false);
+        if (HostProcess.Platform.defaultValue() === "darwin") {
+          expect(usageLaunch?.environment.SSH_CONNECTION).toBeUndefined();
         }
-        expect(yield* h.fs.readFileString(tokenPath)).toBe(renewedToken);
+        expect(usageLaunch?.environment.GEMINI_API_KEY).toBeUndefined();
+        expect(usageLaunch?.environment.BROWSER).toBe("");
+        expect(usageLaunch?.environment.AGENT_BOARD_HOOKS).toBe("off");
+        expect(usageLaunch?.environment.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+        expect(
+          usageLaunch?.tempDirectory?.startsWith(`${h.directories.runtimeTemp}${h.path.sep}`),
+        ).toBe(true);
+        expect(refreshed.usageLimits?.credentialFingerprint).toBe("keyring:oauth-personal");
         yield* h.assertClosed;
       }),
   );

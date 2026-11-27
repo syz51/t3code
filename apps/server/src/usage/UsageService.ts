@@ -103,6 +103,7 @@ const providerRateModels = new Map(
 const transcriptFormats = new Map(
   transcriptReaders.map(({ reader }) => [reader.provider, reader.format] as const),
 );
+const scanProviderKinds = new Set(scanReaders.map(({ reader }) => reader.provider));
 
 interface TranscriptSource {
   readonly provider: UsageProviderKind;
@@ -161,11 +162,23 @@ const decodeCachedSources = Schema.decodeUnknownOption(
   }),
 );
 
+export interface ArchivedUsageFile {
+  readonly path: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly records: readonly UsageRecord[];
+}
+
 export class UsageService extends Context.Service<
   UsageService,
   {
     readonly readSummary: (input: UsageSummaryInput) => Effect.Effect<UsageSummary, UsageReadError>;
     readonly refreshRates: Effect.Effect<UsagePricing>;
+    /** Persists parsed records for scanned files (e.g. Antigravity DBs) before they are pruned. */
+    readonly archiveScannedFiles: (
+      provider: UsageProviderKind,
+      files: ReadonlyArray<ArchivedUsageFile>,
+    ) => Effect.Effect<boolean>;
   }
 >()("t3/usage/UsageService") {}
 
@@ -469,7 +482,7 @@ export const make = Effect.gen(function* () {
         cacheDirty = document !== null;
       }
       if (document === null) return;
-      const decoded = decodeScanCache(document, transcriptFormats);
+      const decoded = decodeScanCache(document, transcriptFormats, scanProviderKinds);
       for (const [path, entry] of decoded) fileCache.set(path, entry);
       const saved = (document as { readonly files?: unknown }).files;
       const complete =
@@ -1269,7 +1282,150 @@ export const make = Effect.gen(function* () {
     return yield* Deferred.await(deferred);
   });
 
-  return { readSummary, refreshRates, awaitPersisted } as const;
+  const archiveScannedFiles = Effect.fn("UsageService.archiveScannedFiles")(function* (
+    provider: UsageProviderKind,
+    files: ReadonlyArray<ArchivedUsageFile>,
+  ) {
+    if (files.length === 0) return true;
+    yield* ensureScanCacheLoaded;
+    let changed = false;
+    for (const file of files) {
+      const records = dedupeWithinFile(file.records);
+      if (records.length === 0) continue;
+      const canonical = yield* fileSystem
+        .realPath(file.path)
+        .pipe(Effect.orElseSucceed(() => file.path));
+      const existing = fileCache.get(canonical);
+      const next: CachedFile = {
+        size: file.size,
+        mtimeMs: file.mtimeMs,
+        provider,
+        records,
+        tailRecords: [],
+        malformedRecords: [],
+        position: { resumeOffset: 0, guardLength: 0, guardHash: 0, state: null },
+      };
+      if (
+        existing === undefined ||
+        existing.provider !== provider ||
+        isLaterRead(next, existing) ||
+        existing.records.length < next.records.length
+      ) {
+        fileCache.set(canonical, next);
+        changed = true;
+      }
+    }
+    if (!changed && !cacheDirty) return true;
+    if (changed) cacheDirty = true;
+    yield* persistCaches;
+    return !cacheDirty;
+  });
+
+  return { readSummary, refreshRates, archiveScannedFiles, awaitPersisted } as const;
 });
 
 export const layer = Layer.effect(UsageService, make);
+
+/**
+ * Offline scan-cache archiver for maintenance paths (such as `t3 doctor`) when no live
+ * `UsageService` is running. Preserves existing cached entries, sources, and coverage metadata.
+ */
+export const archiveScannedFilesOffline = Effect.fn("UsageService.archiveScannedFilesOffline")(
+  function* (input: {
+    readonly stateDir: string;
+    readonly provider: UsageProviderKind;
+    readonly files: ReadonlyArray<ArchivedUsageFile>;
+  }) {
+    const nonEmpty = input.files
+      .map((file) => ({ ...file, records: dedupeWithinFile(file.records) }))
+      .filter((file) => file.records.length > 0);
+    if (nonEmpty.length === 0) return true;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const scanCachePath = path.join(input.stateDir, SCAN_CACHE_FILE_NAME);
+    const readDocument = (filePath: string) =>
+      fileSystem.readFileString(filePath).pipe(
+        Effect.flatMap((raw) => decodeScanCacheFile(raw)),
+        Effect.catchCause(() => Effect.succeed(null)),
+      );
+    const currentExists = yield* fileSystem
+      .exists(scanCachePath)
+      .pipe(Effect.catchCause(() => Effect.succeed(true)));
+    let document: unknown = null;
+    let current = false;
+    if (currentExists) {
+      document = yield* readDocument(scanCachePath);
+      // Fail closed if an existing current scan cache cannot be read or decoded so we never
+      // overwrite prior Claude/Codex/Antigravity history with a partial snapshot.
+      if (document === null) return false;
+      current = true;
+    } else {
+      for (const fileName of LEGACY_SCAN_CACHE_FILE_NAMES) {
+        const legacyPath = path.join(input.stateDir, fileName);
+        const legacyExists = yield* fileSystem
+          .exists(legacyPath)
+          .pipe(Effect.catchCause(() => Effect.succeed(false)));
+        if (!legacyExists) continue;
+        document = yield* readDocument(legacyPath);
+        if (document === null) return false;
+        break;
+      }
+    }
+    const cache: ScanCache =
+      document === null
+        ? new Map()
+        : decodeScanCache(document, transcriptFormats, scanProviderKinds);
+    const savedFiles =
+      document === null ? undefined : (document as { readonly files?: unknown }).files;
+    const complete =
+      typeof savedFiles === "object" &&
+      savedFiles !== null &&
+      Object.keys(savedFiles).length === cache.size;
+    const keepCoveredSince = current && complete && cache.size > 0;
+    const extraSources = document === null ? Option.none() : decodeCachedSources(document);
+    let changed = false;
+    for (const file of nonEmpty) {
+      const canonical = yield* fileSystem
+        .realPath(file.path)
+        .pipe(Effect.orElseSucceed(() => file.path));
+      const existing = cache.get(canonical);
+      const next: CachedFile = {
+        size: file.size,
+        mtimeMs: file.mtimeMs,
+        provider: input.provider,
+        records: file.records,
+        tailRecords: [],
+        malformedRecords: [],
+        position: { resumeOffset: 0, guardLength: 0, guardHash: 0, state: null },
+      };
+      if (
+        existing === undefined ||
+        existing.provider !== input.provider ||
+        isLaterRead(next, existing) ||
+        existing.records.length < next.records.length
+      ) {
+        cache.set(canonical, next);
+        changed = true;
+      }
+    }
+    if (!changed) return true;
+    const writeScanCache = makeScanCacheWriter();
+    const extra = Option.match(extraSources, {
+      onNone: () => ({ sources: {}, coveredSince: {} }),
+      onSome: (saved) => ({
+        sources: saved.sources,
+        coveredSince: keepCoveredSince ? (saved.coveredSince ?? {}) : {},
+      }),
+    });
+    return yield* Effect.sync(() => writeScanCache(cache, extra)).pipe(
+      Effect.flatMap((contents) =>
+        writeFileStringAtomically({ filePath: scanCachePath, contents }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        ),
+      ),
+      Effect.as(true),
+      Effect.catchCause(() => Effect.succeed(false)),
+    );
+  },
+);

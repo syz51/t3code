@@ -2653,6 +2653,134 @@ describe("UsageService", () => {
     }),
   );
 
+  it.effect(
+    "retains archived Antigravity usage in the scan cache after the session database is pruned",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        const prefix = "usage-service-antigravity-pruned-archive-test";
+        const stateDir = NodePath.join(home, prefix, "userdata");
+        const conversations = NodePath.join(
+          stateDir,
+          "providers",
+          "antigravity",
+          "ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32",
+          "antigravity-acp",
+          "conversations",
+        );
+        const dbPath = NodePath.join(conversations, "11111111-1111-4111-8111-111111111111.db");
+        yield* Effect.promise(async () => {
+          await NodeFSP.mkdir(conversations, { recursive: true });
+          const db = new NodeSqlite.DatabaseSync(dbPath);
+          try {
+            db.exec("CREATE TABLE steps (idx INTEGER, metadata BLOB)");
+            const metadata = new Uint8Array([
+              0x4a,
+              4,
+              0x10,
+              100,
+              0x18,
+              19,
+              ...Buffer.from("420608a087b7d306", "hex"),
+            ]);
+            db.prepare("INSERT INTO steps VALUES (?, ?)").run(0, metadata);
+          } finally {
+            db.close();
+          }
+        });
+        yield* Effect.gen(function* () {
+          const firstService = yield* UsageService.make;
+          const root = yield* Effect.promise(() => NodeFSP.realpath(conversations));
+          const canonicalDb = yield* Effect.promise(() => NodeFSP.realpath(dbPath));
+          const archived = yield* firstService.archiveScannedFiles("antigravity", [
+            {
+              path: canonicalDb,
+              size: 4096,
+              mtimeMs: Date.parse("2026-08-01T10:00:00Z"),
+              records: [
+                {
+                  provider: "antigravity",
+                  sessionId: "11111111-1111-4111-8111-111111111111",
+                  timestampMs: Date.parse("2026-08-01T10:00:00Z"),
+                  model: "gemini-4-neon",
+                  totals: {
+                    uncachedInputTokens: 100,
+                    cachedInputTokens: 0,
+                    cacheCreationTokens: 0,
+                    outputTokens: 19,
+                    reasoningTokens: 0,
+                  },
+                  reportedCostUsd: null,
+                  speed: "standard",
+                  dedupeKey: "antigravity:11111111-1111-4111-8111-111111111111:step:0:0",
+                },
+              ],
+            },
+          ]);
+          assert.isTrue(archived);
+          yield* Effect.promise(() => NodeFSP.rm(dbPath, { force: true }));
+
+          const reloadedService = yield* UsageService.make;
+          const summary = yield* reloadedService.readSummary(WINDOW);
+          assert.strictEqual(
+            summary.buckets
+              .filter((bucket) => bucket.provider === "antigravity" && bucket.sourcePath === root)
+              .reduce((sum, bucket) => sum + bucket.totals.outputTokens, 0),
+            19,
+          );
+        }).pipe(Effect.provide(layerService({ prefix, home, settings })));
+      }),
+  );
+
+  it.effect("keeps Antigravity history from a removed instance's T3-managed profile", () =>
+    Effect.gen(function* () {
+      const { settings, home } = yield* setup;
+      const prefix = "usage-service-antigravity-removed-profile-test";
+      const stateDir = NodePath.join(home, prefix, "userdata");
+      const conversations = NodePath.join(
+        stateDir,
+        "providers",
+        "antigravity",
+        // sha256("antigravity-2"), a profile whose instance is no longer in providerInstances.
+        "97f81140feefaccf1e7435718682af520bf6d1a03bfba6ea2eed5c2cabf8be73",
+        "antigravity-acp",
+        "conversations",
+      );
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(conversations, { recursive: true });
+        const db = new NodeSqlite.DatabaseSync(NodePath.join(conversations, "profile.db"));
+        try {
+          db.exec("CREATE TABLE steps (idx INTEGER, metadata BLOB)");
+          // Step protobuf: 100 input tokens, 7 output tokens, and 2026-08-01T10:00Z.
+          const metadata = new Uint8Array([
+            0x4a,
+            4,
+            0x10,
+            100,
+            0x18,
+            7,
+            ...Buffer.from("420608a087b7d306", "hex"),
+          ]);
+          db.prepare("INSERT INTO steps VALUES (?, ?)").run(0, metadata);
+        } finally {
+          db.close();
+        }
+      });
+      yield* Effect.gen(function* () {
+        assert.notProperty(settings.providerInstances, "antigravity-2");
+        const service = yield* UsageService.make;
+        const summary = yield* service.readSummary(WINDOW);
+        const root = yield* Effect.promise(() => NodeFSP.realpath(conversations));
+        assert.strictEqual(
+          summary.buckets
+            .filter((bucket) => bucket.provider === "antigravity" && bucket.sourcePath === root)
+            .reduce((sum, bucket) => sum + bucket.totals.outputTokens, 0),
+          7,
+        );
+      }).pipe(Effect.provide(layerService({ prefix, home, settings })));
+    }),
+  );
+
   it.effect("reads configured and disabled accounts once across shared and aliased homes", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
@@ -3580,7 +3708,7 @@ describe("UsageService", () => {
             60 + 20 * (version === 4 ? 1 : 2),
           );
           yield* upgraded.awaitPersisted;
-          assert.strictEqual(SCAN_CACHE_FILE_NAME, "usage-scan-cache-v17.json");
+          assert.strictEqual(SCAN_CACHE_FILE_NAME, "usage-scan-cache-v18.json");
           assert.deepStrictEqual(
             (yield* Effect.promise(() => NodeFSP.readdir(stateDir)))
               .filter((name) => name.startsWith("usage-scan-cache"))
@@ -4406,5 +4534,75 @@ describe("UsageService", () => {
         `interruption left the next matching request pending at scheduler check ${orphanedAt}`,
       );
     }),
+  );
+
+  it.effect(
+    "archiveScannedFilesOffline fails closed when an existing scan cache cannot be decoded and clears coveredSince on legacy upgrade",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "usage-offline-archive-" });
+        const cachePath = NodePath.join(tempDir, SCAN_CACHE_FILE_NAME);
+        const sampleFile = {
+          path: NodePath.join(tempDir, "session.db"),
+          size: 128,
+          mtimeMs: 1_700_000_000_000,
+          records: [
+            {
+              provider: "antigravity" as const,
+              timestampMs: Date.parse("2026-08-01T10:00:00Z"),
+              model: "gemini-2.5-pro",
+              sessionId: "session-offline-1",
+              totals: {
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheCreationTokens: 0,
+                outputTokens: 25,
+                reasoningTokens: 0,
+              },
+              reportedCostUsd: null,
+              speed: "standard" as const,
+              dedupeKey: "session-offline-1:0",
+            },
+          ],
+        };
+
+        // 1. Corrupt existing current cache -> must fail closed and leave file untouched.
+        yield* fs.writeFileString(cachePath, "{not-valid-json");
+        const failed = yield* UsageService.archiveScannedFilesOffline({
+          stateDir: tempDir,
+          provider: "antigravity",
+          files: [sampleFile],
+        });
+        assert.isFalse(failed);
+        assert.equal(yield* fs.readFileString(cachePath), "{not-valid-json");
+
+        // 2. Legacy v16 cache with coveredSince -> upgrades cleanly while dropping coveredSince.
+        yield* fs.remove(cachePath);
+        const legacyPath = NodePath.join(tempDir, "usage-scan-cache-v16.json");
+        yield* fs.writeFileString(
+          legacyPath,
+          JSON.stringify({
+            version: 16,
+            models: [],
+            sessions: [],
+            files: {},
+            sources: {},
+            coveredSince: { claude: 1_700_000_000_000 },
+          }),
+        );
+        const upgraded = yield* UsageService.archiveScannedFilesOffline({
+          stateDir: tempDir,
+          provider: "antigravity",
+          files: [sampleFile],
+        });
+        assert.isTrue(upgraded);
+        const written = JSON.parse(yield* fs.readFileString(cachePath)) as {
+          coveredSince?: Record<string, number>;
+          files: Record<string, { p: string }>;
+        };
+        assert.deepEqual(written.coveredSince ?? {}, {});
+        assert.equal(Object.values(written.files)[0]?.p, "antigravity");
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
