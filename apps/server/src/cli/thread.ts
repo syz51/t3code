@@ -13,6 +13,7 @@ import {
   type OrchestratorMcpThreadDetail,
   type OrchestratorMcpThreadListItem,
   type OrchestratorMcpThreadRun,
+  type OrchestratorMcpThreadSendInput,
   type OrchestratorMcpThreadStatus,
   type OrchestratorMcpThreadReadToolItem,
 } from "@t3tools/contracts";
@@ -1021,16 +1022,41 @@ const threadStartCommand = Command.make("start", {
   ),
 );
 
+const THREAD_SEND_MODES = ["queue", "auto", "steer", "restart"] as const satisfies ReadonlyArray<
+  NonNullable<OrchestratorMcpThreadSendInput["mode"]>
+>;
+
+const sendModeFlag = Flag.Literals("mode", THREAD_SEND_MODES).pipe(
+  Flag.withDescription(
+    "Delivery mode: queue (default) starts an idle thread or queues the next turn; auto starts an idle thread, steers a running turn, or queues; steer steers a running turn mid-flight; restart interrupts and restarts a running turn.",
+  ),
+  Flag.withDefault("queue"),
+);
+
+const formatSendResult = (result: OrchestratorMcpThreadSendResult): string => {
+  switch (result.delivery) {
+    case "started":
+      return "Sent.";
+    case "queued":
+      return "Queued.";
+    case "steered":
+      return "Steered.";
+    case "restarted":
+      return "Restarted.";
+  }
+};
+
 const threadSendCommand = Command.make("send", {
   ...projectLocationFlags,
   thread: threadArgument,
   message: messageArgument,
+  mode: sendModeFlag,
   outputSchema: outputSchemaFlag,
   wait: waitFlag,
   json: jsonFlag,
 }).pipe(
   Command.withDescription(
-    "Send a message to a thread. A busy thread gets it as its next turn; nothing is interrupted.",
+    "Send a message to a thread. Defaults to --mode queue (starts an idle thread or queues behind a running turn).",
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
@@ -1044,7 +1070,7 @@ const threadSendCommand = Command.make("send", {
           const followWakes = flags.wait ? yield* threadIsIdle(tools, threadId) : false;
           const sent = yield* tools.call(
             "t3_thread_send",
-            { threadId, message, mode: "queue", ...output },
+            { threadId, message, mode: flags.mode, ...output },
             OrchestratorMcpThreadSendResult,
           );
           if (flags.wait) {
@@ -1055,9 +1081,7 @@ const threadSendCommand = Command.make("send", {
               followWakes,
             });
           }
-          yield* flags.json
-            ? printJson(sent)
-            : Console.log(sent.delivery === "queued" ? "Queued." : "Sent.");
+          yield* flags.json ? printJson(sent) : Console.log(formatSendResult(sent));
         }),
       );
     }).pipe(reportThreadErrors),

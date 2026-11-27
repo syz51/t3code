@@ -1,7 +1,7 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { AuthSessionId, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
+import { AuthSessionId, MessageId, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NetService from "@t3tools/shared/Net";
 import * as ConfigProvider from "effect/ConfigProvider";
@@ -1123,4 +1123,384 @@ it.effect("interrupt routes server and tool errors through reportThreadErrors", 
       assert.deepStrictEqual((yield* TestConsole.errorLines).slice(before), [testCase.message]);
     }
   }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+const messageId = MessageId.make("message-1");
+
+it.effect("send passes --mode (defaulting to queue) and formats each delivery outcome", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-send-mode-");
+    const calls: Array<{ readonly tool: string; readonly args: Record<string, unknown> }> = [];
+    const cases = [
+      {
+        label: "default mode on idle thread",
+        flags: [] as ReadonlyArray<string>,
+        expectedMode: "queue",
+        result: { threadId, messageId, runId, status: "running", delivery: "started" },
+        expectedLine: "Sent.",
+      },
+      {
+        label: "default mode on running thread",
+        flags: [] as ReadonlyArray<string>,
+        expectedMode: "queue",
+        result: { threadId, messageId, runId, status: "queued", delivery: "queued" },
+        expectedLine: "Queued.",
+      },
+      {
+        label: "explicit --mode queue on running thread",
+        flags: ["--mode", "queue"],
+        expectedMode: "queue",
+        result: { threadId, messageId, runId, status: "queued", delivery: "queued" },
+        expectedLine: "Queued.",
+      },
+      {
+        label: "--mode auto on idle thread",
+        flags: ["--mode", "auto"],
+        expectedMode: "auto",
+        result: { threadId, messageId, runId, status: "running", delivery: "started" },
+        expectedLine: "Sent.",
+      },
+      {
+        label: "--mode auto on running thread (steers)",
+        flags: ["--mode", "auto"],
+        expectedMode: "auto",
+        result: { threadId, messageId, runId, status: "running", delivery: "steered" },
+        expectedLine: "Steered.",
+      },
+      {
+        label: "--mode auto on unsteerable running thread (queues)",
+        flags: ["--mode", "auto"],
+        expectedMode: "auto",
+        result: { threadId, messageId, runId, status: "queued", delivery: "queued" },
+        expectedLine: "Queued.",
+      },
+      {
+        label: "--mode steer on running thread",
+        flags: ["--mode", "steer"],
+        expectedMode: "steer",
+        result: { threadId, messageId, runId, status: "running", delivery: "steered" },
+        expectedLine: "Steered.",
+      },
+      {
+        label: "--mode restart on running thread",
+        flags: ["--mode", "restart"],
+        expectedMode: "restart",
+        result: { threadId, messageId, runId, status: "running", delivery: "restarted" },
+        expectedLine: "Restarted.",
+      },
+    ] as const;
+
+    let index = 0;
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          calls.push({ tool, args });
+          const next = cases[index++];
+          return next === undefined
+            ? Effect.die(`unexpected ${tool} call`)
+            : Effect.succeed({ structuredContent: next.result });
+        },
+      }),
+    );
+
+    for (const testCase of cases) {
+      yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "send",
+        threadId,
+        "Hello",
+        ...testCase.flags,
+        "--base-dir",
+        baseDir,
+      ]);
+      assert.strictEqual(
+        (yield* TestConsole.logLines).at(-1),
+        testCase.expectedLine,
+        testCase.label,
+      );
+    }
+
+    assert.deepStrictEqual(
+      calls,
+      cases.map((testCase) => ({
+        tool: "t3_thread_send",
+        args: { threadId, message: "Hello", mode: testCase.expectedMode },
+      })),
+    );
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("send --json prints the decoded result for each mode", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-send-json-");
+    const cases = [
+      {
+        mode: "queue",
+        result: { threadId, messageId, runId, status: "queued", delivery: "queued" },
+      },
+      {
+        mode: "auto",
+        result: { threadId, messageId, runId, status: "running", delivery: "steered" },
+      },
+      {
+        mode: "steer",
+        result: { threadId, messageId, runId, status: "running", delivery: "steered" },
+      },
+      {
+        mode: "restart",
+        result: { threadId, messageId, runId, status: "running", delivery: "restarted" },
+      },
+    ] as const;
+
+    let index = 0;
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          if (tool !== "t3_thread_send") return Effect.die(`unexpected ${tool} call`);
+          const next = cases[index++];
+          if (next === undefined) return Effect.die("extra t3_thread_send call");
+          assert.strictEqual(args.mode, next.mode);
+          return Effect.succeed({ structuredContent: next.result });
+        },
+      }),
+    );
+
+    for (const testCase of cases) {
+      yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        "send",
+        threadId,
+        "Hello",
+        "--mode",
+        testCase.mode,
+        "--json",
+        "--base-dir",
+        baseDir,
+      ]);
+      assert.deepStrictEqual(
+        JSON.parse(String((yield* TestConsole.logLines).at(-1))),
+        testCase.result,
+        testCase.mode,
+      );
+    }
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("send --mode steer on an idle thread reports the server error cleanly", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-send-steer-idle-");
+    const serverMessage =
+      'Thread thread-1 has no active turn to steer. Use mode: "auto" or "queue" to start a new turn.';
+    const calls: Array<{ readonly tool: string; readonly args: Record<string, unknown> }> = [];
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          calls.push({ tool, args });
+          return Effect.succeed({
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  _tag: "OrchestratorMcpFailure",
+                  code: "thread_not_sendable",
+                  message: serverMessage,
+                }),
+              },
+            ],
+          });
+        },
+      }),
+    );
+
+    const before = (yield* TestConsole.errorLines).length;
+    const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+      "send",
+      threadId,
+      "Redirect now",
+      "--mode",
+      "steer",
+      "--base-dir",
+      baseDir,
+    ]).pipe(Effect.flip);
+
+    assert.strictEqual(error._tag, "ThreadToolFailedError");
+    assert.strictEqual(error.message, serverMessage);
+    assert.deepStrictEqual((yield* TestConsole.errorLines).slice(before), [serverMessage]);
+    assert.deepStrictEqual(calls, [
+      { tool: "t3_thread_send", args: { threadId, message: "Redirect now", mode: "steer" } },
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect(
+  "send --mode auto --wait follows wakes on an idle thread and skips them when steering",
+  () =>
+    Effect.gen(function* () {
+      const baseDir = yield* makeRunningBaseDir("t3-thread-send-wait-");
+      const runScenario = (idle: boolean) =>
+        Effect.gen(function* () {
+          const calls: Array<{ readonly tool: string; readonly args: Record<string, unknown> }> =
+            [];
+          let waitCalls = 0;
+          using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+            Effect.succeed({
+              call: (tool, args) => {
+                calls.push({ tool, args });
+                if (tool === "t3_thread_wait") {
+                  waitCalls += 1;
+                  if (waitCalls === 1) {
+                    return Effect.succeed({
+                      structuredContent: {
+                        threadId,
+                        runId: idle ? null : runId,
+                        status: idle ? "idle" : "running",
+                        timedOut: !idle,
+                      },
+                    });
+                  }
+                  return Effect.succeed({
+                    structuredContent: {
+                      threadId,
+                      runId,
+                      status: "completed",
+                      timedOut: false,
+                      ...(args.untilDelegatedWorkSettled
+                        ? { resultRun: { runId, status: "completed" } }
+                        : {}),
+                    },
+                  });
+                }
+                if (tool === "t3_thread_send") {
+                  return Effect.succeed({
+                    structuredContent: {
+                      threadId,
+                      messageId,
+                      runId,
+                      status: "running",
+                      delivery: idle ? "started" : "steered",
+                    },
+                  });
+                }
+                if (tool === "t3_thread_read") {
+                  if (args.view === "messages") {
+                    return Effect.succeed({
+                      structuredContent: {
+                        items: [
+                          {
+                            position: 0,
+                            itemId: "item-1",
+                            runId,
+                            messageId: null,
+                            type: "assistant_message",
+                            status: "completed",
+                            text: idle ? "Idle reply" : "Steered reply",
+                            updatedAt: "2026-01-01T00:00:00.000Z",
+                          },
+                        ],
+                        nextPosition: 0,
+                        hasMore: false,
+                      },
+                    });
+                  }
+                  return Effect.succeed({
+                    structuredContent: {
+                      recentRuns: [
+                        {
+                          runId,
+                          ordinal: 1,
+                          status: "completed",
+                          providerInstanceId: "codex",
+                          model: "test",
+                          requestedAt: "2026-01-01T00:00:00.000Z",
+                          startedAt: "2026-01-01T00:00:00.000Z",
+                          completedAt: "2026-01-01T00:00:01.000Z",
+                        },
+                      ],
+                      items: [],
+                      nextPosition: null,
+                      hasMore: false,
+                    },
+                  });
+                }
+                return Effect.die(`unexpected ${tool} call`);
+              },
+            }),
+          );
+
+          yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+            "send",
+            threadId,
+            "Follow up",
+            "--mode",
+            "auto",
+            "--wait",
+            "--base-dir",
+            baseDir,
+          ]);
+
+          assert.strictEqual(
+            (yield* TestConsole.logLines).at(-1),
+            idle ? "Idle reply" : "Steered reply",
+          );
+          const sendCall = calls.find((entry) => entry.tool === "t3_thread_send");
+          assert.deepStrictEqual(sendCall?.args, {
+            threadId,
+            message: "Follow up",
+            mode: "auto",
+          });
+          const settledWait = calls.some(
+            (entry) =>
+              entry.tool === "t3_thread_wait" &&
+              entry.args.runId === runId &&
+              entry.args.untilDelegatedWorkSettled === true,
+          );
+          assert.strictEqual(settledWait, idle);
+        });
+
+      yield* runScenario(true);
+      yield* runScenario(false);
+    }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("send rejects an invalid --mode before opening a session", () =>
+  Effect.gen(function* () {
+    const baseDir = yield* makeRunningBaseDir("t3-thread-send-invalid-mode-");
+    using session = vi
+      .spyOn(McpBridge, "mcpToolSession")
+      .mockReturnValue(Effect.die("no session should open"));
+
+    const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+      "send",
+      threadId,
+      "Hello",
+      "--mode",
+      "bogus",
+      "--base-dir",
+      baseDir,
+    ]).pipe(Effect.flip);
+
+    if (!CliError.isCliError(error) || error._tag !== "ShowHelp") {
+      assert.fail(`Expected ShowHelp, got ${String(error)}`);
+    }
+    const flagError = error.errors[0];
+    if (flagError?._tag !== "InvalidValue") {
+      assert.fail(`Expected InvalidValue, got ${String(flagError?._tag)}`);
+    }
+    assert.strictEqual(flagError.option, "mode");
+    assert.strictEqual(flagError.value, "bogus");
+    assert.strictEqual(session.mock.calls.length, 0);
+  }).pipe(Effect.scoped, Effect.provide(cliTestLayer)),
+);
+
+it.effect("send --help documents --mode choices and default behavior", () =>
+  Effect.gen(function* () {
+    yield* Command.runWith(threadCommand, { version: "0.0.0" })(["send", "--help"]);
+    const help = (yield* TestConsole.logLines).join("\n");
+    assert.include(help, "--mode");
+    assert.include(help, "queue");
+    assert.include(help, "auto");
+    assert.include(help, "steer");
+    assert.include(help, "restart");
+    assert.include(help, "idle");
+    assert.include(help, "running");
+  }).pipe(Effect.provide(Layer.mergeAll(cliTestLayer, Layer.fresh(TestConsole.layer)))),
 );
