@@ -53,4 +53,5 @@ t3 thread list
 ```
 
 - By default, `start` uses the project's configured new-thread workspace (a new worktree from its default branch or the project folder). Pass `--worktree <base-branch>`, `--local` (force the project folder), `--title` / `--generate-title`, `--provider <id> --model <slug>`, `--option id=value` (e.g. `reasoningEffort=high` for Codex, `effort=high` for Claude), or `-` to read the prompt from stdin. Use `interrupt` to stop a thread's running turn.
+- `send` defaults to `--mode queue` (starts an idle thread or queues the next turn). Pass `--mode auto` to steer a running turn (or start/queue otherwise), `--mode steer` to steer a running turn mid-flight, or `--mode restart` to interrupt and restart a running turn.
 - `--wait` prints the reply and exits `1` on failure/stop or `2` when waiting for user input. Add `--json` for structured output including the thread ID.
