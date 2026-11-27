@@ -2016,11 +2016,12 @@ it.effect.skipIf(!symlinksSupported)("preserves relative links when replacing di
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
 );
 
-it("selects local macOS fork signing only for unsigned macOS -fork. builds on darwin", () => {
+it("selects local macOS fork signing only for unsigned macOS dir -fork. builds on darwin", () => {
   assert.isTrue(
     shouldSignMacForkBuild({
       hostPlatform: "darwin",
       platform: "mac",
+      target: "dir",
       signed: false,
       appVersion: "0.1.13-fork.20261126",
     }),
@@ -2029,6 +2030,16 @@ it("selects local macOS fork signing only for unsigned macOS -fork. builds on da
     shouldSignMacForkBuild({
       hostPlatform: "darwin",
       platform: "mac",
+      target: "dmg",
+      signed: false,
+      appVersion: "0.1.13-fork.20261126",
+    }),
+  );
+  assert.isFalse(
+    shouldSignMacForkBuild({
+      hostPlatform: "darwin",
+      platform: "mac",
+      target: "dir",
       signed: true,
       appVersion: "0.1.13-fork.20261126",
     }),
@@ -2037,6 +2048,7 @@ it("selects local macOS fork signing only for unsigned macOS -fork. builds on da
     shouldSignMacForkBuild({
       hostPlatform: "darwin",
       platform: "mac",
+      target: "dir",
       signed: false,
       appVersion: "0.1.13-nightly.20261126.1",
     }),
@@ -2045,6 +2057,7 @@ it("selects local macOS fork signing only for unsigned macOS -fork. builds on da
     shouldSignMacForkBuild({
       hostPlatform: "linux",
       platform: "mac",
+      target: "dir",
       signed: false,
       appVersion: "0.1.13-fork.20261126",
     }),

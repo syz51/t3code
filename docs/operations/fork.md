@@ -421,12 +421,12 @@ rebuilds on both Macs.
   EOF
   /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -config "$tmp/ext.cnf"
-  /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+  /usr/bin/openssl pkcs12 -export -name "T3 Code Fork" -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
     -out "$tmp/id.p12" -passout pass:temp-import
   security import "$tmp/id.p12" -k ~/Library/Keychains/login.keychain-db \
     -P temp-import -T /usr/bin/codesign
   # Allow unattended signing by /usr/bin/codesign with no GUI prompt (prompts for the Air login keychain password once).
-  security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l "T3 Code Fork" \
     ~/Library/Keychains/login.keychain-db
   scripts/fork-app-sign.sh --check-identity
   ```
@@ -561,4 +561,4 @@ To go back to the previous build, quit the app and move the old app from that ba
 `/Applications`. Restore the database backup only when the newer build ran migrations the older
 one does not know. Verify an installed or copied fork build with
 `codesign --verify --deep --strict "/Applications/T3 Code (Beta).app"` (or
-`scripts/fork-app-sign.sh --verify`).
+`scripts/fork-app-sign.sh --verify "/Applications/T3 Code (Beta).app"`).

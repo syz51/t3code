@@ -3655,12 +3655,14 @@ export const validateMacPackagedPayload = Effect.fn("desktopArtifact.validateMac
 export function shouldSignMacForkBuild(input: {
   readonly hostPlatform: string;
   readonly platform: typeof BuildPlatform.Type;
+  readonly target: string;
   readonly signed: boolean;
   readonly appVersion: string;
 }): boolean {
   return (
     input.hostPlatform === "darwin" &&
     input.platform === "mac" &&
+    input.target === "dir" &&
     !input.signed &&
     input.appVersion.includes("-fork.")
   );
@@ -3829,6 +3831,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
   const signMacForkBuild = shouldSignMacForkBuild({
     hostPlatform,
     platform: options.platform,
+    target: options.target,
     signed: options.signed,
     appVersion,
   });
