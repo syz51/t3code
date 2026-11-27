@@ -1715,6 +1715,19 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       ).toBe(41);
 
       yield* runGit(repoDir, ["config", "--unset", "branch.feature/no-upstream-fork.remote"]);
+      // Local branch behind its published remote ref (e.g. follow-up commit pushed elsewhere).
+      yield* runGit(repoDir, ["checkout", "-b", "behind-push", "feature/no-upstream-fork"]);
+      yield* runGit(repoDir, ["commit", "--allow-empty", "-m", "Push follow-up commit"]);
+      yield* runGit(repoDir, ["push", "fork", "HEAD:refs/heads/feature/no-upstream-fork"]);
+      yield* runGit(repoDir, ["checkout", "feature/no-upstream-fork"]);
+      const { manager: behindManager } = yield* makeManager({ providerScenario });
+      expect(
+        (yield* behindManager.branchPullRequest({
+          cwd: repoDir,
+          branch: "feature/no-upstream-fork",
+        }))?.number,
+      ).toBe(41);
+
       yield* runGit(repoDir, ["checkout", "-b", "diverged-push", "main"]);
       yield* runGit(repoDir, ["commit", "--allow-empty", "-m", "Rewrite fork head"]);
       yield* runGit(repoDir, [
@@ -3188,6 +3201,9 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* runGit(repoDir, ["branch", "--track", "t3code/pr-300/main", "origin/main"]);
       yield* runGit(repoDir, ["branch", "--track", "feature/fork-merged", "origin/main"]);
       yield* runGit(repoDir, ["branch", "--track", "feature/fork-open", "origin/main"]);
+      yield* runGit(repoDir, ["branch", "--no-track", "feature/fork-behind", "origin/main"]);
+      yield* runGit(repoDir, ["branch", "--no-track", "feature/fork-pruned", "origin/main"]);
+      yield* runGit(repoDir, ["branch", "--no-track", "feature/upstream-pruned", "origin/main"]);
       yield* runGit(repoDir, [
         "push",
         "origin",
@@ -3195,6 +3211,12 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         "feature/fork-merged",
         "feature/fork-open",
       ]);
+      // Push a follow-up commit to origin/feature/fork-behind so the local branch stays behind.
+      yield* runGit(repoDir, ["checkout", "-b", "temp/behind-tip", "feature/fork-behind"]);
+      yield* runGit(repoDir, ["commit", "--allow-empty", "-m", "Follow-up pushed to fork"]);
+      yield* runGit(repoDir, ["push", "origin", "HEAD:refs/heads/feature/fork-behind"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      yield* runGit(repoDir, ["branch", "-D", "temp/behind-tip"]);
       yield* configureVisibleRemoteUrlWithLocalRewrite(
         repoDir,
         "origin",
@@ -3211,6 +3233,17 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       const { service, calls } = createFakeSourceControlProvider({
         prListByRepository: {
           "contributor/codething-mvp": [
+            {
+              number: 11,
+              title: "Old reverse merge from main inside fork",
+              url: "https://github.com/contributor/codething-mvp/pull/11",
+              baseRefName: "release",
+              headRefName: "main",
+              state: "merged",
+              isCrossRepository: false,
+              headRepositoryNameWithOwner: "contributor/codething-mvp",
+              headRepositoryOwnerLogin: "contributor",
+            },
             {
               number: 12,
               title: "Merged inside the fork",
@@ -3229,6 +3262,28 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
               baseRefName: "main",
               headRefName: "feature/fork-open",
               state: "open",
+              isCrossRepository: false,
+              headRepositoryNameWithOwner: "contributor/codething-mvp",
+              headRepositoryOwnerLogin: "contributor",
+            },
+            {
+              number: 14,
+              title: "Merged inside the fork while local is behind",
+              url: "https://github.com/contributor/codething-mvp/pull/14",
+              baseRefName: "main",
+              headRefName: "feature/fork-behind",
+              state: "merged",
+              isCrossRepository: false,
+              headRepositoryNameWithOwner: "contributor/codething-mvp",
+              headRepositoryOwnerLogin: "contributor",
+            },
+            {
+              number: 15,
+              title: "Merged inside the fork and remote ref pruned",
+              url: "https://github.com/contributor/codething-mvp/pull/15",
+              baseRefName: "main",
+              headRefName: "feature/fork-pruned",
+              state: "merged",
               isCrossRepository: false,
               headRepositoryNameWithOwner: "contributor/codething-mvp",
               headRepositoryOwnerLogin: "contributor",
@@ -3254,6 +3309,16 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
               url: "https://github.com/pingdotgg/codething-mvp/pull/224",
               headRefName: "feature/published",
               state: "open",
+            },
+          ],
+          "feature/upstream-pruned": [
+            {
+              ...forkPullRequest,
+              number: 301,
+              title: "Merged upstream and fork ref pruned",
+              url: "https://github.com/pingdotgg/codething-mvp/pull/301",
+              headRefName: "feature/upstream-pruned",
+              state: "merged",
             },
           ],
         },
@@ -3305,6 +3370,70 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
           { refresh: true, includeHeadRepository: true },
         ),
       ).toBeNull();
+      // Base-tracking unpublished branch must not inherit a merged PR from main inside the fork.
+      expect(
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "t3code/new-thread" },
+          { refresh: true, includeHeadRepository: true },
+        ),
+      ).toBeNull();
+
+      // No-upstream branch behind its fork remote ref still finds a merged fork PR for cleanup.
+      expect(
+        yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/fork-behind" }),
+      ).toBeNull();
+      expect(
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "feature/fork-behind" },
+          { refresh: true, includeHeadRepository: true },
+        ),
+      ).toMatchObject({
+        number: 14,
+        state: "merged",
+        repositoryKey: "github.com/contributor/codething-mvp",
+      });
+
+      // No-upstream branch whose fork remote ref was pruned after merge stays quiet for status,
+      // but cleanup finds its merged PR in the fork or upstream.
+      const callsBeforePrunedStatus = calls.length;
+      expect(
+        yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/fork-pruned" }),
+      ).toBeNull();
+      expect(calls.length).toBe(callsBeforePrunedStatus);
+      expect(
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "feature/fork-pruned" },
+          { refresh: true, includeHeadRepository: true },
+        ),
+      ).toMatchObject({
+        number: 15,
+        state: "merged",
+        repositoryKey: "github.com/contributor/codething-mvp",
+      });
+      expect(
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "feature/upstream-pruned" },
+          { refresh: true, includeHeadRepository: true },
+        ),
+      ).toMatchObject({
+        number: 301,
+        state: "merged",
+        repositoryKey: "github.com/pingdotgg/codething-mvp",
+      });
+
+      // Base-tracking branch whose own fork remote ref was deleted & pruned after merge.
+      yield* runGit(repoDir, ["push", "origin", "--delete", "feature/fork-merged"]);
+      yield* runGit(repoDir, ["fetch", "--prune", "origin"]);
+      expect(
+        yield* manager.branchPullRequest(
+          { cwd: repoDir, branch: "feature/fork-merged" },
+          { refresh: true, includeHeadRepository: true },
+        ),
+      ).toMatchObject({
+        number: 12,
+        state: "merged",
+        repositoryKey: "github.com/contributor/codething-mvp",
+      });
     }),
   );
 

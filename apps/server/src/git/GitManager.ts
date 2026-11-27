@@ -1596,14 +1596,14 @@ export const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
           if (!lookup) {
-            return { latest: null, headContext };
+            return { latest: null, headContext, lookup: false, unpublished: true };
           }
           if (
             details.localBranchExists &&
             (details.upstreamRef === null || headContext.remoteName === null) &&
             (yield* isUnpublishedBranch(cwd, headContext))
           ) {
-            return { latest: null, headContext };
+            return { latest: null, headContext, lookup: true, unpublished: true };
           }
           const shared = yield* prLookupGitReads;
           if (isActivePrLookupGitReads(shared, cwd)) {
@@ -1611,7 +1611,7 @@ export const make = Effect.gen(function* () {
           }
           const latest = yield* findLatestPrForHeadContext(cwd, headContext, details.defaultBranch);
           if (latest !== null) yield* noteLookupState(latest);
-          return { latest, headContext };
+          return { latest, headContext, lookup: true, unpublished: false };
         }),
       );
     },
@@ -2191,34 +2191,41 @@ export const make = Effect.gen(function* () {
     if (exactRemotes.length > 1) return null;
     let remoteName = exactRemotes[0]?.name;
     if (remoteName === undefined) {
-      const ancestorRemotes = yield* Effect.forEach(
+      const isAncestor = (ancestorOid: string, descendantOid: string) =>
+        gitCore
+          .execute({
+            operation: "GitManager.findPublishedBranchRemote.ancestor",
+            cwd,
+            args: ["merge-base", "--is-ancestor", ancestorOid, descendantOid],
+            allowNonZeroExit: true,
+            timeoutMs: 5_000,
+          })
+          .pipe(
+            Effect.flatMap((result) => {
+              // Exit 1 means non-ancestor; other failures must reject inference rather than pick another fork.
+              if (result.exitCode === 0) return Effect.succeed(true);
+              if (result.exitCode === 1) return Effect.succeed(false);
+              return new GitCommandError({
+                operation: "GitManager.findPublishedBranchRemote.ancestor",
+                command: "git merge-base --is-ancestor",
+                cwd,
+                exitCode: result.exitCode,
+                detail: "Ancestry probe failed; rejecting ancestry inference.",
+              });
+            }),
+          );
+      const relatedRemotes = yield* Effect.forEach(
         remoteRefs,
         (remote) =>
-          gitCore
-            .execute({
-              operation: "GitManager.findPublishedBranchRemote.ancestor",
-              cwd,
-              args: ["merge-base", "--is-ancestor", remote.oid, localOid],
-              allowNonZeroExit: true,
-              timeoutMs: 5_000,
-            })
-            .pipe(
-              Effect.flatMap((result) => {
-                // Exit 1 means non-ancestor; other failures must reject inference rather than pick another fork.
-                if (result.exitCode === 0) return Effect.succeed(remote.name);
-                if (result.exitCode === 1) return Effect.succeed(null);
-                return new GitCommandError({
-                  operation: "GitManager.findPublishedBranchRemote.ancestor",
-                  command: "git merge-base --is-ancestor",
-                  cwd,
-                  exitCode: result.exitCode,
-                  detail: "Ancestry probe failed; rejecting ancestry inference.",
-                });
-              }),
+          isAncestor(remote.oid, localOid).pipe(
+            Effect.flatMap((remoteIsAncestor) =>
+              remoteIsAncestor ? Effect.succeed(true) : isAncestor(localOid, remote.oid),
             ),
+            Effect.map((related) => (related ? remote.name : null)),
+          ),
         { concurrency: "unbounded" },
       );
-      const matches = ancestorRemotes.filter((name) => name !== null);
+      const matches = relatedRemotes.filter((name) => name !== null);
       if (matches.length !== 1) return null;
       remoteName = matches[0];
     }
@@ -2360,28 +2367,98 @@ export const make = Effect.gen(function* () {
   });
 
   // A host that targets another repository (gh's upstream) misses a pull request merged
-  // inside the branch's own repository. Kept out of status so it cannot hide Create PR upstream.
+  // inside the branch's own repository, and a pruned remote head skips the primary lookup
+  // on a branch without an upstream. Kept out of status so it cannot hide Create PR upstream.
   const findMergedPrInHeadRepository = Effect.fn("findMergedPrInHeadRepository")(function* (
     cwd: string,
     headContext: BranchHeadContext,
+    options: {
+      readonly lookup: boolean;
+      readonly unpublished: boolean;
+      readonly fallbackRemoteName: string;
+    },
   ) {
-    if (!headContext.isCrossRepository || headContext.headRepositoryNameWithOwner === null) {
-      return null;
-    }
+    const headBranch = options.lookup ? headContext.headBranch : headContext.localBranch;
+    if (headBranch.length === 0) return null;
+
     const provider = yield* sourceControlProvider(cwd);
-    if (provider.createsChangeRequestsIn === undefined) return null;
-    const sameRepository = { ...headContext, isCrossRepository: false };
-    const pullRequests = yield* provider.listChangeRequests({
-      cwd,
-      headSelector: headContext.headBranch,
-      state: "all",
-      limit: 20,
-      repository: headContext.headRepositoryNameWithOwner,
-    });
-    const merged = pullRequests
-      .map(toPullRequestInfo)
-      .filter((pr) => pr.state === "merged" && matchesBranchHeadContext(pr, sameRepository));
-    return Arr.sort(merged, pullRequestUpdatedAtDescOrder)[0] ?? null;
+    const canTargetOtherRepository = provider.createsChangeRequestsIn !== undefined;
+
+    let repositoryNameWithOwner = headContext.headRepositoryNameWithOwner;
+    let ownerLogin = headContext.headRepositoryOwnerLogin;
+    let isCrossRepository = headContext.isCrossRepository;
+
+    if (repositoryNameWithOwner === null && headContext.remoteName === null) {
+      const fallbackRepository = yield* resolveRemoteRepositoryContext(
+        cwd,
+        options.fallbackRemoteName,
+      );
+      if (fallbackRepository.repositoryNameWithOwner !== null) {
+        repositoryNameWithOwner = fallbackRepository.repositoryNameWithOwner;
+        ownerLogin = fallbackRepository.ownerLogin;
+        isCrossRepository =
+          canTargetOtherRepository &&
+          !(yield* targetsRemote(cwd, options.fallbackRemoteName, fallbackRepository));
+      }
+    }
+
+    const queryOwnRepository =
+      (isCrossRepository && canTargetOtherRepository && repositoryNameWithOwner !== null) ||
+      (!isCrossRepository && options.unpublished);
+
+    if (queryOwnRepository) {
+      const sameRepository = {
+        headBranch,
+        headRepositoryNameWithOwner: repositoryNameWithOwner,
+        headRepositoryOwnerLogin: ownerLogin,
+        isCrossRepository: false,
+      };
+      const pullRequests = yield* provider.listChangeRequests({
+        cwd,
+        headSelector: headBranch,
+        state: "all",
+        limit: 20,
+        ...(isCrossRepository && repositoryNameWithOwner !== null
+          ? { repository: repositoryNameWithOwner }
+          : {}),
+      });
+      const merged = pullRequests
+        .map(toPullRequestInfo)
+        .filter((pr) => pr.state === "merged" && matchesBranchHeadContext(pr, sameRepository));
+      const latestMerged = Arr.sort(merged, pullRequestUpdatedAtDescOrder)[0] ?? null;
+      if (latestMerged !== null) return latestMerged;
+    }
+
+    if (isCrossRepository && options.unpublished && repositoryNameWithOwner !== null) {
+      const forkContext = {
+        headBranch,
+        headRepositoryNameWithOwner: repositoryNameWithOwner,
+        headRepositoryOwnerLogin: ownerLogin,
+        isCrossRepository: true,
+      };
+      const probe = headBranchProbe(
+        provider,
+        ownerLogin ? [`${ownerLogin}:${headBranch}`, headBranch] : [headBranch],
+        "all",
+      );
+      const mergedByNumber = new Map<number, PullRequestInfo>();
+      for (const headSelector of probe.headSelectors) {
+        const pullRequests = yield* provider.listChangeRequests({
+          cwd,
+          headSelector,
+          state: "all",
+          limit: probe.limit,
+        });
+        for (const pr of pullRequests.map(toPullRequestInfo)) {
+          if (pr.state === "merged" && matchesBranchHeadContext(pr, forkContext)) {
+            mergedByNumber.set(pr.number, pr);
+          }
+        }
+      }
+      return Arr.sort(mergedByNumber.values(), pullRequestUpdatedAtDescOrder)[0] ?? null;
+    }
+
+    return null;
   });
 
   const findLatestPrForHeadContext = Effect.fn("findLatestPrForHeadContext")(function* (
@@ -3664,17 +3741,20 @@ export const make = Effect.gen(function* () {
         });
       }
     }
+    const isDefaultBranch =
+      branch === defaultBranch ||
+      (defaultBranch === null && (branch === "main" || branch === "master"));
     const latest =
       cached.latest ??
-      (options.includeHeadRepository === true
-        ? yield* findMergedPrInHeadRepository(cacheCwd, cached.headContext)
+      (options.includeHeadRepository === true && !isDefaultBranch
+        ? yield* findMergedPrInHeadRepository(cacheCwd, cached.headContext, {
+            lookup: cached.lookup,
+            unpublished: cached.unpublished,
+            fallbackRemoteName: defaultRemoteName,
+          })
         : null);
     if (latest === null) return null;
-    if (
-      (branch === defaultBranch ||
-        (defaultBranch === null && (branch === "main" || branch === "master"))) &&
-      latest.state !== "open"
-    ) {
+    if (isDefaultBranch && latest.state !== "open") {
       return null;
     }
     return {
