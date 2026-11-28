@@ -70,6 +70,7 @@ const makeHarness = Effect.fn(function* (options: {
 }) {
   const listeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
   const opens: TerminalOpenInput[] = [];
+  const closed: Array<string | undefined> = [];
   const openedSessions: TerminalSessionSnapshot[] = [];
   const loadedProjectFileRoots: string[] = [];
   let session = options.previousSession;
@@ -99,8 +100,9 @@ const makeHarness = Effect.fn(function* (options: {
         return () => listeners.delete(listener);
       }),
     write: (input) => Queue.offer(writes, input.data).pipe(Effect.asVoid),
-    close: () =>
+    close: (input) =>
       Effect.sync(() => {
+        closed.push(input.terminalId);
         session = undefined;
       }).pipe(
         Effect.andThen(
@@ -109,6 +111,7 @@ const makeHarness = Effect.fn(function* (options: {
           }),
         ),
       ),
+    // As if a prompt hook were still running: the idle check keeps the shell.
     closeIdle: () => Effect.void,
     closeOnSettle: () => Effect.void,
   });
@@ -165,6 +168,7 @@ const makeHarness = Effect.fn(function* (options: {
           command: options.command ?? "vp i",
           icon: "configure",
           runOnWorktreeCreate: true,
+          ...(options.trigger === "settle" ? { runOnSettle: true } : {}),
         },
       ],
     },
@@ -179,6 +183,7 @@ const makeHarness = Effect.fn(function* (options: {
     emit,
     openedSessions,
     opens,
+    closed,
     loadedProjectFileRoots,
   };
 });
@@ -189,6 +194,7 @@ const setup = Effect.fn(function* (
     readonly history?: string;
     readonly previousSession?: TerminalSessionSnapshot;
     readonly shell?: string | null;
+    readonly trigger?: "setup" | "settle";
   } = {},
 ) {
   const harness = yield* makeHarness(options);
@@ -265,6 +271,22 @@ describe("ProjectSetupScriptRunner", () => {
       expect(sentinel).toBeDefined();
       yield* emit({ ...event, type: "output", data: `${sentinel}0\r\n% ` });
       expect(yield* completion).toMatchObject({ exitCode: 0 });
+    }),
+  );
+
+  it.effect("closes a successful settle shell even while its prompt is still busy", () =>
+    Effect.gen(function* () {
+      const { result, completion, writes, emit, closed } = yield* setup({ trigger: "settle" });
+      if (result.status !== "started") return yield* Effect.die("settle did not start");
+      const settleEvent = { ...event, terminalId: result.terminalId };
+      yield* emit({ ...settleEvent, type: "output", data: "% \x1b[?2004h" });
+      const sentinel = (yield* Queue.take(writes)).match(/__T3_SETUP_DONE___[a-f0-9]+:/)?.[0];
+      // No prompt follows: the prompt hook is still running when the wait for it ends.
+      yield* emit({ ...settleEvent, type: "output", data: `\r\n${sentinel}0\r\n` });
+      const done = yield* completion.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* TestClock.adjust("1 second");
+      expect(yield* Fiber.join(done)).toMatchObject({ exitCode: 0 });
+      expect(closed).toEqual([result.terminalId]);
     }),
   );
 

@@ -37,6 +37,7 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
   readAntigravityChildrenAtWork,
+  readAntigravityExecutedModel,
   readAntigravityPendingReply,
   readAntigravitySubagentTranscript,
 } from "../../provider/acp/AntigravityChildWork.ts";
@@ -290,7 +291,8 @@ export function makeAntigravityAcpAdapterFlavor(
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
     // Antigravity supports HTTP MCP without advertising mcpCapabilities.http, skipping the stdio bridge.
     mcpOverHttp: true,
-    deferMcpTools: true,
+    // Antigravity freezes its toolbox per turn, so optional T3 tools run through `tool_call`.
+    deferMcpTools: "proxy",
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
     buildAttachmentPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
@@ -407,6 +409,8 @@ export function makeAntigravityAcpAdapterFlavor(
               profileDirectory,
               sessionId,
             }),
+          executedModel: (sessionId: string) =>
+            readAntigravityExecutedModel({ profileDirectory, sessionId }),
         }),
   };
 }
