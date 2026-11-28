@@ -208,15 +208,17 @@ delete `antigravityCliUsageLimits.ts` and its test.
 
 ## State retention
 
-The fork adds two rules to the 6-hourly history compaction in
+The fork adds retention rules to the 6-hourly history compaction in
 [ProjectionMaintenance](../../apps/server/src/orchestration-v2/ProjectionMaintenance.ts). `t3 doctor`
-runs the same pass. They stop older history from growing; they do not make the file much smaller.
+runs the same pass. They stop older history from growing; they do not make the file much smaller
+until space is reclaimed (`incremental_vacuum` or `VACUUM`).
 
-| Table                                    | Readers                                               | Fork rule                                              |
-| ---------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
-| `orchestration_events`                   | reconnect replay, command-id retries, prompt anchors  | drop superseded `turn-item.updated` and `node.updated` |
-| `orchestration_v2_projection_turn_items` | thread views, `getTurnItem`, thread find, MCP context | trim items of threads settled for 7 days               |
-| `orchestration_v2_projection_nodes`      | thread views, recovery                                | none                                                   |
+| Table                                    | Readers                                               | Fork rule                                                                          |
+| ---------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `orchestration_events`                   | reconnect replay, command-id retries, prompt anchors  | drop superseded `turn-item.updated` and `node.updated`                             |
+| `orchestration_v2_projection_turn_items` | thread views, `getTurnItem`, thread find, MCP context | trim long outputs and delete finished `reasoning` rows (+ positions) after 7 days  |
+| `orchestration_v2_projection_nodes`      | thread views, recovery                                | delete settled leaf nodes (`tool_call`, `assistant_message`, `reasoning`) after 7d |
+| Automated threads (`subagent`, `mcp:`)   | parent subagent cards, MCP reads, sidebar history     | soft-delete and purge into tombstones after 14 days settled (interactive kept)     |
 
 - **Superseded updates.** Both event types carry the whole entity, so a newer one replaces an
   older one. Each entity keeps its first update, because clients append an entity where they
@@ -225,19 +227,41 @@ runs the same pass. They stop older history from growing; they do not make the f
   drops only rows older than the previous pass's mark, which is at least an hour old.
   Provider-turn updates stay, because later ones inherit `tokenUsage` (upstream PR #22548
   handles them).
-- **Settled threads.** For a settled thread unchanged for 7 days, each finished command or tool
-  text output longer than 17,408 characters keeps its first and last 8,192 characters, with a
-  note saying how much was removed. Finished `dynamic_tool` structured object and array outputs
-  longer than 17,408 characters are also compacted: embedded base64 images, documents, binary
-  resources, and long `data:...;base64,...` URLs are replaced with text notices (avoiding broken
-  image asset fetches when inspecting the row), string fields longer than 9,216 characters keep
-  their first and last 4,096 characters, redundant `structuredContent` copies are dropped when
-  `content` carries the output, and outputs still larger than 17,408 characters are trimmed to
-  their ends while preserving T3 metadata (`htmlRender`, `t3McpApp`, `sentMessage`,
-  `preview_recording_stop`, `isError`, and thread/task references). The watermark is versioned
-  (`turn-items-compacted-before-v2`) so upgrading backfills already-settled threads once without
-  re-scanning them on later passes. Reasoning text becomes empty and shows as a "Thinking" row.
-  Messages, diffs and checkpoints stay. Removed output cannot be recovered.
+- **Settled threads (7 days).** For a settled thread unchanged for 7 days:
+  - Each finished command or tool text output longer than 17,408 characters keeps its first and
+    last 8,192 characters, with a note saying how much was removed. Finished `dynamic_tool`
+    structured object and array outputs longer than 17,408 characters are also compacted: embedded
+    base64 images, documents, binary resources, and long `data:...;base64,...` URLs are replaced
+    with text notices (avoiding broken image asset fetches when inspecting the row), string fields
+    longer than 9,216 characters keep their first and last 4,096 characters, redundant
+    `structuredContent` copies are dropped when `content` carries the output, and outputs still
+    larger than 17,408 characters are trimmed to their ends while preserving T3 metadata
+    (`htmlRender`, `t3McpApp`, `sentMessage`, `preview_recording_stop`, `isError`, and thread/task
+    references). The watermark is versioned (`turn-items-compacted-before-v2`) so upgrading
+    backfills already-settled threads once without re-scanning them on later passes.
+  - Finished `reasoning` turn items (not referenced as another item's `parent_item_id`) are deleted
+    from `orchestration_v2_projection_turn_items` and `orchestration_v2_turn_item_positions`
+    (database triggers keep item counts exact; any parented reasoning row falls back to cleared
+    empty text).
+  - Settled leaf rows in `orchestration_v2_projection_nodes` (`kind` in `tool_call`,
+    `assistant_message`, `reasoning` with terminal status, including runless provider-native
+    subagent leaves) are deleted while keeping structural nodes (`root_turn`, `subagent`,
+    `todo_list`, `approval_request`, `user_input_request`), any node referenced by
+    `parent_node_id`, `owner_node_id`, `runtime_requests`, or `run_attempts`, and all nodes of
+    multi-attempt runs. Both deletions share a versioned watermark
+    (`settled-projections-pruned-before-v1`) so upgrading backfills already-settled threads once
+    without re-scanning on later passes.
+  - Messages, diffs, checkpoints, and interactive thread transcripts stay. Removed output and
+    reasoning rows cannot be recovered.
+- **Aged automated threads (14 days).** Settled automated threads (`lineage.relationshipToParent =
+  'subagent'` or `mcp:` / `subagent:` / `thread:subagent:` / `thread:delegated-task:` IDs,
+  excluding side chats) unchanged for 14 days are soft-deleted and purged by the existing
+  `purgeThreads` pass into tombstones. Pinned threads, guest-shared threads, live run-fork
+  sources, pending `merge_back` sources, threads with active runs/outbox/requests/provider
+  threads, and subagents of unsettled or active live parent threads are never purged. Interactive
+  user threads are never auto-deleted. Usage history tables (`provider_sessions`,
+  `provider_threads`, `provider_turns`, `run_attempts`, `checkpoints`, `context_transfers`) and
+  parent thread `orchestration_v2_projection_subagents` summaries stay intact.
 - **Antigravity ACP session files.** The fork also runs
   [AntigravitySessionRetention](../../apps/server/src/provider/acp/AntigravitySessionRetention.ts)
   alongside the 6-hourly compaction pass, in `t3 doctor`, and immediately on `thread.deleted`

@@ -92,8 +92,11 @@ const SUPERSEDED_THROUGH = "event-log-superseded-through";
 // Command-id retries replay their own events; keep recent updates for them.
 const SUPERSEDED_GRACE = Duration.hours(1);
 const SETTLED_THREAD_AGE = Duration.days(7);
+const AUTOMATED_THREAD_RETENTION = Duration.days(14);
 // Versioned so upgrading from text-only compaction backfills older settled threads once.
 const TURN_ITEMS_COMPACTED_BEFORE = "turn-items-compacted-before-v2";
+// Versioned so upgrading backfills settled leaf-node and reasoning pruning once without rescanning.
+const SETTLED_PROJECTIONS_PRUNED_BEFORE = "settled-projections-pruned-before-v1";
 const KEPT_OUTPUT_CHARS = 8192;
 const COMPACTED_OUTPUT_MIN_CHARS = 2 * KEPT_OUTPUT_CHARS + 1024;
 const STRUCTURED_KEPT_CHARS = 4096;
@@ -103,6 +106,14 @@ const MAX_STRUCTURED_DEPTH = 32;
 // Each rewritten row is parsed several times; bound one statement's work by bytes.
 const UPDATE_PAGE_BYTES = 4 * 1024 * 1024;
 const SETTLED_ITEM_STATUSES = ["completed", "failed", "interrupted", "cancelled"] as const;
+const SETTLED_NODE_STATUSES = [
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "rolled_back",
+] as const;
+const SETTLED_LEAF_NODE_KINDS = ["tool_call", "assistant_message", "reasoning"] as const;
 const DATA_URL_BASE64_PATTERN = /^data:([^;,]{1,128})(?:;[^,]{0,128})?;base64,/i;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -688,7 +699,8 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
         // Settling bumps updated_at, so a thread settled later enters a later window.
         const threads = yield* sql<{ readonly thread_id: string }>`
           SELECT thread_id FROM orchestration_v2_projection_threads
-          WHERE updated_at < ${cutoffIso} AND updated_at >= ${previousIso}
+          WHERE deleted_at IS NULL
+            AND updated_at < ${cutoffIso} AND updated_at >= ${previousIso}
             AND json_extract(payload_json, '$.settledAt') IS NOT NULL
         `.pipe(NodeSqliteClient.readOnly);
         const output = sql`json_extract(payload_json, '$.output')`;
@@ -879,6 +891,283 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
         return compacted;
       },
     );
+
+    // Removes settled leaf execution nodes and finished reasoning items (with positions) on
+    // threads settled for SETTLED_THREAD_AGE, preserving structural nodes and parent references.
+    const pruneSettledProjections = Effect.fn("ProjectionMaintenance.pruneSettledProjections")(
+      function* (now: DateTime.Utc, betweenPages: Effect.Effect<void>) {
+        const cutoff = DateTime.subtractDuration(now, SETTLED_THREAD_AGE);
+        const cutoffIso = DateTime.formatIso(cutoff);
+        const previous = yield* sql<MetadataRow>`
+          SELECT projection_name, last_sequence, updated_at
+          FROM orchestration_v2_projection_metadata
+          WHERE projection_name = ${SETTLED_PROJECTIONS_PRUNED_BEFORE}
+        `.pipe(NodeSqliteClient.readOnly);
+        const previousIso = previous[0]?.updated_at ?? "";
+        const threads = yield* sql<{ readonly thread_id: string }>`
+          SELECT thread_id FROM orchestration_v2_projection_threads
+          WHERE deleted_at IS NULL
+            AND updated_at < ${cutoffIso} AND updated_at >= ${previousIso}
+            AND json_extract(payload_json, '$.settledAt') IS NOT NULL
+        `.pipe(NodeSqliteClient.readOnly);
+
+        let pruned = 0;
+        for (const { thread_id: threadId } of threads) {
+          const threadStillSettled = sql`
+            EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_threads AS thread
+              WHERE thread.thread_id = ${threadId}
+                AND thread.deleted_at IS NULL
+                AND thread.updated_at < ${cutoffIso}
+                AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
+            )
+          `;
+
+          const leafNodes = yield* sql<{ readonly node_id: string }>`
+            SELECT node.node_id
+            FROM orchestration_v2_projection_nodes AS node
+            WHERE node.thread_id = ${threadId}
+              AND node.kind IN ${sql.in(SETTLED_LEAF_NODE_KINDS)}
+              AND node.status IN ${sql.in(SETTLED_NODE_STATUSES)}
+              AND NOT EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_nodes AS child
+                WHERE child.parent_node_id = node.node_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+                WHERE pt.owner_node_id = node.node_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_runtime_requests AS rr
+                WHERE rr.thread_id = ${threadId} AND rr.node_id = node.node_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_run_attempts AS ra
+                WHERE ra.thread_id = ${threadId} AND ra.root_node_id = node.node_id
+              )
+              AND (
+                node.run_id IS NULL
+                OR node.run_id NOT IN (
+                  SELECT run_id FROM orchestration_v2_projection_run_attempts
+                  WHERE thread_id = ${threadId}
+                  GROUP BY run_id
+                  HAVING COUNT(*) > 1
+                )
+              )
+            ORDER BY node.node_id ASC
+          `.pipe(NodeSqliteClient.readOnly);
+          yield* betweenPages;
+
+          for (let start = 0; start < leafNodes.length; start += PURGE_BATCH_SIZE) {
+            const batch = leafNodes
+              .slice(start, start + PURGE_BATCH_SIZE)
+              .map((row) => row.node_id);
+            const deleted = yield* sql<{ readonly node_id: string }>`
+              DELETE FROM orchestration_v2_projection_nodes
+              WHERE node_id IN ${sql.in(batch)}
+                AND thread_id = ${threadId}
+                AND kind IN ${sql.in(SETTLED_LEAF_NODE_KINDS)}
+                AND status IN ${sql.in(SETTLED_NODE_STATUSES)}
+                AND NOT EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_nodes AS child
+                  WHERE child.parent_node_id = orchestration_v2_projection_nodes.node_id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+                  WHERE pt.owner_node_id = orchestration_v2_projection_nodes.node_id
+                )
+                AND ${threadStillSettled}
+              RETURNING node_id
+            `;
+            pruned += deleted.length;
+            yield* Effect.yieldNow;
+            yield* betweenPages;
+          }
+
+          const reasoningRows = yield* sql<{ readonly turn_item_id: string }>`
+            SELECT turn_item_id
+            FROM orchestration_v2_projection_turn_items
+            WHERE thread_id = ${threadId}
+              AND type = 'reasoning'
+              AND status IN ${sql.in(SETTLED_ITEM_STATUSES)}
+          `.pipe(NodeSqliteClient.readOnly);
+          if (reasoningRows.length > 0) {
+            // Materialize parent IDs once per thread; parent_item_id has no index.
+            const parentRows = yield* sql<{ readonly parent_item_id: string }>`
+              SELECT DISTINCT parent_item_id
+              FROM orchestration_v2_projection_turn_items
+              WHERE thread_id = ${threadId} AND parent_item_id IS NOT NULL
+            `.pipe(NodeSqliteClient.readOnly);
+            const parentIds = new Set(parentRows.map((row) => row.parent_item_id));
+            const deletableReasoningIds = reasoningRows
+              .map((row) => row.turn_item_id)
+              .filter((id) => !parentIds.has(id));
+            yield* betweenPages;
+
+            for (let start = 0; start < deletableReasoningIds.length; start += PURGE_BATCH_SIZE) {
+              const batch = deletableReasoningIds.slice(start, start + PURGE_BATCH_SIZE);
+              pruned += yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  const deleted = yield* sql<{ readonly turn_item_id: string }>`
+                    DELETE FROM orchestration_v2_projection_turn_items
+                    WHERE turn_item_id IN ${sql.in(batch)}
+                      AND thread_id = ${threadId}
+                      AND type = 'reasoning'
+                      AND status IN ${sql.in(SETTLED_ITEM_STATUSES)}
+                      AND ${threadStillSettled}
+                    RETURNING turn_item_id
+                  `;
+                  if (deleted.length === 0) return 0;
+                  const deletedIds = deleted.map((row) => row.turn_item_id);
+                  const deletedPositions = yield* sql<{ readonly deleted: number }>`
+                    DELETE FROM orchestration_v2_turn_item_positions
+                    WHERE thread_id = ${threadId} AND turn_item_id IN ${sql.in(deletedIds)}
+                    RETURNING 1 AS deleted
+                  `;
+                  return deleted.length + deletedPositions.length;
+                }),
+              );
+              yield* Effect.yieldNow;
+              yield* betweenPages;
+            }
+          } else {
+            yield* betweenPages;
+          }
+        }
+        if (previousIso === "" || cutoffIso > previousIso) {
+          yield* writeMetadata(SETTLED_PROJECTIONS_PRUNED_BEFORE, 0, cutoff);
+        }
+        return pruned;
+      },
+    );
+
+    // Soft-deletes aged automated (subagent / mcp:) threads so purgeThreads clears their content
+    // into tombstones while keeping usage metadata, parent subagent summaries, and live references.
+    const expireAgedAutomatedThreads = Effect.fn(
+      "ProjectionMaintenance.expireAgedAutomatedThreads",
+    )(function* (now: DateTime.Utc, betweenPages: Effect.Effect<void>) {
+      const cutoffIso = DateTime.formatIso(
+        DateTime.subtractDuration(now, AUTOMATED_THREAD_RETENTION),
+      );
+      const nowIso = DateTime.formatIso(now);
+      const automatedThreadFilter = sql`(
+          json_extract(thread.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+          OR thread.thread_id LIKE 'mcp:%'
+          OR thread.thread_id LIKE 'subagent:%'
+          OR thread.thread_id LIKE 'thread:subagent:%'
+          OR thread.thread_id LIKE 'thread:delegated-task:%'
+        )
+        AND COALESCE(json_extract(thread.payload_json, '$.lineage.sideChat'), 0) <> 1
+        AND json_extract(thread.payload_json, '$.pinnedAt') IS NULL
+        AND json_extract(thread.payload_json, '$.snoozedUntil') IS NULL
+        AND json_extract(thread.payload_json, '$.guestShare') IS NULL`;
+      const automatedThreadGuards = sql`
+          NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_effect_outbox AS effect
+            WHERE effect.thread_id = thread.thread_id
+              AND effect.status IN ('pending', 'running')
+              AND effect.effect_type NOT IN ('thread-content.purge', 'thread-title.generate')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_runs AS run
+            WHERE run.thread_id = thread.thread_id
+              AND run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_runtime_requests AS req
+            WHERE req.thread_id = thread.thread_id
+              AND req.status = 'pending'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_provider_threads AS pt
+            WHERE pt.thread_id = thread.thread_id
+              AND pt.status = 'active'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_subagents AS task
+            JOIN orchestration_v2_projection_threads AS parent ON parent.thread_id = task.thread_id
+            WHERE task.child_thread_id = thread.thread_id
+              AND parent.deleted_at IS NULL
+              AND (
+                task.status IN ('idle', 'pending', 'running', 'waiting')
+                OR json_extract(parent.payload_json, '$.settledAt') IS NULL
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_threads AS parent
+            WHERE parent.thread_id = json_extract(thread.payload_json, '$.lineage.parentThreadId')
+              AND parent.deleted_at IS NULL
+              AND json_extract(parent.payload_json, '$.settledAt') IS NULL
+          )
+        `;
+      const candidates = yield* sql<{ readonly thread_id: string }>`
+          WITH RECURSIVE referenced_sources(thread_id) AS (
+            SELECT json_extract(fork.payload_json, '$.forkedFrom.threadId')
+            FROM orchestration_v2_projection_threads AS fork
+            WHERE fork.deleted_at IS NULL
+              AND json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
+            UNION
+            SELECT transfer.source_thread_id
+            FROM orchestration_v2_projection_context_transfers AS transfer
+            JOIN orchestration_v2_projection_threads AS target
+              ON target.thread_id = transfer.target_thread_id
+            WHERE transfer.type = 'merge_back' AND transfer.status = 'pending'
+              AND target.deleted_at IS NULL
+            UNION
+            SELECT json_extract(fork.payload_json, '$.forkedFrom.threadId')
+            FROM referenced_sources
+            JOIN orchestration_v2_projection_threads AS fork
+              ON fork.thread_id = referenced_sources.thread_id
+            WHERE json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
+          )
+          SELECT thread.thread_id
+          FROM orchestration_v2_projection_threads AS thread
+          WHERE thread.deleted_at IS NULL
+            AND thread.updated_at < ${cutoffIso}
+            AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
+            AND ${automatedThreadFilter}
+            AND thread.thread_id NOT IN (
+              SELECT thread_id FROM referenced_sources WHERE thread_id IS NOT NULL
+            )
+            AND ${automatedThreadGuards}
+          ORDER BY thread.updated_at ASC, thread.thread_id ASC
+        `.pipe(NodeSqliteClient.readOnly);
+      yield* betweenPages;
+
+      for (let start = 0; start < candidates.length; start += PURGE_BATCH_SIZE) {
+        const batch = candidates.slice(start, start + PURGE_BATCH_SIZE).map((row) => row.thread_id);
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const expired = yield* sql<{ readonly thread_id: string }>`
+                UPDATE orchestration_v2_projection_threads AS thread
+                SET
+                  deleted_at = ${nowIso},
+                  payload_json = json_set(
+                    payload_json,
+                    '$.deletedAt', ${nowIso},
+                    '$.updatedAt', ${nowIso}
+                  )
+                WHERE thread.thread_id IN ${sql.in(batch)}
+                  AND thread.deleted_at IS NULL
+                  AND thread.updated_at < ${cutoffIso}
+                  AND json_extract(thread.payload_json, '$.settledAt') IS NOT NULL
+                  AND ${automatedThreadFilter}
+                  AND ${automatedThreadGuards}
+                RETURNING thread_id
+              `;
+            if (expired.length === 0) return;
+            const expiredIds = expired.map((row) => row.thread_id);
+            yield* sql`
+                UPDATE projection_threads
+                SET deleted_at = COALESCE(deleted_at, ${nowIso})
+                WHERE thread_id IN ${sql.in(expiredIds)}
+              `;
+          }),
+        );
+        yield* Effect.yieldNow;
+        yield* betweenPages;
+      }
+    });
 
     // A run fork shows its source's history without copying it, through any chain of forks, and a
     // pending merge-back still reads its source. Such a deleted thread keeps its content until
@@ -1152,9 +1441,12 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
         }
         if (mark === undefined || markIsDue) yield* writeMetadata(EVENT_LOG_PRUNE_MARK, head, now);
 
+        // Expire aged automated threads before purgeThreads so they clear in the same pass.
+        yield* expireAgedAutomatedThreads(now, betweenPages);
+
         // Catches threads deleted before purging existed, and any purge a crash interrupted.
         // It runs first so the legacy prune below takes the v1 events of threads it marks.
-        const purgedRowCount = yield* purgeThreads(undefined, betweenPages);
+        let purgedRowCount = yield* purgeThreads(undefined, betweenPages);
 
         const legacy = yield* pruneImportedLegacyHistory(
           head,
@@ -1163,6 +1455,8 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
         );
         deletedEventCount += legacy.deletedEventCount;
         deletedEventCount += yield* pruneSupersededUpdates(now, head, betweenPages);
+        // Prune settled leaf nodes and finished reasoning rows before compacting remaining outputs.
+        purgedRowCount += yield* pruneSettledProjections(now, betweenPages);
         const compactedTurnItemCount = yield* compactSettledTurnItems(now, betweenPages);
 
         const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
