@@ -1,5 +1,7 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { RepositoryIdentity } from "@t3tools/contracts";
+import { makeLocalFileTracer } from "@t3tools/shared/observability";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -7,6 +9,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectEnrichment from "./ProjectEnrichmentService.ts";
@@ -387,4 +390,70 @@ it.effect("keeps a lookup's identity when another root is invalidated mid-flight
       assert.equal(expired.repositoryIdentity?.canonicalKey, "example.test/v1/widgets");
     }).pipe(Effect.provide(layer(layerMetadata)));
   }),
+);
+
+it.effect("samples fast readRepositoryIdentity spans while keeping slow lookups", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const recorded: Array<string> = [];
+      const delegated: Array<string> = [];
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1024,
+        maxFiles: 1,
+        batchWindowMs: 1_000,
+        sampleRoutineSpans: true,
+        sink: {
+          filePath: "unused",
+          push: (record) => recorded.push(record.name),
+          flush: Effect.void,
+          flushSync: () => {},
+          close: () => Effect.void,
+        },
+        delegate: Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            span._spanId = `${"1".repeat(14)}01`;
+            delegated.push(options.name);
+            return span;
+          },
+        }),
+      });
+      const layerMetadata = Layer.merge(
+        Layer.succeed(RepositoryIdentityResolver.RepositoryIdentityResolver, {
+          resolve: (workspaceRoot) =>
+            workspaceRoot === "/slow"
+              ? TestClock.adjust("10 millis").pipe(Effect.as(identity(workspaceRoot)))
+              : Effect.succeed(null),
+        }),
+        Layer.succeed(ProjectFaviconResolver.ProjectFaviconResolver, {
+          invalidate: () => Effect.void,
+          resolvePath: () => Effect.succeed(null),
+        }),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* ProjectEnrichment.ProjectEnrichmentService;
+        assert.isNull(yield* service.readRepositoryIdentity("/fast"));
+        assert.isNull(yield* service.readRepositoryIdentity("/fast"));
+        assert.equal(
+          (yield* service.readRepositoryIdentity("/slow"))?.canonicalKey,
+          "example.test/v1/slow",
+        );
+      }).pipe(
+        Effect.provide(layer(layerMetadata)),
+        Effect.withTracer(tracer),
+        Effect.withTracerEnabled(true),
+      );
+
+      assert.deepEqual(
+        delegated.filter((name) => name === "ProjectEnrichmentService.readRepositoryIdentity"),
+        Array(3).fill("ProjectEnrichmentService.readRepositoryIdentity"),
+      );
+      assert.deepEqual(
+        recorded.filter((name) => name === "ProjectEnrichmentService.readRepositoryIdentity"),
+        ["ProjectEnrichmentService.readRepositoryIdentity"],
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );

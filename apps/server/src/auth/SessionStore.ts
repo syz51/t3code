@@ -10,6 +10,7 @@ import {
   RuntimeMode,
   type ServerAuthSessionMethod,
 } from "@t3tools/contracts";
+import { routineSpan } from "@t3tools/shared/observability";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -823,117 +824,114 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const verify: SessionStore["Service"]["verify"] = Effect.fn("SessionStore.verify")(
-    function* (token) {
-      if (devAuth?.matches(token)) {
-        const row = yield* authSessions
-          .getById({ sessionId: devAuth.sessionId })
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
-            ),
-          );
-        if (Option.isNone(row)) {
-          return yield* new UnknownSessionTokenError({ sessionId: devAuth.sessionId });
-        }
-        if (row.value.revokedAt !== null) {
-          return yield* new SessionTokenRevokedError({
-            sessionId: devAuth.sessionId,
-            revokedAt: row.value.revokedAt,
-          });
-        }
-        const observedAt = yield* DateTime.now;
-        if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
-          return yield* new SessionTokenExpiredError({
-            sessionId: devAuth.sessionId,
-            expiresAt: row.value.expiresAt,
-            observedAt,
-          });
-        }
-        return {
-          sessionId: row.value.sessionId,
-          token,
-          method: row.value.method,
-          client: toClientMetadata(row.value.client),
-          expiresAt: row.value.expiresAt,
-          subject: row.value.subject,
-          scopes: row.value.scopes,
-        } satisfies VerifiedSession;
-      }
-      const [encodedPayload, signature] = token.split(".");
-      if (!encodedPayload || !signature) {
-        return yield* new MalformedSessionTokenError({});
-      }
-
-      if (!(yield* signer.verify(encodedPayload, signature))) {
-        return yield* new InvalidSessionTokenSignatureError({});
-      }
-
-      const claims = yield* decodeSessionClaims(base64UrlDecodeUtf8(encodedPayload)).pipe(
-        Effect.mapError((cause) => new InvalidSessionTokenPayloadError({ cause })),
-      );
-
-      const observedAt = yield* DateTime.now;
-      const expiresAt = DateTime.make(claims.exp);
-      if (Option.isNone(expiresAt)) {
-        return yield* new InvalidSessionExpirationClaimError({
-          sessionId: claims.sid,
-          expirationClaim: claims.exp,
-        });
-      }
-      // A peer link's session renews while it is used and its token is never
-      // reissued, so the session row holds its deadline, not the token.
-      const rowHoldsDeadline = claims.plk === 1;
-      if (!rowHoldsDeadline && claims.exp <= observedAt.epochMilliseconds) {
-        return yield* new SessionTokenExpiredError({
-          sessionId: claims.sid,
-          expiresAt: expiresAt.value,
-          observedAt,
-        });
-      }
-
+  const verify: SessionStore["Service"]["verify"] = Effect.fn("SessionStore.verify", {
+    attributes: routineSpan,
+  })(function* (token) {
+    if (devAuth?.matches(token)) {
       const row = yield* authSessions
-        .getById({ sessionId: claims.sid })
+        .getById({ sessionId: devAuth.sessionId })
         .pipe(
           Effect.mapError(
-            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+            (cause) =>
+              new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
           ),
         );
       if (Option.isNone(row)) {
-        return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+        return yield* new UnknownSessionTokenError({ sessionId: devAuth.sessionId });
       }
       if (row.value.revokedAt !== null) {
         return yield* new SessionTokenRevokedError({
-          sessionId: claims.sid,
+          sessionId: devAuth.sessionId,
           revokedAt: row.value.revokedAt,
         });
       }
-      if (
-        rowHoldsDeadline &&
-        row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds
-      ) {
+      const observedAt = yield* DateTime.now;
+      if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
         return yield* new SessionTokenExpiredError({
-          sessionId: claims.sid,
+          sessionId: devAuth.sessionId,
           expiresAt: row.value.expiresAt,
           observedAt,
         });
       }
-
       return {
-        sessionId: claims.sid,
+        sessionId: row.value.sessionId,
         token,
-        method: claims.method,
+        method: row.value.method,
         client: toClientMetadata(row.value.client),
-        expiresAt: rowHoldsDeadline ? row.value.expiresAt : expiresAt.value,
-        subject: claims.sub,
+        expiresAt: row.value.expiresAt,
+        subject: row.value.subject,
         scopes: row.value.scopes,
-        ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
-        ...(claims.rtc ? { runtimeModeCeiling: claims.rtc } : {}),
-        ...(claims.plk === 1 ? { peerLink: true as const } : {}),
       } satisfies VerifiedSession;
-    },
-  );
+    }
+    const [encodedPayload, signature] = token.split(".");
+    if (!encodedPayload || !signature) {
+      return yield* new MalformedSessionTokenError({});
+    }
+
+    if (!(yield* signer.verify(encodedPayload, signature))) {
+      return yield* new InvalidSessionTokenSignatureError({});
+    }
+
+    const claims = yield* decodeSessionClaims(base64UrlDecodeUtf8(encodedPayload)).pipe(
+      Effect.mapError((cause) => new InvalidSessionTokenPayloadError({ cause })),
+    );
+
+    const observedAt = yield* DateTime.now;
+    const expiresAt = DateTime.make(claims.exp);
+    if (Option.isNone(expiresAt)) {
+      return yield* new InvalidSessionExpirationClaimError({
+        sessionId: claims.sid,
+        expirationClaim: claims.exp,
+      });
+    }
+    // A peer link's session renews while it is used and its token is never
+    // reissued, so the session row holds its deadline, not the token.
+    const rowHoldsDeadline = claims.plk === 1;
+    if (!rowHoldsDeadline && claims.exp <= observedAt.epochMilliseconds) {
+      return yield* new SessionTokenExpiredError({
+        sessionId: claims.sid,
+        expiresAt: expiresAt.value,
+        observedAt,
+      });
+    }
+
+    const row = yield* authSessions
+      .getById({ sessionId: claims.sid })
+      .pipe(
+        Effect.mapError(
+          (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+        ),
+      );
+    if (Option.isNone(row)) {
+      return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+    }
+    if (row.value.revokedAt !== null) {
+      return yield* new SessionTokenRevokedError({
+        sessionId: claims.sid,
+        revokedAt: row.value.revokedAt,
+      });
+    }
+    if (rowHoldsDeadline && row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+      return yield* new SessionTokenExpiredError({
+        sessionId: claims.sid,
+        expiresAt: row.value.expiresAt,
+        observedAt,
+      });
+    }
+
+    return {
+      sessionId: claims.sid,
+      token,
+      method: claims.method,
+      client: toClientMetadata(row.value.client),
+      expiresAt: rowHoldsDeadline ? row.value.expiresAt : expiresAt.value,
+      subject: claims.sub,
+      scopes: row.value.scopes,
+      ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
+      ...(claims.rtc ? { runtimeModeCeiling: claims.rtc } : {}),
+      ...(claims.plk === 1 ? { peerLink: true as const } : {}),
+    } satisfies VerifiedSession;
+  });
 
   const extend: SessionStore["Service"]["extend"] = Effect.fn("SessionStore.extend")(
     function* (sessionId, expiresAt, step) {

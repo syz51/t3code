@@ -27,6 +27,7 @@ import {
 } from "@t3tools/contracts";
 import { isLocalLoopbackHost } from "@t3tools/shared/hostClassification";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import { routineSpan } from "@t3tools/shared/observability";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -1686,7 +1687,7 @@ export const make = Effect.gen(function* () {
           } satisfies McpClientSession;
         }),
       ),
-      Effect.withSpan("EnvironmentAuth.authenticateMcpClient"),
+      Effect.withSpan("EnvironmentAuth.authenticateMcpClient", { attributes: routineSpan }),
     );
   };
 

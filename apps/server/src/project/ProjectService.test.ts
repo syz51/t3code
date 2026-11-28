@@ -1187,12 +1187,21 @@ it.effect(
         yield* fileSystem.makeTempDirectoryScoped({ prefix: "project-folder-sync-throttle-" }),
       );
       let syncSpans = 0;
+      let hydrateSpans = 0;
+      let listPageSpans = 0;
+      let getByIdSpans = 0;
       let rootScans = 0;
       const syncEnded = yield* Queue.unbounded<void>();
       const tracer = Tracer.make({
         span: (options) => {
           const span = new Tracer.NativeSpan(options);
-          if (options.name === "ProjectService.syncFolders") {
+          if (options.name === "ProjectService.hydrate") {
+            hydrateSpans += 1;
+          } else if (options.name === "ProjectService.listPage") {
+            listPageSpans += 1;
+          } else if (options.name === "ProjectService.getById") {
+            getByIdSpans += 1;
+          } else if (options.name === "ProjectService.syncFolders") {
             syncSpans += 1;
             const end = span.end.bind(span);
             span.end = (...args) => {
@@ -1231,12 +1240,16 @@ it.effect(
         yield* service.getById(projectId);
         yield* service.getByWorkspaceRoot(root);
         yield* service.snapshot;
+        yield* service.listPage({ cursor: 0, limit: 20 });
         yield* TestClock.adjust("29 seconds");
         yield* Effect.all([service.getById(projectId), service.getById(projectId)], {
           concurrency: "unbounded",
         });
         yield* Effect.yieldNow;
         assert.equal(syncSpans, 1);
+        assert.equal(hydrateSpans, 0);
+        assert.equal(listPageSpans, 1);
+        assert.isAtLeast(getByIdSpans, 3);
         assert.equal(rootScans, scansAfterInitialSync);
 
         yield* fileSystem.makeDirectory(`${root}/web/.git`, { recursive: true });

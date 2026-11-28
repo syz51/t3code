@@ -1,4 +1,5 @@
 import type { RepositoryIdentity } from "@t3tools/contracts";
+import { routineSpan } from "@t3tools/shared/observability";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -314,10 +315,12 @@ export const make = Effect.fn("ProjectEnrichmentService.make")(function* (
   );
 
   const readRepositoryIdentity: ProjectEnrichmentService["Service"]["readRepositoryIdentity"] =
-    Effect.fn("ProjectEnrichmentService.readRepositoryIdentity")(function* (workspaceRoot) {
-      const resolved = yield* Cache.get(repositoryIdentityCache, workspaceRoot);
-      return Exit.isSuccess(resolved) ? resolved.value : null;
-    });
+    Effect.fn("ProjectEnrichmentService.readRepositoryIdentity", { attributes: routineSpan })(
+      function* (workspaceRoot) {
+        const resolved = yield* Cache.get(repositoryIdentityCache, workspaceRoot);
+        return Exit.isSuccess(resolved) ? resolved.value : null;
+      },
+    );
 
   const invalidate: ProjectEnrichmentService["Service"]["invalidate"] = Effect.fn(
     "ProjectEnrichmentService.invalidate",
