@@ -265,7 +265,8 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const hydrate = Effect.fn("ProjectService.hydrate")(function* (row: ProjectStore.ProjectRow) {
+  // Runs per project row inside traced callers; only in-memory cache/throttle work (syncFolders traces its own fork).
+  const hydrate = Effect.fnUntraced(function* (row: ProjectStore.ProjectRow) {
     if (row.deletedAt === null) {
       const now = yield* Clock.currentTimeMillis;
       if ((folderSyncDue.get(row.projectId) ?? 0) <= now) {

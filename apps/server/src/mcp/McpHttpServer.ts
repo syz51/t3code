@@ -358,9 +358,9 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
             Effect.orElseSucceed(() => undefined),
           ),
   });
-  const authenticateRequest = Effect.fn("McpHttpServer.authenticateRequest")(function* (
-    request: HttpServerRequest.HttpServerRequest,
-  ) {
+  const authenticateRequest = Effect.fn("McpHttpServer.authenticateRequest", {
+    attributes: routineSpan,
+  })(function* (request: HttpServerRequest.HttpServerRequest) {
     const authorization = request.headers.authorization;
     const token = parseBearerToken(request) ?? "";
     const invocation =

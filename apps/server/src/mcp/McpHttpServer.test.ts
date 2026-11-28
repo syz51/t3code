@@ -20,6 +20,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -28,6 +29,7 @@ import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import { makeLocalFileTracer } from "@t3tools/shared/observability";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
@@ -1806,6 +1808,161 @@ it.effect("accepts case-insensitive MCP bearer schemes and diagnoses rejected cr
       layerAuth.pipe(
         Layer.provideMerge(NodeHttpServer.layerTest),
         Layer.provideMerge(Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+    ),
+  );
+});
+
+it.effect("samples fast MCP client auth spans while keeping failures and slow auth", () => {
+  const layerAuth = Layer.mergeAll(EnvironmentAuth.layer, McpSessionRegistry.layer).pipe(
+    Layer.provideMerge(
+      Layer.mock(ServerEnvironment.ServerEnvironment)({
+        getEnvironmentId: Effect.succeed(environmentId),
+      }),
+    ),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provide(ServerSecretStore.layer),
+    Layer.provide(ManagedPolicy.layerTest()),
+    Layer.provideMerge(ServerEnvironment.layerIdentity),
+    Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-auth-trace-test-" })),
+    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const oauth = yield* auth.issueMcpClientSession({
+        label: "MCP trace sampling test",
+        access: "read-only",
+        peerLink: false,
+        client: { deviceType: "bot" },
+      });
+      const recorded: Array<string> = [];
+      const delegated: Array<string> = [];
+      const baseClock = yield* Clock.Clock;
+      let slowSpans = false;
+      let syntheticNanos = 0n;
+      const currentNanos = () => {
+        if (slowSpans) {
+          syntheticNanos += 10_000_000n;
+          return syntheticNanos;
+        }
+        return baseClock.currentTimeNanosUnsafe();
+      };
+      const clock: Clock.Clock = {
+        currentTimeMillisUnsafe: () => baseClock.currentTimeMillisUnsafe(),
+        currentTimeMillis: baseClock.currentTimeMillis,
+        currentTimeNanosUnsafe: currentNanos,
+        currentTimeNanos: Effect.sync(currentNanos),
+        monotonicTimeNanosUnsafe: () => baseClock.monotonicTimeNanosUnsafe(),
+        monotonicTimeNanos: baseClock.monotonicTimeNanos,
+        sleep: (duration) => baseClock.sleep(duration),
+      };
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1024,
+        maxFiles: 1,
+        batchWindowMs: 1_000,
+        sampleRoutineSpans: true,
+        sink: {
+          filePath: "unused",
+          push: (record) => recorded.push(record.name),
+          flush: Effect.void,
+          flushSync: () => {},
+          close: () => Effect.void,
+        },
+        delegate: Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            span._spanId = `${"1".repeat(14)}01`;
+            delegated.push(options.name);
+            return span;
+          },
+        }),
+      });
+      yield* HttpRouter.serve(
+        McpHttpServer.layerMcpTransport(Layer.empty).pipe(
+          Layer.provide(McpOAuth.layerMcpClientAuthenticator),
+          Layer.provide(ServerSettings.layerTest()),
+        ),
+        { disableListenLog: true, disableLogger: true },
+      ).pipe(
+        Layer.build,
+        Effect.withTracer(tracer),
+        Effect.withTracerEnabled(true),
+        Effect.provideService(Clock.Clock, clock),
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const initialize = (token: string) =>
+        httpClient.post("/mcp", {
+          headers: {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${token}`,
+          },
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-trace-test","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+
+      const authSpanNames = new Set([
+        "McpHttpServer.authenticateRequest",
+        "McpHttpServer.McpClientAuthenticator.authenticate",
+        "EnvironmentAuth.authenticateMcpClient",
+        "SessionStore.verify",
+      ]);
+      const recordedAuthSpans = () => recorded.filter((name) => authSpanNames.has(name));
+      const delegatedAuthSpans = () => delegated.filter((name) => authSpanNames.has(name));
+
+      // Fast successful OAuth auth drops all routine auth spans from local trace output
+      // and never emits the redundant McpClientAuthenticator wrapper span.
+      recorded.length = 0;
+      delegated.length = 0;
+      expect((yield* initialize(oauth.token)).status).toBe(200);
+      expect(delegatedAuthSpans()).not.toContain(
+        "McpHttpServer.McpClientAuthenticator.authenticate",
+      );
+      expect(delegatedAuthSpans()).toEqual(
+        expect.arrayContaining([
+          "McpHttpServer.authenticateRequest",
+          "EnvironmentAuth.authenticateMcpClient",
+          "SessionStore.verify",
+        ]),
+      );
+      expect(recordedAuthSpans()).toEqual([]);
+
+      // Slow successful OAuth auth (>=10ms) keeps the routine auth spans in local traces.
+      recorded.length = 0;
+      slowSpans = true;
+      expect((yield* initialize(oauth.token)).status).toBe(200);
+      slowSpans = false;
+      expect(recordedAuthSpans()).toEqual(
+        expect.arrayContaining([
+          "McpHttpServer.authenticateRequest",
+          "EnvironmentAuth.authenticateMcpClient",
+          "SessionStore.verify",
+        ]),
+      );
+      expect(recordedAuthSpans()).not.toContain(
+        "McpHttpServer.McpClientAuthenticator.authenticate",
+      );
+
+      // Failed / rejected auth keeps failure and warning-annotated auth spans in local traces.
+      recorded.length = 0;
+      yield* auth.revokeSession(oauth.sessionId);
+      expect((yield* initialize(oauth.token)).status).toBe(401);
+      expect(recordedAuthSpans()).toEqual(
+        expect.arrayContaining([
+          "McpHttpServer.authenticateRequest",
+          "EnvironmentAuth.authenticateMcpClient",
+          "SessionStore.verify",
+        ]),
+      );
+    }),
+  ).pipe(
+    Effect.provide(
+      layerAuth.pipe(
+        Layer.provideMerge(NodeHttpServer.layerTest),
+        Layer.provideMerge(Logger.layer([Logger.tracerLogger], { mergeWithExisting: false })),
       ),
     ),
   );
