@@ -239,10 +239,8 @@ export const make = Effect.gen(function* () {
   const folderSyncDue = new Map<ProjectId, number>();
   const syncFolders = Effect.fn("ProjectService.syncFolders")(function* (
     row: ProjectStore.ProjectRow,
+    now: number,
   ) {
-    const now = yield* Clock.currentTimeMillis;
-    if ((folderSyncDue.get(row.projectId) ?? 0) > now) return;
-    folderSyncDue.set(row.projectId, now + FOLDER_SYNC_INTERVAL_MS);
     const discovered = yield* discoverFolders(row.workspaceRoot).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
@@ -269,7 +267,11 @@ export const make = Effect.gen(function* () {
 
   const hydrate = Effect.fn("ProjectService.hydrate")(function* (row: ProjectStore.ProjectRow) {
     if (row.deletedAt === null) {
-      yield* syncFolders(row).pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(scope));
+      const now = yield* Clock.currentTimeMillis;
+      if ((folderSyncDue.get(row.projectId) ?? 0) <= now) {
+        folderSyncDue.set(row.projectId, now + FOLDER_SYNC_INTERVAL_MS);
+        yield* syncFolders(row, now).pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(scope));
+      }
     }
     const enrichment =
       row.deletedAt === null
