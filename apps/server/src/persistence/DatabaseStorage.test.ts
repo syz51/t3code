@@ -1,7 +1,9 @@
+import { AuthSessionId } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -14,6 +16,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
+import * as AuthSessions from "./AuthSessions.ts";
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import * as DatabaseStorage from "./DatabaseStorage.ts";
 import * as Sqlite from "./Sqlite.ts";
@@ -265,4 +268,57 @@ it.effect(
         ),
       );
     }).pipe(Effect.provide(testConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+it.effect("prunes expired and revoked auth sessions during periodic compaction", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(startupTime);
+    const now = DateTime.makeUnsafe(startupTime);
+    const oldTime = DateTime.formatIso(
+      DateTime.subtractDuration(
+        now,
+        Duration.sum(AuthSessions.AUTH_SESSION_RETENTION, Duration.days(1)),
+      ),
+    );
+    const recentTime = DateTime.formatIso(DateTime.subtractDuration(now, Duration.days(1)));
+    const futureTime = DateTime.formatIso(DateTime.addDuration(now, Duration.days(30)));
+
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO auth_sessions (
+          session_id, subject, scopes, method, client_device_type, issued_at, expires_at, revoked_at
+        ) VALUES
+          ('session-active', 'browser', '["access:read"]', 'browser-session-cookie', 'desktop', ${recentTime}, ${futureTime}, NULL),
+          ('session-live-expired', 'dpop', '["access:read"]', 'dpop-access-token', 'desktop', ${oldTime}, ${oldTime}, NULL),
+          ('session-recent-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${futureTime}, ${recentTime}),
+          ('session-old-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${futureTime}, ${oldTime}),
+          ('session-old-expired', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${oldTime}, NULL)
+      `;
+      yield* DatabaseStorage.DatabaseStorage;
+
+      yield* TestClock.adjust(5 * minute);
+
+      const remaining = yield* sql<{ readonly session_id: string }>`
+        SELECT session_id FROM auth_sessions ORDER BY session_id
+      `;
+      assert.deepStrictEqual(
+        remaining.map((row) => row.session_id),
+        ["session-active", "session-live-expired", "session-recent-revoked"],
+      );
+    }).pipe(
+      Effect.provide(
+        DatabaseStorage.layer.pipe(
+          Layer.provide(ProjectionMaintenance.layer),
+          Layer.provide(
+            Layer.succeed(
+              DatabaseStorage.LiveAuthSessionIds,
+              Effect.succeed([AuthSessionId.make("session-live-expired")]),
+            ),
+          ),
+          Layer.provideMerge(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }).pipe(Effect.provide(testConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
 );

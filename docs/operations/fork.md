@@ -259,6 +259,15 @@ runs the same pass. They stop older history from growing; they do not make the f
   - **Safety guards:** active/unsettled threads, live in-process sessions, files with open OS
     handles (`lsof`), and `.db` files whose usage records fail to scan or persist to the usage
     cache are never removed.
+- **Auth sessions (7 days).** Alongside the 6-hourly compaction pass in
+  [DatabaseStorage](../../apps/server/src/persistence/DatabaseStorage.ts) and offline `t3 doctor`
+  compaction in [DatabaseMaintenance](../../apps/server/src/persistence/DatabaseMaintenance.ts),
+  [AuthSessionRepository.pruneExpiredAndRevoked](../../apps/server/src/persistence/AuthSessions.ts)
+  deletes `auth_sessions` rows revoked (`revoked_at < cutoff`) or expired (`revoked_at IS NULL AND
+  expires_at < cutoff`) more than 7 days ago in paced 500-row batches indexed by
+  `idx_auth_sessions_active`. Active sessions, sessions referenced by live connections or DPoP
+  renewal chains (`SessionStore.liveSessionIds`), and `dev-auth-*` revocation tombstones are never
+  pruned.
 
 Related upstream work: issue #28903 (retention for events and turn items), PR #29806 (one-day
 event window) and PR #22548 (provider-turn updates).

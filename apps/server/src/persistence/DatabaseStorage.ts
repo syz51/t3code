@@ -1,6 +1,11 @@
-import { DatabaseReclaimError, type DatabaseStorageStatus } from "@t3tools/contracts";
+import {
+  type AuthSessionId,
+  DatabaseReclaimError,
+  type DatabaseStorageStatus,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -17,6 +22,7 @@ import { resolveHostCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as AntigravitySessionRetention from "../provider/acp/AntigravitySessionRetention.ts";
+import * as AuthSessions from "./AuthSessions.ts";
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import { forkParked } from "../serverActivation.ts";
 
@@ -42,10 +48,17 @@ export const ServerRestart = Context.Reference<Effect.Effect<void> | null>(
   { defaultValue: () => null },
 );
 
+/** Returns auth session ids referenced by live connections or active renewal chains. */
+export const LiveAuthSessionIds = Context.Reference<Effect.Effect<ReadonlyArray<AuthSessionId>>>(
+  "t3/persistence/DatabaseStorage/LiveAuthSessionIds",
+  { defaultValue: () => Effect.succeed([]) },
+);
+
 const formatGiB = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const authSessions = yield* AuthSessions.AuthSessionRepository;
   const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
   const antigravityRetention = yield* AntigravitySessionRetention.AntigravitySessionRetention;
   const config = yield* ServerConfig.ServerConfig;
@@ -53,6 +66,7 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const statusRef = yield* SubscriptionRef.make<DatabaseStorageStatus | null>(null);
   const restart = yield* ServerRestart;
+  const liveAuthSessionIds = yield* LiveAuthSessionIds;
   const reclaimFiles = DatabaseMaintenance.reclaimFiles(path, config.dbPath);
   let reclaimFailure = Option.getOrUndefined(
     yield* fs.readFileString(reclaimFiles.failure).pipe(Effect.option),
@@ -153,6 +167,28 @@ const make = Effect.gen(function* () {
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
     const result = yield* maintenance.pruneEventStore(betweenPages);
+    const authSessionCutoff = DateTime.subtractDuration(
+      yield* DateTime.now,
+      AuthSessions.AUTH_SESSION_RETENTION,
+    );
+    const excludeSessionIds = yield* liveAuthSessionIds;
+    const authSessionResult = yield* authSessions
+      .pruneExpiredAndRevoked({
+        before: authSessionCutoff,
+        excludeSessionIds,
+        betweenPages,
+      })
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Auth session retention pruning failed", { cause }).pipe(
+            Effect.as({
+              deletedRevokedCount: 0,
+              deletedExpiredCount: 0,
+              totalDeletedCount: 0,
+            }),
+          ),
+        ),
+      );
     const antigravityResult = yield* antigravityRetention
       .pruneSessions(betweenPages)
       .pipe(
@@ -171,6 +207,9 @@ const make = Effect.gen(function* () {
       result.purgedRowCount > 0
     ) {
       yield* Effect.logInfo("Compacted orchestration history", result);
+    }
+    if (authSessionResult.totalDeletedCount > 0) {
+      yield* Effect.logInfo("Pruned expired and revoked auth sessions", authSessionResult);
     }
     if (
       antigravityResult.deletedSessions > 0 ||
@@ -269,4 +308,4 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(DatabaseStorage, make);
+export const layer = Layer.effect(DatabaseStorage, make).pipe(Layer.provide(AuthSessions.layer));

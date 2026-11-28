@@ -1673,13 +1673,14 @@ Owner check: `git diff --stat origin/main...origin/fork` shows only `apps/server
 ### E-M9. Auth sessions
 
 - Owner: upstream
-- Stored in: SQLite `auth_sessions` rows (`revokedAt`, `expiresAt`, scopes); signed tokens held by clients; memory: `connectedSessionsRef` (`apps/server/src/auth/SessionStore.ts:501`), `changesPubSub` (`:502`), `latestSessionByProofKey` (`:505`).
+- Stored in: SQLite `auth_sessions` rows (`revokedAt`, `expiresAt`, scopes); signed tokens held by clients; memory: `connectedSessionsRef` (`apps/server/src/auth/SessionStore.ts`), `invalidationChainSessionsRef`, `changesPubSub`, `latestSessionByProofKey`.
 - States: issued and active; connected (count above 0); expired; revoked; replaced by a successor; reusable dev session (never expires, web dev mode only, `apps/server/src/auth/ReusableDevAuth.ts`).
 - Transitions:
   - none -> active: `issue`, `apps/server/src/auth/SessionStore.ts:644` (replace-active variant inside it).
   - active -> verified on each request: `verify`, `:752` (signature, expiry claim, row present, not revoked; scopes come from the row).
   - active -> revoked: `revoke`, `:987`; `revokeAllExcept`, `:1008`.
   - active -> expired: by clock; a connected socket is closed by `awaitInvalidation`, `:1042`.
+  - expired / revoked -> pruned (fork): `AuthSessionRepository.pruneExpiredAndRevoked` deletes rows older than 7 days (`AUTH_SESSION_RETENTION`) in 500-row batches during 6-hourly compaction (`DatabaseStorage.ts`) and offline `t3 doctor` compaction (`DatabaseMaintenance.ts`), preserving live connected/renewal-chain session IDs (`SessionStore.liveSessionIds`) and `dev-auth-*` revocation tombstones.
   - WebSocket ticket: `issueWebSocketToken`, `:852`; `verifyWebSocketToken`, `:889`.
 - Restart: rows survive. Connected counts and `latestSessionByProofKey` are lost; all sockets are closed by the restart, so the counts stay consistent.
 - Explicit or implicit: implicit; state is derived from row columns and the clock in each method.

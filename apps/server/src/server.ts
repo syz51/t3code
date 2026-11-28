@@ -6,6 +6,7 @@ import * as EnvironmentKeys from "./cloud/environmentKeys.ts";
 import * as AssetSigner from "./assets/AssetSigner.ts";
 import * as WorkspacePreviewRevisions from "./assets/WorkspacePreviewRevisions.ts";
 import * as DatabaseStorage from "./persistence/DatabaseStorage.ts";
+import * as SessionStore from "./auth/SessionStore.ts";
 import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as PullRequestWatchReactor from "./orchestration-v2/PullRequestWatchReactor.ts";
@@ -747,6 +748,11 @@ const layerServerRestart = Layer.effect(
   }),
 );
 
+const layerLiveAuthSessionIds = Layer.effect(
+  DatabaseStorage.LiveAuthSessionIds,
+  Effect.map(SessionStore.SessionStore, (sessions) => sessions.liveSessionIds),
+);
+
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   AgentAwarenessRelay.layer,
   ProviderHostPathWatcher.layer.pipe(Layer.provide(layerDesktopTelemetryReceiver)),
@@ -758,6 +764,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
     Layer.provide(ProjectionMaintenance.layer),
     Layer.provide(layerAntigravityRetentionForMaintenance),
     Layer.provide(layerServerRestart),
+    Layer.provide(layerLiveAuthSessionIds),
   ),
   layerThreadPullRequestWorker,
   KeepAwake.layer,

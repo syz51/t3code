@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -10,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as AuthSessions from "./AuthSessions.ts";
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import * as Sqlite from "./Sqlite.ts";
 
@@ -205,6 +207,16 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         const dbPath = path.join(baseDir, "userdata", "statev2.sqlite");
         // Opening the database migrates it.
         yield* Effect.void.pipe(Effect.provide(Sqlite.layerFromPath(dbPath)));
+        const now = yield* DateTime.now;
+        const staleSessionAt = DateTime.formatIso(
+          DateTime.subtractDuration(
+            now,
+            Duration.sum(AuthSessions.AUTH_SESSION_RETENTION, Duration.days(1)),
+          ),
+        );
+        const activeSessionExpiresAt = DateTime.formatIso(
+          DateTime.addDuration(now, Duration.days(30)),
+        );
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           yield* sql`PRAGMA auto_vacuum = NONE`;
@@ -214,6 +226,14 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           yield* sql`CREATE TABLE discarded_data (value BLOB)`;
           yield* sql`INSERT INTO discarded_data VALUES (zeroblob(4194304))`;
           yield* sql`DROP TABLE discarded_data`;
+          yield* sql`
+            INSERT INTO auth_sessions (
+              session_id, subject, scopes, method, client_device_type, issued_at, expires_at, revoked_at
+            ) VALUES
+              ('session-active', 'browser', '["access:read"]', 'browser-session-cookie', 'desktop', ${staleSessionAt}, ${activeSessionExpiresAt}, NULL),
+              ('session-old-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${staleSessionAt}, ${activeSessionExpiresAt}, ${staleSessionAt}),
+              ('session-old-expired', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${staleSessionAt}, ${staleSessionAt}, NULL)
+          `;
           yield* sql`
             INSERT INTO orchestration_v2_projection_messages (
               message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json
@@ -273,6 +293,10 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           const sql = yield* SqlClient.SqlClient;
           assert.deepEqual(yield* sql`PRAGMA auto_vacuum`, [{ auto_vacuum: 2 }]);
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
+          assert.deepEqual(
+            yield* sql`SELECT session_id AS "sessionId" FROM auth_sessions ORDER BY session_id`,
+            [{ sessionId: "session-active" }],
+          );
           assert.deepEqual(
             yield* sql`
               SELECT messages.message_id AS "messageId"
