@@ -208,9 +208,9 @@ describe("AntigravityAdapterV2 flavor", () => {
     });
   });
 
-  it("enables HTTP MCP transport with deferred tool exposure", () => {
+  it("enables HTTP MCP transport with deferred-proxy tool exposure", () => {
     assert.isTrue(flavor.mcpOverHttp);
-    assert.isTrue(flavor.deferMcpTools);
+    assert.strictEqual(flavor.deferMcpTools, "proxy");
   });
 
   it("shows each ask_question question as the question body, not the generic form message", () => {
@@ -4071,7 +4071,7 @@ describe("AntigravityAdapterV2 session system prompt", () => {
             url: endpoint,
             headers: [
               { name: "Authorization", value: authorization },
-              { name: "t3-tool-exposure", value: "deferred" },
+              { name: "t3-tool-exposure", value: "deferred-proxy" },
             ],
           },
         ];
