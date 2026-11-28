@@ -1,6 +1,6 @@
 import { Schema } from "effect";
 
-import { EnvironmentId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { EnvironmentId, SecretRef, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   PREVIEW_VIEWPORT_MAX_AREA,
   PreviewRenderedViewportSize,
@@ -384,9 +384,8 @@ export const PreviewAutomationUploadInput = Schema.Struct({
 );
 export type PreviewAutomationUploadInput = typeof PreviewAutomationUploadInput.Type;
 
-export const PreviewAutomationTypeInput = Schema.Struct({
+const PreviewAutomationTypeCommonFields = {
   ...PreviewAutomationTabTargetFields,
-  text: Schema.String,
   selector: Schema.optional(LegacySelector),
   locator: Schema.optional(Locator),
   clear: Schema.optional(
@@ -395,6 +394,11 @@ export const PreviewAutomationTypeInput = Schema.Struct({
     }),
   ),
   timeoutMs: OptionalTimeoutMs,
+};
+
+export const PreviewAutomationTypeInput = Schema.Struct({
+  ...PreviewAutomationTypeCommonFields,
+  text: Schema.String,
 }).check(
   Schema.makeFilter(
     (input) =>
@@ -403,6 +407,24 @@ export const PreviewAutomationTypeInput = Schema.Struct({
   ),
 );
 export type PreviewAutomationTypeInput = typeof PreviewAutomationTypeInput.Type;
+
+const PreviewAutomationActTypeInput = Schema.Struct({
+  ...PreviewAutomationTypeCommonFields,
+  text: Schema.optional(Schema.String),
+  secretRef: Schema.optional(SecretRef),
+}).check(
+  Schema.makeFilter((input) => {
+    if (input.selector !== undefined && input.locator !== undefined) {
+      return "Provide at most one of selector or locator.";
+    }
+    if (input.text !== undefined && input.secretRef !== undefined) {
+      return "Provide either text or secretRef, not both.";
+    }
+    return (
+      input.text !== undefined || input.secretRef !== undefined || "Provide text or secretRef."
+    );
+  }),
+);
 
 export const PreviewAutomationPressInput = Schema.Struct({
   ...PreviewAutomationTabTargetFields,
@@ -430,7 +452,7 @@ export type PreviewAutomationScrollInput = typeof PreviewAutomationScrollInput.T
 /** Strict input for each `preview_act` action. */
 export const PreviewAutomationActInputs = {
   click: PreviewAutomationClickInput,
-  type: PreviewAutomationTypeInput,
+  type: PreviewAutomationActTypeInput,
   hover: PreviewAutomationHoverInput,
   select: PreviewAutomationSelectInput,
   drag: PreviewAutomationDragInput,
@@ -460,6 +482,7 @@ export const PreviewAutomationActInput = Schema.Struct({
   button: Schema.optional(Schema.Literals(["left", "right", "middle"])),
   clickCount: Schema.optional(Schema.Int),
   text: Schema.optional(Schema.String),
+  secretRef: Schema.optional(SecretRef),
   clear: Schema.optional(Schema.Boolean),
   values: Schema.optional(Schema.Array(Schema.String)),
   source: Schema.optional(Locator),

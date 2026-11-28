@@ -472,6 +472,14 @@ describe("server browser element refs", () => {
     expect(line).toMatch(/: •+$/);
     await ServerBrowserPage.type(page, { locator: locators(line)[0]!, text: "next", clear: true });
     expect(await page.locator("#pw").inputValue()).toBe("next");
+    await ServerBrowserPage.type(page, {
+      locator: locators(line)[0]!,
+      text: "secret-pass",
+      clear: true,
+      sensitive: true,
+    });
+    expect(await page.locator("#pw").inputValue()).toBe("secret-pass");
+    expect(String((await takeSnapshot()).accessibilityTree)).not.toContain("secret-pass");
   });
 
   it("masks dotted values in page text next to punctuation, with odd spaces, and at the cut", async () => {
@@ -1064,6 +1072,55 @@ describe("server browser type", () => {
       });
       expect(fill).not.toHaveBeenCalled();
       expect(typed).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps sensitive values and lengths out of timeout and Playwright errors", async () => {
+    const secretValue = "SensitiveSecret#998877";
+    const malformed = {
+      locator: () => ({
+        evaluate: async () => true,
+        fill: async () => {
+          throw new Error(`locator.fill: Error: Malformed value "${secretValue}"`);
+        },
+      }),
+      keyboard: { type: async () => {} },
+    } as unknown as Page;
+    const fillError = await ServerBrowserPage.type(malformed, {
+      locator: "#date",
+      text: secretValue,
+      clear: true,
+      sensitive: true,
+    }).catch((error: unknown) => error);
+    expect(fillError).toMatchObject({ tag: "PreviewAutomationExecutionError" });
+    expect(JSON.stringify(fillError)).not.toContain(secretValue);
+
+    vi.useFakeTimers();
+    try {
+      const slowPage = {
+        locator: () => ({
+          evaluate: async () => true,
+          fill: async () => {},
+        }),
+        keyboard: {
+          type: async () => {
+            vi.advanceTimersByTime(500);
+          },
+          insertText: async () => {},
+        },
+      } as unknown as Page;
+      const longSecret = `${secretValue}${"x".repeat(80)}`;
+      const timeoutError = await ServerBrowserPage.type(slowPage, {
+        locator: "#pw",
+        text: longSecret,
+        timeoutMs: 300,
+        sensitive: true,
+      }).catch((error: unknown) => error);
+      expect(timeoutError).toMatchObject({ tag: "PreviewAutomationTimeoutError" });
+      expect(JSON.stringify(timeoutError)).not.toContain(secretValue);
+      expect(JSON.stringify(timeoutError)).not.toContain(String(longSecret.length));
     } finally {
       vi.useRealTimers();
     }

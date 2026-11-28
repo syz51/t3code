@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import { Tool } from "effect/ai";
 
+import { OrchestratorToolkit } from "../orchestrator/tools.ts";
 import { PreviewToolkit } from "./tools.ts";
 
 const schemaHasMultipleAllOfDescriptions = (schema: unknown): boolean => {
@@ -50,4 +51,14 @@ it("preview_open accepts a target while preserving open input constraints", () =
   });
   expect(() => decode({ target: { ...target, port: 0 } })).toThrow();
   expect(() => decode({ target, tabId: "tab-1", reuseExistingTab: false })).toThrow();
+});
+
+it("exposes secretRef on preview_act and names the page-login route in tool descriptions", () => {
+  const previewAct = PreviewToolkit.tools.preview_act;
+  const schema = Tool.getJsonSchema(previewAct) as {
+    readonly properties?: Readonly<Record<string, unknown>>;
+  };
+  expect(schema.properties?.secretRef).toBeDefined();
+  expect(previewAct.description).toContain("secretRef");
+  expect(OrchestratorToolkit.tools.request_secret.description).toContain("preview_act");
 });

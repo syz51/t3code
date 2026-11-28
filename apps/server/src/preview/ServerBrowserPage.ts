@@ -976,15 +976,58 @@ const valueOnlyInput = (
   );
 };
 
+export type TypeInput = PreviewAutomationTypeInput & {
+  readonly sensitive?: boolean | undefined;
+};
+
+const sanitizeSensitiveTypeError = (
+  cause: unknown,
+  timeoutMs: number,
+): ServerBrowserOperationError | BrowserControlInterrupted => {
+  if (isBrowserControlInterrupted(cause) || isServerBrowserOperationError(cause)) return cause;
+  const mapped = toOperationError(cause, timeoutMs);
+  if (mapped.tag === "PreviewAutomationTimeoutError") {
+    return new ServerBrowserOperationError({
+      tag: mapped.tag,
+      message: `Timed out after ${timeoutMs}ms while typing the secret.`,
+      detail: { timeoutMs },
+    });
+  }
+  if (mapped.tag === "PreviewAutomationInvalidSelectorError") {
+    return new ServerBrowserOperationError({
+      tag: mapped.tag,
+      message: "Invalid selector or locator while typing the secret.",
+    });
+  }
+  if (mapped.tag === "PreviewAutomationTargetNotEditableError") {
+    return new ServerBrowserOperationError({
+      tag: mapped.tag,
+      message: "The target is not an enabled text field, so the secret was not typed.",
+    });
+  }
+  return new ServerBrowserOperationError({
+    tag: "PreviewAutomationExecutionError",
+    message: "Could not type the secret into the target field.",
+  });
+};
+
 // Keys reach pages that build their value from keydown. Line breaks stay text: Enter would submit the form.
-const typeKeys = async (page: Page, text: string, timeoutMs: number, deadline: number) => {
+const typeKeys = async (
+  page: Page,
+  text: string,
+  timeoutMs: number,
+  deadline: number,
+  sensitive = false,
+) => {
   let typed = 0;
   for (const [index, part] of text.split(/([\r\n]+)/u).entries()) {
     // Keys cost about a millisecond each, so long text is sent in pieces that stop at the deadline.
     const pieces = index % 2 === 1 ? [part] : (part.match(/[^]{1,64}/gu) ?? []);
     for (const piece of pieces) {
       if (Date.now() >= deadline) {
-        const reason = `Typing stopped after ${typed} of ${text.length} characters, which the field now holds. Type the rest in another call or raise timeoutMs.`;
+        const reason = sensitive
+          ? "Typing the secret timed out before completion. Clear the field, ask again with request_secret if needed, or raise timeoutMs."
+          : `Typing stopped after ${typed} of ${text.length} characters, which the field now holds. Type the rest in another call or raise timeoutMs.`;
         throw new ServerBrowserOperationError({
           tag: "PreviewAutomationTimeoutError",
           message: reason,
@@ -998,40 +1041,46 @@ const typeKeys = async (page: Page, text: string, timeoutMs: number, deadline: n
   }
 };
 
-export const type = async (page: Page, input: PreviewAutomationTypeInput) => {
+export const type = async (page: Page, input: TypeInput) => {
   // One deadline across steps keeps the reply inside the broker's grace; Playwright reads 0 as none.
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   const remaining = () => Math.max(1, deadline - Date.now());
-  const locator = targetLocator(page, input);
-  if (locator !== null && input.clear) {
-    // Pickers and sliders take a value such as 2026-01-31 only from fill, and some reject an empty one.
-    const timeout = remaining();
-    if (await pageAnswer(locator.evaluate(valueOnlyInput, undefined, { timeout }), timeout)) {
-      await locator.fill(input.text, { timeout: remaining() });
+  const sensitive = input.sensitive === true;
+  try {
+    const locator = targetLocator(page, input);
+    if (locator !== null && input.clear) {
+      // Pickers and sliders take a value such as 2026-01-31 only from fill, and some reject an empty one.
+      const timeout = remaining();
+      if (await pageAnswer(locator.evaluate(valueOnlyInput, undefined, { timeout }), timeout)) {
+        await locator.fill(input.text, { timeout: remaining() });
+        return;
+      }
+      // fill follows a label to its control and leaves that control focused for the keys.
+      await locator.fill("", { timeout: remaining() });
+      await typeKeys(page, input.text, timeoutMs, deadline, sensitive);
       return;
     }
-    // fill follows a label to its control and leaves that control focused for the keys.
-    await locator.fill("", { timeout: remaining() });
-    await typeKeys(page, input.text, timeoutMs, deadline);
-    return;
+    const focused =
+      locator === null
+        ? // A `*:focus` locator needs Playwright's utility world, which some desktop tabs never get.
+          await pageAnswer(page.evaluate(focusTextTarget, null), remaining())
+        : await locator.evaluate(focusTextTarget, undefined, { timeout: remaining() });
+    if (focused !== true) {
+      throw new ServerBrowserOperationError({
+        tag: "PreviewAutomationTargetNotEditableError",
+        message: "The target is not an enabled text field, so no text was typed.",
+      });
+    }
+    if (input.clear) {
+      await page.keyboard.press("ControlOrMeta+A");
+      await page.keyboard.press("Delete");
+    }
+    await typeKeys(page, input.text, timeoutMs, deadline, sensitive);
+  } catch (cause) {
+    if (sensitive) throw sanitizeSensitiveTypeError(cause, timeoutMs);
+    throw cause;
   }
-  const focused =
-    locator === null
-      ? // A `*:focus` locator needs Playwright's utility world, which some desktop tabs never get.
-        await pageAnswer(page.evaluate(focusTextTarget, null), remaining())
-      : await locator.evaluate(focusTextTarget, undefined, { timeout: remaining() });
-  if (focused !== true) {
-    throw new ServerBrowserOperationError({
-      tag: "PreviewAutomationTargetNotEditableError",
-      message: "The target is not an enabled text field, so no text was typed.",
-    });
-  }
-  if (input.clear) {
-    await page.keyboard.press("ControlOrMeta+A");
-    await page.keyboard.press("Delete");
-  }
-  await typeKeys(page, input.text, timeoutMs, deadline);
 };
 
 export const hover = async (

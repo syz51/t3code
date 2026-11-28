@@ -5,13 +5,16 @@ import * as Schema from "effect/Schema";
 import {
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PREVIEW_RECORDING_STOP_TIMEOUT_MS,
+  PreviewAutomationExecutionError,
   PreviewAutomationRecordingTransferError,
   PreviewAutomationRecordingDesktopUpdateRequiredError,
   PreviewAutomationRecordingArtifact,
   PreviewAutomationActInputs,
+  PreviewAutomationTimeoutError,
   OrchestratorMcpFailure,
   type ToolActivityIcon,
   type ThreadId,
+  type PreviewAutomationError,
   type PreviewAutomationOperation,
   type PreviewAutomationOpenInput,
   type PreviewAutomationRecordingStatus,
@@ -21,6 +24,8 @@ import {
   type PreviewAutomationSnapshotMetadata,
   type PreviewAutomationStatus,
   type PreviewTabId,
+  type SecretRef,
+  type SecretRequestError,
 } from "@t3tools/contracts";
 
 import {
@@ -31,6 +36,8 @@ import {
 } from "../../../attachmentStore.ts";
 import { resolveAttachmentRelativePath } from "../../../attachmentPaths.ts";
 import * as ServerConfig from "../../../config.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
@@ -116,6 +123,63 @@ const invokeTargeted = <A extends object>(
 const decodeActInput = Record.map(PreviewAutomationActInputs, (schema) =>
   Schema.decodeUnknownEffect(schema),
 );
+
+const secretRefFailureCode = (reason: SecretRequestError["reason"]) =>
+  reason === "invalid_ref" || reason === "ref_unavailable" || reason === "ref_expired"
+    ? ("invalid_request" as const)
+    : ("orchestration_error" as const);
+
+const redactSensitivePreviewError = (error: PreviewAutomationError): PreviewAutomationError => {
+  if (error._tag === "PreviewAutomationExecutionError") {
+    const { cause: _cause, reason: _reason, ...fields } = error;
+    return new PreviewAutomationExecutionError({
+      ...fields,
+      cause: null,
+      reason: "Could not type the secret into the target field.",
+    });
+  }
+  if (error._tag === "PreviewAutomationTimeoutError") {
+    const { cause: _cause, reason: _reason, ...fields } = error;
+    return new PreviewAutomationTimeoutError({
+      ...fields,
+      cause: null,
+      reason: "Timed out while typing the secret.",
+    });
+  }
+  return error;
+};
+
+const consumeSecretRefForPreview = Effect.fn("PreviewToolkit.consumeSecretRef")(function* (
+  ref: SecretRef,
+) {
+  const scope = yield* McpInvocationContext.requireThreadMcpCapability("preview");
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const caller = yield* threads.getThreadShell(scope.thread.threadId).pipe(
+    Effect.mapError(
+      () =>
+        new OrchestratorMcpFailure({
+          code: "orchestration_error",
+          message: "Could not load the calling thread.",
+        }),
+    ),
+  );
+  if (caller === null || caller.deletedAt !== null) {
+    return yield* new OrchestratorMcpFailure({
+      code: "thread_not_found",
+      message: "The calling thread was not found.",
+    });
+  }
+  const secretRequests = yield* SecretRequests.SecretRequests;
+  return yield* secretRequests.consume({ ref, projectId: caller.projectId }).pipe(
+    Effect.mapError(
+      (error) =>
+        new OrchestratorMcpFailure({
+          code: secretRefFailureCode(error.reason),
+          message: error.message,
+        }),
+    ),
+  );
+});
 
 const UploadedRecordingArtifact = Schema.Struct({
   ...PreviewAutomationRecordingArtifact.fields,
@@ -238,13 +302,25 @@ const handlers = {
       Effect.mapError(
         (cause) => new OrchestratorMcpFailure({ code: "invalid_request", message: cause.message }),
       ),
-      Effect.flatMap((decoded) =>
-        invokeTargeted<object>(
+      Effect.flatMap((decoded) => {
+        if (action === "type" && "secretRef" in decoded && decoded.secretRef !== undefined) {
+          const { secretRef, text: _text, ...typeInput } = decoded;
+          return consumeSecretRefForPreview(secretRef).pipe(
+            Effect.flatMap((secretValue) =>
+              invokeTargeted<object>(
+                "type",
+                { ...typeInput, text: secretValue, sensitive: true },
+                typeInput.timeoutMs,
+              ).pipe(Effect.mapError(redactSensitivePreviewError)),
+            ),
+          );
+        }
+        return invokeTargeted<object>(
           action,
           decoded,
           "timeoutMs" in decoded ? decoded.timeoutMs : undefined,
-        ),
-      ),
+        );
+      }),
     ),
   ),
   preview_evaluate: McpToolAccess.actsAsCaller(({ tabId, ...input }) =>

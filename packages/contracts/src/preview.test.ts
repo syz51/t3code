@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { EnvironmentId, ThreadId } from "./baseSchemas.ts";
 import {
+  PreviewAutomationActInputs,
   PreviewAutomationHost,
   PreviewAutomationInvalidSelectorError,
   PreviewAutomationStatus,
@@ -81,5 +82,36 @@ describe("PreviewAutomationInvalidSelectorError", () => {
     expect(message).toMatch(/CSS/);
     expect(message).toMatch(/\blocator\b/);
     expect(message).toContain("aria-ref=");
+  });
+});
+
+describe("PreviewAutomationActInputs.type", () => {
+  const decodeType = Schema.decodeUnknownSync(PreviewAutomationActInputs.type);
+
+  it("accepts either literal text or a secretRef, never both or neither", () => {
+    expect(decodeType({ locator: "#email", text: "ada@example.com" })).toEqual({
+      locator: "#email",
+      text: "ada@example.com",
+    });
+    expect(
+      decodeType({
+        locator: "#password",
+        secretRef: "secret-ref:0123456789abcdef0123456789abcdef",
+        clear: true,
+      }),
+    ).toEqual({
+      locator: "#password",
+      secretRef: "secret-ref:0123456789abcdef0123456789abcdef",
+      clear: true,
+    });
+    expect(() => decodeType({ locator: "#password" })).toThrow();
+    expect(() =>
+      decodeType({
+        locator: "#password",
+        text: "literal",
+        secretRef: "secret-ref:0123456789abcdef0123456789abcdef",
+      }),
+    ).toThrow();
+    expect(() => decodeType({ locator: "#password", secretRef: "   " })).toThrow();
   });
 });
