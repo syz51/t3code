@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   ProviderInteractionMode,
   RuntimeMode,
+  SecretRequestError,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -53,6 +54,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerHttp from "../http.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
@@ -107,6 +109,7 @@ const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
   Layer.provideMerge(PreviewAutomationBroker.layer),
+  Layer.provideMerge(Layer.mock(SecretRequests.SecretRequests)({})),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" })),
   Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
 );
@@ -690,8 +693,83 @@ it.effect("checks each preview_act action against that action's own input", () =
 
       yield* callTool("preview_act", { action: "type", selector: "#name", text: "Ada" });
       expect(inputs.at(-2)).toEqual({ selector: "#name", text: "Ada" });
+
+      const missingTextAndRef = yield* callTool("preview_act", {
+        action: "type",
+        selector: "#name",
+      });
+      expect(missingTextAndRef.isError).toBe(true);
     }),
   ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "preview_act fills a field from a one-use secretRef without leaking it to the tool result or logs",
+  () => {
+    const secretValue = "McpHttpSecret!5432";
+    const secretRef = "secret-ref:0123456789abcdef0123456789abcdef";
+    let available = true;
+    const logs: Array<string> = [];
+    const captureLogger = Logger.make(({ message, cause }) => {
+      logs.push(JSON.stringify({ message, cause: String(cause) }));
+    });
+    const layerWithSecret = McpHttpServer.layerPreviewToolkit.pipe(
+      Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+      Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
+      Layer.provideMerge(PreviewAutomationBroker.layer),
+      Layer.provideMerge(
+        Layer.mock(SecretRequests.SecretRequests)({
+          consume: ({ ref, projectId }) => {
+            if (
+              available &&
+              ref === secretRef &&
+              projectId === ProjectId.make("project:mcp-test")
+            ) {
+              available = false;
+              return Effect.succeed(secretValue);
+            }
+            return Effect.fail(
+              new SecretRequestError({
+                reason: "ref_unavailable",
+              }),
+            );
+          },
+        }),
+      ),
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-secret-" })),
+      Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      Layer.provideMerge(Logger.layer([captureLogger])),
+    );
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const inputs = yield* serveSnapshots("mcp-secret-client", {});
+        const first = yield* callTool("preview_act", {
+          action: "type",
+          locator: "aria-ref=e9",
+          secretRef,
+          clear: true,
+        });
+        expect(first.isError).toBe(false);
+        expect(JSON.stringify(first)).not.toContain(secretValue);
+        expect(inputs[0]).toEqual({
+          locator: "aria-ref=e9",
+          text: secretValue,
+          clear: true,
+          sensitive: true,
+        });
+
+        const second = yield* callTool("preview_act", {
+          action: "type",
+          locator: "aria-ref=e9",
+          secretRef,
+        });
+        expect(second.isError).toBe(true);
+        expect(JSON.stringify(second)).toContain("already used");
+        expect(JSON.stringify(second)).not.toContain(secretValue);
+        expect(logs.join("\n")).not.toContain(secretValue);
+      }),
+    ).pipe(Effect.provide(layerWithSecret));
+  },
 );
 
 it.effect("rejects a hand-registered tool's undeclared argument before asking the browser", () =>

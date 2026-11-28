@@ -36,7 +36,6 @@ import {
   type PreviewAutomationSetColorSchemeInput,
   type PreviewAutomationSnapshotInput,
   type PreviewAutomationStatus,
-  type PreviewAutomationTypeInput,
   type PreviewAutomationUploadInput,
   type PreviewAutomationWaitForInput,
   PreviewClearProfileError,
@@ -3174,7 +3173,7 @@ const make = Effect.gen(function* () {
       case "type": {
         // As for click: typing stops at the broker's deadline instead of running on after the reply.
         const typeInput = {
-          ...(input as PreviewAutomationTypeInput),
+          ...(input as ServerBrowserPage.TypeInput),
           timeoutMs: Math.max(1, Math.floor(deadlineMs - performance.now())),
         };
         return recordAction(tab, "type", () => ServerBrowserPage.type(tab.page, typeInput));
