@@ -249,10 +249,12 @@ const make = Effect.gen(function* () {
         const authSessions = yield* AuthSessions.AuthSessionRepository;
         yield* onStep("prune-events");
         const summary = yield* maintenance.pruneEventStore();
+        const now = yield* DateTime.now;
         yield* authSessions.pruneExpiredAndRevoked({
-          before: DateTime.subtractDuration(
-            yield* DateTime.now,
-            AuthSessions.AUTH_SESSION_RETENTION,
+          before: DateTime.subtractDuration(now, AuthSessions.AUTH_SESSION_RETENTION),
+          revokedBotBefore: DateTime.subtractDuration(
+            now,
+            AuthSessions.AUTH_REVOKED_BOT_SESSION_RETENTION,
           ),
         });
         yield* onStep("vacuum");

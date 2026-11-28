@@ -1,3 +1,4 @@
+import { routineSpan } from "@t3tools/shared/observability";
 import {
   CommandId,
   type RunId,
@@ -1598,26 +1599,25 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const loadCaller = Effect.fn("OrchestratorMcpService.loadCaller")(function* <K extends "runs">(
-    scope: McpInvocationScope,
-    fields: ReadonlyArray<K>,
-  ) {
-    yield* requireCapability(scope);
-    if (scope.thread === undefined) {
+  const loadCaller = Effect.fn("OrchestratorMcpService.loadCaller", { attributes: routineSpan })(
+    function* <K extends "runs">(scope: McpInvocationScope, fields: ReadonlyArray<K>) {
+      yield* requireCapability(scope);
+      if (scope.thread === undefined) {
+        return {
+          parent: undefined,
+          limits: clientModeCeiling(scope.client),
+        } as const;
+      }
+      const parent = yield* loadCallerRecords(scope.thread.threadId, fields);
       return {
-        parent: undefined,
-        limits: clientModeCeiling(scope.client),
+        parent,
+        limits: {
+          runtimeMode: parent.thread.runtimeMode,
+          interactionMode: parent.thread.interactionMode,
+        },
       } as const;
-    }
-    const parent = yield* loadCallerRecords(scope.thread.threadId, fields);
-    return {
-      parent,
-      limits: {
-        runtimeMode: parent.thread.runtimeMode,
-        interactionMode: parent.thread.interactionMode,
-      },
-    } as const;
-  });
+    },
+  );
 
   const loadThreadCaller = Effect.fn("OrchestratorMcpService.loadThreadCaller")(function* (
     scope: McpInvocationScope,

@@ -20,6 +20,7 @@ import {
   threadLinkCandidates,
   threadLinkRefs,
 } from "@t3tools/shared/threadLinks";
+import { routineSpan } from "@t3tools/shared/observability";
 import { hasPendingBackgroundSubagent } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -134,7 +135,7 @@ export interface Caller {
   readonly limits: CallerLimits;
 }
 
-export const readCaller = Effect.fn("mcp.readCaller")(function* () {
+export const readCaller = Effect.fn("mcp.readCaller", { attributes: routineSpan })(function* () {
   const scope = yield* McpInvocationContext.McpInvocationContext;
   if (!scope.capabilities.has("orchestration")) {
     return yield* new OrchestratorMcpFailure({
@@ -145,7 +146,7 @@ export const readCaller = Effect.fn("mcp.readCaller")(function* () {
   return yield* loadCaller();
 });
 
-export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
+export const loadCaller = Effect.fn("mcp.loadCaller", { attributes: routineSpan })(function* () {
   const scope = yield* McpInvocationContext.McpInvocationContext;
   const threads = yield* ThreadManagement.ThreadManagementService;
   if (scope.thread === undefined) {

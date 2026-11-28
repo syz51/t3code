@@ -281,6 +281,12 @@ it.effect("prunes expired and revoked auth sessions during periodic compaction",
       ),
     );
     const recentTime = DateTime.formatIso(DateTime.subtractDuration(now, Duration.days(1)));
+    const staleBotRevokedTime = DateTime.formatIso(
+      DateTime.subtractDuration(
+        now,
+        Duration.sum(AuthSessions.AUTH_REVOKED_BOT_SESSION_RETENTION, Duration.minutes(5)),
+      ),
+    );
     const futureTime = DateTime.formatIso(DateTime.addDuration(now, Duration.days(30)));
 
     yield* Effect.gen(function* () {
@@ -292,6 +298,7 @@ it.effect("prunes expired and revoked auth sessions during periodic compaction",
           ('session-active', 'browser', '["access:read"]', 'browser-session-cookie', 'desktop', ${recentTime}, ${futureTime}, NULL),
           ('session-live-expired', 'dpop', '["access:read"]', 'dpop-access-token', 'desktop', ${oldTime}, ${oldTime}, NULL),
           ('session-recent-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${futureTime}, ${recentTime}),
+          ('session-revoked-bot', 'mcp-client', '["access:read"]', 'bearer-access-token', 'bot', ${recentTime}, ${futureTime}, ${staleBotRevokedTime}),
           ('session-old-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${futureTime}, ${oldTime}),
           ('session-old-expired', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${oldTime}, ${oldTime}, NULL)
       `;

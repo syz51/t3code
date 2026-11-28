@@ -38,6 +38,7 @@ vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
           expiresAt,
         })),
       revokeSession: () => Effect.succeed(true),
+      deleteSession: () => Effect.succeed(true),
     }),
   };
 });

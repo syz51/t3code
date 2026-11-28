@@ -33,6 +33,7 @@ const createSession = (
     readonly issuedAt: DateTime.Utc;
     readonly expiresAt: DateTime.Utc;
     readonly revokedAt?: DateTime.Utc;
+    readonly deviceType?: AuthSessions.AuthSessionClientMetadataRecord["deviceType"];
   },
 ) =>
   Effect.gen(function* () {
@@ -42,7 +43,7 @@ const createSession = (
       subject: "mcp-client",
       scopes,
       method: "bearer-access-token",
-      client,
+      client: { ...client, deviceType: input.deviceType ?? client.deviceType },
       issuedAt: input.issuedAt,
       expiresAt: input.expiresAt,
     });
@@ -219,6 +220,108 @@ describe("AuthSessionRepository.pruneExpiredAndRevoked", () => {
         totalDeletedCount: 0,
       });
       assert.equal(pauses, 0);
+    }).pipe(Effect.provide(layerAuthSession)),
+  );
+
+  it.effect(
+    "prunes revoked bot sessions on a shorter window without removing interactive rows",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* AuthSessions.AuthSessionRepository;
+        const revokedBotCutoff = DateTime.subtractDuration(
+          now,
+          AuthSessions.AUTH_REVOKED_BOT_SESSION_RETENTION,
+        );
+        const recentIssuedAt = DateTime.subtractDuration(now, Duration.days(1));
+        const futureExpiry = DateTime.addDuration(now, Duration.days(20));
+
+        const activeBotId = yield* createSession(sessions, {
+          id: "01-active-bot",
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          deviceType: "bot",
+        });
+        const recentRevokedBotId = yield* createSession(sessions, {
+          id: "02-recent-revoked-bot",
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          revokedAt: DateTime.addDuration(revokedBotCutoff, Duration.seconds(1)),
+          deviceType: "bot",
+        });
+        const liveExcludedRevokedBotId = yield* createSession(sessions, {
+          id: "03-live-excluded-bot",
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          revokedAt: DateTime.subtractDuration(revokedBotCutoff, Duration.minutes(5)),
+          deviceType: "bot",
+        });
+        const recentRevokedDesktopId = yield* createSession(sessions, {
+          id: "04-recent-revoked-desktop",
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          revokedAt: DateTime.subtractDuration(revokedBotCutoff, Duration.hours(2)),
+          deviceType: "desktop",
+        });
+        const revokedDevBotId = yield* createSession(sessions, {
+          id: `${REUSABLE_DEV_SESSION_PREFIX}bot-tombstone`,
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          revokedAt: DateTime.subtractDuration(revokedBotCutoff, Duration.hours(2)),
+          deviceType: "bot",
+        });
+        // Prunable: bot session revoked strictly before revokedBotCutoff.
+        yield* createSession(sessions, {
+          id: "05-stale-revoked-bot",
+          issuedAt: recentIssuedAt,
+          expiresAt: futureExpiry,
+          revokedAt: DateTime.subtractDuration(revokedBotCutoff, Duration.seconds(1)),
+          deviceType: "bot",
+        });
+
+        const result = yield* sessions.pruneExpiredAndRevoked({
+          before: cutoff,
+          revokedBotBefore: revokedBotCutoff,
+          excludeSessionIds: [liveExcludedRevokedBotId],
+        });
+        assert.deepStrictEqual(result, {
+          deletedRevokedCount: 1,
+          deletedExpiredCount: 0,
+          totalDeletedCount: 1,
+        });
+        assert.deepStrictEqual(yield* remainingSessionIds, [
+          activeBotId,
+          recentRevokedBotId,
+          liveExcludedRevokedBotId,
+          recentRevokedDesktopId,
+          revokedDevBotId,
+        ]);
+      }).pipe(Effect.provide(layerAuthSession)),
+  );
+});
+
+describe("AuthSessionRepository.deleteById", () => {
+  it.effect("hard-deletes ephemeral sessions while preserving dev-auth tombstones", () =>
+    Effect.gen(function* () {
+      const sessions = yield* AuthSessions.AuthSessionRepository;
+      const futureExpiry = DateTime.addDuration(now, Duration.days(1));
+
+      const ephemeralId = yield* createSession(sessions, {
+        id: "ephemeral-cli",
+        issuedAt: now,
+        expiresAt: futureExpiry,
+        deviceType: "bot",
+      });
+      const devId = yield* createSession(sessions, {
+        id: `${REUSABLE_DEV_SESSION_PREFIX}keep`,
+        issuedAt: now,
+        expiresAt: futureExpiry,
+      });
+
+      assert.isTrue(yield* sessions.deleteById({ sessionId: ephemeralId }));
+      assert.isFalse(yield* sessions.deleteById({ sessionId: ephemeralId }));
+      assert.isFalse(yield* sessions.deleteById({ sessionId: devId }));
+      assert.isTrue(Option.isNone(yield* sessions.getById({ sessionId: ephemeralId })));
+      assert.deepStrictEqual(yield* remainingSessionIds, [devId]);
     }).pipe(Effect.provide(layerAuthSession)),
   );
 });

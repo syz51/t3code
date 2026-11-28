@@ -62,6 +62,7 @@ const makeConfig = (baseDir: string) =>
       logLevel: "Info",
       traceMinLevel: "Info",
       traceTimingEnabled: true,
+      traceMinSpanDurationMs: 10,
       traceBatchWindowMs: 200,
       traceMaxBytes: 10 * 1024 * 1024,
       traceMaxFiles: 10,

@@ -114,7 +114,10 @@ export type SetAuthSessionLastConnectedAtInput = typeof SetAuthSessionLastConnec
 
 // Bounds auth_sessions growth while keeping recent revoked/expired rows for diagnostics and errors.
 export const AUTH_SESSION_RETENTION = Duration.days(7);
+// Ephemeral bot/CLI sessions discard their tokens on exit; prune any soft-revoked rows promptly.
+export const AUTH_REVOKED_BOT_SESSION_RETENTION = Duration.hours(1);
 const PRUNE_BATCH_SIZE = 500;
+const DEV_SESSION_GLOB = `${REUSABLE_DEV_SESSION_PREFIX}*`;
 
 export class AuthSessionRepository extends Context.Service<
   AuthSessionRepository,
@@ -137,6 +140,9 @@ export class AuthSessionRepository extends Context.Service<
     readonly revoke: (
       input: RevokeAuthSessionInput,
     ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
+    readonly deleteById: (
+      input: GetAuthSessionByIdInput,
+    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
     /** Moves a live session's expiry; false when it is revoked, expired, missing or past `onlyIfExpiresBy`. */
     readonly extend: (
       input: ExtendAuthSessionInput,
@@ -155,6 +161,7 @@ export class AuthSessionRepository extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<AuthSessionId>, AuthSessionRepositoryError>;
     readonly pruneExpiredAndRevoked: (input: {
       readonly before: DateTime.Utc;
+      readonly revokedBotBefore?: DateTime.Utc;
       readonly excludeSessionIds?: ReadonlyArray<AuthSessionId>;
       readonly batchSize?: number;
       readonly betweenPages?: Effect.Effect<void>;
@@ -383,6 +390,18 @@ export const make = Effect.gen(function* () {
       `,
   });
 
+  const deleteSessionRows = SqlSchema.findAll({
+    Request: GetAuthSessionByIdInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    execute: ({ sessionId }) =>
+      sql`
+        DELETE FROM auth_sessions
+        WHERE session_id = ${sessionId}
+          AND session_id NOT GLOB ${DEV_SESSION_GLOB}
+        RETURNING session_id AS "sessionId"
+      `,
+  });
+
   const extendSessionRows = SqlSchema.findAll({
     Request: ExtendAuthSessionInput,
     Result: Schema.Struct({ sessionId: AuthSessionId }),
@@ -546,6 +565,18 @@ export const make = Effect.gen(function* () {
       Effect.map((rows) => rows.length > 0),
     );
 
+  const deleteById: AuthSessionRepository["Service"]["deleteById"] = (input) =>
+    deleteSessionRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.deleteById:query",
+          "AuthSessionRepository.deleteById:decodeRows",
+          { sessionId: input.sessionId },
+        ),
+      ),
+      Effect.map((rows) => rows.length > 0),
+    );
+
   const extend: AuthSessionRepository["Service"]["extend"] = (input) =>
     extendSessionRows(input).pipe(
       Effect.mapError(
@@ -633,21 +664,20 @@ export const make = Effect.gen(function* () {
             : PRUNE_BATCH_SIZE;
         const betweenPages = input.betweenPages ?? Effect.void;
         // Keep revoked reusable-dev-token tombstones so startup createIfAbsent never re-enables them.
-        const devSessionPattern = `${REUSABLE_DEV_SESSION_PREFIX}*`;
         const excludeFilter =
           input.excludeSessionIds !== undefined && input.excludeSessionIds.length > 0
             ? sql`AND session_id NOT IN ${sql.in(input.excludeSessionIds)}`
             : sql``;
 
-        // Both predicates are indexed by idx_auth_sessions_active(revoked_at, expires_at, issued_at).
-        const deletedRevokedCount = yield* drainDeleteBatches(
+        // Predicates are indexed by idx_auth_sessions_active(revoked_at, expires_at, issued_at).
+        const deletedAgedRevokedCount = yield* drainDeleteBatches(
           sql<{ readonly pruned: number }>`
             DELETE FROM auth_sessions
             WHERE rowid IN (
               SELECT rowid FROM auth_sessions
               WHERE revoked_at IS NOT NULL
                 AND revoked_at < ${cutoffIso}
-                AND session_id NOT GLOB ${devSessionPattern}
+                AND session_id NOT GLOB ${DEV_SESSION_GLOB}
                 ${excludeFilter}
               LIMIT ${batchSize}
             )
@@ -656,6 +686,35 @@ export const make = Effect.gen(function* () {
           batchSize,
           betweenPages,
         );
+        let deletedRevokedBotCount = 0;
+        if (
+          input.revokedBotBefore !== undefined &&
+          DateTime.isGreaterThan(input.revokedBotBefore, input.before)
+        ) {
+          if (deletedAgedRevokedCount > 0) {
+            yield* Effect.yieldNow;
+            yield* betweenPages;
+          }
+          const revokedBotCutoffIso = DateTime.formatIso(input.revokedBotBefore);
+          deletedRevokedBotCount = yield* drainDeleteBatches(
+            sql<{ readonly pruned: number }>`
+              DELETE FROM auth_sessions
+              WHERE rowid IN (
+                SELECT rowid FROM auth_sessions
+                WHERE revoked_at IS NOT NULL
+                  AND revoked_at < ${revokedBotCutoffIso}
+                  AND client_device_type = 'bot'
+                  AND session_id NOT GLOB ${DEV_SESSION_GLOB}
+                  ${excludeFilter}
+                LIMIT ${batchSize}
+              )
+              RETURNING 1 AS pruned
+            `,
+            batchSize,
+            betweenPages,
+          );
+        }
+        const deletedRevokedCount = deletedAgedRevokedCount + deletedRevokedBotCount;
         if (deletedRevokedCount > 0) {
           yield* Effect.yieldNow;
           yield* betweenPages;
@@ -667,7 +726,7 @@ export const make = Effect.gen(function* () {
               SELECT rowid FROM auth_sessions
               WHERE revoked_at IS NULL
                 AND expires_at < ${cutoffIso}
-                AND session_id NOT GLOB ${devSessionPattern}
+                AND session_id NOT GLOB ${DEV_SESSION_GLOB}
                 ${excludeFilter}
               LIMIT ${batchSize}
             )
@@ -699,6 +758,7 @@ export const make = Effect.gen(function* () {
     getById,
     listActive,
     revoke,
+    deleteById,
     extend,
     revokeAllExcept,
     setLastConnectedAt,

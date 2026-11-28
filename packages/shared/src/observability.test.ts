@@ -23,7 +23,9 @@ import {
   errorTag,
   makeLocalFileTracer,
   makeTraceSink,
+  shouldRecordLocalTraceRecord,
   type EffectTraceRecord,
+  type OtlpTraceRecord,
   type TraceRecord,
   OtlpHeadersFromString,
   truncateTraceAttributes,
@@ -203,6 +205,184 @@ describe("observability", () => {
       );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "filters fast successful event-less spans below minSpanDurationMs while keeping slow, failed, interrupted, logged, sampled, and OTLP spans",
+    () =>
+      Effect.gen(function* () {
+        const names: Array<string> = [];
+        const delegates: Array<Tracer.Span> = [];
+        const tracer = yield* makeLocalFileTracer({
+          filePath: "unused",
+          maxBytes: 1024,
+          maxFiles: 1,
+          batchWindowMs: 1000,
+          minSpanDurationMs: 10,
+          sink: {
+            filePath: "unused",
+            push: (r) => names.push(r.name),
+            flush: Effect.void,
+            flushSync: () => {},
+            close: () => Effect.void,
+          },
+          delegate: Tracer.make({
+            span: (options) => {
+              const span = new Tracer.NativeSpan(options);
+              span._spanId = "1".repeat(14) + (options.name === "sampled-fast" ? "00" : "01");
+              delegates.push(span);
+              return span;
+            },
+          }),
+        });
+        for (const name of [
+          "fast-untagged",
+          "sampled-fast",
+          "slow-untagged",
+          "failed-fast",
+          "interrupted-fast",
+          "logged-fast",
+        ]) {
+          const span = yield* Effect.makeSpan(name).pipe(
+            Effect.provideService(Tracer.Tracer, tracer),
+          );
+          if (name === "logged-fast") span.event("diagnostic", span.status.startTime);
+          span.end(
+            span.status.startTime + (name === "slow-untagged" ? 10_000_000n : 9_999_999n),
+            name === "failed-fast"
+              ? Exit.fail("boom")
+              : name === "interrupted-fast"
+                ? Exit.interrupt()
+                : Exit.void,
+          );
+        }
+        assert.deepEqual(names, [
+          "sampled-fast",
+          "slow-untagged",
+          "failed-fast",
+          "interrupted-fast",
+          "logged-fast",
+        ]);
+        assert.deepEqual(
+          delegates.map((span) => span.status._tag),
+          Array(6).fill("Ended"),
+        );
+
+        // minSpanDurationMs: 0 records every span unconditionally (including SQLite & routine spans) for verbose debugging.
+        const verboseNames: Array<string> = [];
+        const verboseTracer = yield* makeLocalFileTracer({
+          filePath: "unused",
+          maxBytes: 1024,
+          maxFiles: 1,
+          batchWindowMs: 1000,
+          sampleRoutineSpans: true,
+          minSpanDurationMs: 0,
+          sink: {
+            filePath: "unused",
+            push: (r) => verboseNames.push(r.name),
+            flush: Effect.void,
+            flushSync: () => {},
+            close: () => Effect.void,
+          },
+          delegate: Tracer.make({
+            span: (options) => {
+              const span = new Tracer.NativeSpan(options);
+              span._spanId = "1".repeat(14) + "01";
+              return span;
+            },
+          }),
+        });
+        for (const [name, attr] of [
+          ["fast-verbose", undefined],
+          ["fast-sqlite", ["db.system.name", "sqlite"] as const],
+          ["fast-routine", ["t3.trace.routine", true] as const],
+        ] as const) {
+          const span = yield* Effect.makeSpan(name).pipe(
+            Effect.provideService(Tracer.Tracer, verboseTracer),
+          );
+          if (attr !== undefined) span.attribute(attr[0], attr[1]);
+          span.end(span.status.startTime + 500_000n, Exit.void);
+        }
+        assert.deepEqual(verboseNames, ["fast-verbose", "fast-sqlite", "fast-routine"]);
+
+        // Explicit minSpanDurationMs below 10ms also governs SQLite and routine spans instead of falling back to 10ms.
+        const lowThresholdNames: Array<string> = [];
+        const lowThresholdTracer = yield* makeLocalFileTracer({
+          filePath: "unused",
+          maxBytes: 1024,
+          maxFiles: 1,
+          batchWindowMs: 1000,
+          sampleRoutineSpans: true,
+          minSpanDurationMs: 2,
+          sink: {
+            filePath: "unused",
+            push: (r) => lowThresholdNames.push(r.name),
+            flush: Effect.void,
+            flushSync: () => {},
+            close: () => Effect.void,
+          },
+          delegate: Tracer.make({
+            span: (options) => {
+              const span = new Tracer.NativeSpan(options);
+              span._spanId = "1".repeat(14) + "01";
+              return span;
+            },
+          }),
+        });
+        for (const [name, durationNanos, attr] of [
+          ["sqlite-1ms", 1_000_000n, ["db.system.name", "sqlite"] as const],
+          ["sqlite-3ms", 3_000_000n, ["db.system.name", "sqlite"] as const],
+          ["routine-3ms", 3_000_000n, ["t3.trace.routine", true] as const],
+        ] as const) {
+          const span = yield* Effect.makeSpan(name).pipe(
+            Effect.provideService(Tracer.Tracer, lowThresholdTracer),
+          );
+          span.attribute(attr[0], attr[1]);
+          span.end(span.status.startTime + durationNanos, Exit.void);
+        }
+        assert.deepEqual(lowThresholdNames, ["sqlite-3ms", "routine-3ms"]);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it("filters fast successful event-less OTLP spans while keeping errors, interruptions, events, slow spans, and 1/256 samples", () => {
+    const baseOtlp = (overrides: Partial<OtlpTraceRecord>): OtlpTraceRecord => ({
+      type: "otlp-span",
+      name: "browser.op",
+      traceId: "trace-1",
+      spanId: "1111111111111101",
+      sampled: true,
+      kind: "internal",
+      startTimeUnixNano: "1000000",
+      endTimeUnixNano: "2000000",
+      durationMs: 1,
+      attributes: {},
+      resourceAttributes: {},
+      scope: { attributes: {} },
+      events: [],
+      links: [],
+      status: { code: "0" },
+      ...overrides,
+    });
+    assert.isFalse(shouldRecordLocalTraceRecord(baseOtlp({}), 10));
+    assert.isTrue(shouldRecordLocalTraceRecord(baseOtlp({}), 0));
+    assert.isTrue(shouldRecordLocalTraceRecord(baseOtlp({ spanId: "1111111111111100" }), 10));
+    assert.isTrue(shouldRecordLocalTraceRecord(baseOtlp({ durationMs: 10 }), 10));
+    assert.isTrue(shouldRecordLocalTraceRecord(baseOtlp({ status: { code: "2" } }), 10));
+    assert.isTrue(
+      shouldRecordLocalTraceRecord(baseOtlp({ status: { code: "1", message: "Interrupted" } }), 10),
+    );
+    assert.isTrue(
+      shouldRecordLocalTraceRecord(
+        baseOtlp({ attributes: { "effect.fiber.interrupted": true } }),
+        10,
+      ),
+    );
+    assert.isTrue(
+      shouldRecordLocalTraceRecord(
+        baseOtlp({ events: [{ name: "warn", timeUnixNano: "1000000", attributes: {} }] }),
+        10,
+      ),
+    );
+  });
 
   it.effect(
     "preserves successful results without retaining them in sampled or unsampled spans",

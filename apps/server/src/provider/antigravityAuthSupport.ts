@@ -972,9 +972,8 @@ export function makeAntigravityStdoutTransform(
     ) => Effect.Effect<void, AcpErrors.AcpError>;
   } = {},
 ) {
-  const handleLine = Effect.fn("antigravityAuthSupport.handleStdoutLine")(function* (
-    line: Uint8Array,
-  ) {
+  // Per-line stdout transform runs on every protocol chunk; keep untraced to avoid span churn.
+  const handleLine = Effect.fnUntraced(function* (line: Uint8Array) {
     if (!authPrefixBytes.every((byte, index) => line[index] === byte)) return [line];
     const message = new TextDecoder().decode(line).replace(/\r?\n$/, "");
     const request = yield* parseAntigravityAuthorizationUrl(
@@ -1001,7 +1000,7 @@ export function makeAntigravityStdoutTransform(
       };
       return stdout.pipe(
         Stream.mapEffect(
-          Effect.fn("antigravityAuthSupport.splitStdoutLines")(function* (chunk: Uint8Array) {
+          Effect.fnUntraced(function* (chunk: Uint8Array) {
             const lines: Uint8Array[] = [];
             let offset = 0;
             while (offset < chunk.byteLength) {
