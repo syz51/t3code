@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- an aborted executable probe must not wait for the child to exit a stalled mount.
 import * as NodeChildProcess from "node:child_process";
 
+import { routineSpan } from "@t3tools/shared/observability";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
@@ -2450,7 +2451,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }),
   });
 
-  const queuePersist = Effect.fn("terminal.queuePersist")(function* (
+  const queuePersist = Effect.fn("terminal.queuePersist", { attributes: routineSpan })(function* (
     threadId: string,
     terminalId: string,
     history: BoundedTerminalHistory,
@@ -2725,124 +2726,123 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     },
   );
 
-  const drainProcessEvents = Effect.fn("terminal.drainProcessEvents")(function* (
-    session: TerminalSessionState,
-    expectedPid: number,
-  ) {
-    while (true) {
-      const action: DrainProcessEventAction = yield* Effect.sync(() => {
-        if (session.pid !== expectedPid || !session.process || session.status !== "running") {
-          session.pendingProcessEvents = [];
-          session.pendingProcessEventIndex = 0;
-          session.processEventDrainRunning = false;
-          return { type: "idle" } as const;
-        }
-
-        const nextEvent = session.pendingProcessEvents[session.pendingProcessEventIndex];
-        if (!nextEvent) {
-          session.pendingProcessEvents = [];
-          session.pendingProcessEventIndex = 0;
-          session.processEventDrainRunning = false;
-          return { type: "idle" } as const;
-        }
-
-        session.pendingProcessEvents[session.pendingProcessEventIndex] = undefined;
-        session.pendingProcessEventIndex += 1;
-        if (session.pendingProcessEventIndex * 2 >= session.pendingProcessEvents.length) {
-          session.pendingProcessEvents = session.pendingProcessEvents.slice(
-            session.pendingProcessEventIndex,
-          );
-          session.pendingProcessEventIndex = 0;
-        }
-
-        if (nextEvent.type === "output") {
-          const sanitized = sanitizeTerminalHistoryChunk(
-            session.pendingHistoryControlSequence,
-            nextEvent.data,
-          );
-          session.pendingHistoryControlSequence = sanitized.pendingControlSequence;
-          if (sanitized.visibleText.length > 0) {
-            session.history.append(sanitized.visibleText);
+  const drainProcessEvents = Effect.fn("terminal.drainProcessEvents", { attributes: routineSpan })(
+    function* (session: TerminalSessionState, expectedPid: number) {
+      while (true) {
+        const action: DrainProcessEventAction = yield* Effect.sync(() => {
+          if (session.pid !== expectedPid || !session.process || session.status !== "running") {
+            session.pendingProcessEvents = [];
+            session.pendingProcessEventIndex = 0;
+            session.processEventDrainRunning = false;
+            return { type: "idle" } as const;
           }
+
+          const nextEvent = session.pendingProcessEvents[session.pendingProcessEventIndex];
+          if (!nextEvent) {
+            session.pendingProcessEvents = [];
+            session.pendingProcessEventIndex = 0;
+            session.processEventDrainRunning = false;
+            return { type: "idle" } as const;
+          }
+
+          session.pendingProcessEvents[session.pendingProcessEventIndex] = undefined;
+          session.pendingProcessEventIndex += 1;
+          if (session.pendingProcessEventIndex * 2 >= session.pendingProcessEvents.length) {
+            session.pendingProcessEvents = session.pendingProcessEvents.slice(
+              session.pendingProcessEventIndex,
+            );
+            session.pendingProcessEventIndex = 0;
+          }
+
+          if (nextEvent.type === "output") {
+            const sanitized = sanitizeTerminalHistoryChunk(
+              session.pendingHistoryControlSequence,
+              nextEvent.data,
+            );
+            session.pendingHistoryControlSequence = sanitized.pendingControlSequence;
+            if (sanitized.visibleText.length > 0) {
+              session.history.append(sanitized.visibleText);
+            }
+            const eventStamp = advanceEventSequence(session);
+
+            return {
+              type: "output",
+              threadId: session.threadId,
+              terminalId: session.terminalId,
+              sequence: eventStamp.sequence,
+              history: sanitized.visibleText.length > 0 ? session.history : null,
+              data: nextEvent.data,
+            } as const;
+          }
+
+          const process = session.process;
+          cleanupProcessHandles(session);
+          session.process = null;
+          releasePaste(process);
+          session.pid = null;
+          session.hasRunningSubprocess = false;
+          session.childCommandLabel = null;
+          session.status = "exited";
+          session.pendingHistoryControlSequence = "";
+          session.pendingProcessEvents = [];
+          session.pendingProcessEventIndex = 0;
+          session.processEventDrainRunning = false;
+          session.exitCode = Number.isInteger(nextEvent.event.exitCode)
+            ? nextEvent.event.exitCode
+            : null;
+          session.exitSignal = Number.isInteger(nextEvent.event.signal)
+            ? nextEvent.event.signal
+            : null;
           const eventStamp = advanceEventSequence(session);
 
           return {
-            type: "output",
+            type: "exit",
+            process,
             threadId: session.threadId,
             terminalId: session.terminalId,
             sequence: eventStamp.sequence,
-            history: sanitized.visibleText.length > 0 ? session.history : null,
-            data: nextEvent.data,
+            exitCode: session.exitCode,
+            exitSignal: session.exitSignal,
           } as const;
+        });
+
+        if (action.type === "idle") {
+          return;
         }
 
-        const process = session.process;
-        cleanupProcessHandles(session);
-        session.process = null;
-        releasePaste(process);
-        session.pid = null;
-        session.hasRunningSubprocess = false;
-        session.childCommandLabel = null;
-        session.status = "exited";
-        session.pendingHistoryControlSequence = "";
-        session.pendingProcessEvents = [];
-        session.pendingProcessEventIndex = 0;
-        session.processEventDrainRunning = false;
-        session.exitCode = Number.isInteger(nextEvent.event.exitCode)
-          ? nextEvent.event.exitCode
-          : null;
-        session.exitSignal = Number.isInteger(nextEvent.event.signal)
-          ? nextEvent.event.signal
-          : null;
-        const eventStamp = advanceEventSequence(session);
+        if (action.type === "output") {
+          if (action.history !== null) {
+            yield* queuePersist(action.threadId, action.terminalId, action.history);
+          }
 
-        return {
-          type: "exit",
-          process,
-          threadId: session.threadId,
-          terminalId: session.terminalId,
-          sequence: eventStamp.sequence,
-          exitCode: session.exitCode,
-          exitSignal: session.exitSignal,
-        } as const;
-      });
-
-      if (action.type === "idle") {
-        return;
-      }
-
-      if (action.type === "output") {
-        if (action.history !== null) {
-          yield* queuePersist(action.threadId, action.terminalId, action.history);
+          yield* publishEvent({
+            type: "output",
+            threadId: action.threadId,
+            terminalId: action.terminalId,
+            sequence: action.sequence,
+            data: action.data,
+          });
+          continue;
         }
 
+        yield* clearKillFiber(action.process);
+        yield* unregisterTerminal({
+          threadId: action.threadId,
+          terminalId: action.terminalId,
+        });
         yield* publishEvent({
-          type: "output",
+          type: "exited",
           threadId: action.threadId,
           terminalId: action.terminalId,
           sequence: action.sequence,
-          data: action.data,
+          exitCode: action.exitCode,
+          exitSignal: action.exitSignal,
         });
-        continue;
+        yield* evictInactiveSessionsIfNeeded();
+        return;
       }
-
-      yield* clearKillFiber(action.process);
-      yield* unregisterTerminal({
-        threadId: action.threadId,
-        terminalId: action.terminalId,
-      });
-      yield* publishEvent({
-        type: "exited",
-        threadId: action.threadId,
-        terminalId: action.terminalId,
-        sequence: action.sequence,
-        exitCode: action.exitCode,
-        exitSignal: action.exitSignal,
-      });
-      yield* evictInactiveSessionsIfNeeded();
-      return;
-    }
-  });
+    },
+  );
 
   const stopProcess = Effect.fn("terminal.stopProcess")(function* (session: TerminalSessionState) {
     const process = session.process;

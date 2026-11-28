@@ -348,6 +348,7 @@ const makePairServerConfig = Effect.fn(function* (input: {
     logLevel: input.logLevel,
     traceMinLevel: "Info",
     traceTimingEnabled: false,
+    traceMinSpanDurationMs: 0,
     traceBatchWindowMs: 1_000,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,

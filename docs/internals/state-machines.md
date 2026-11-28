@@ -1680,7 +1680,8 @@ Owner check: `git diff --stat origin/main...origin/fork` shows only `apps/server
   - active -> verified on each request: `verify`, `:752` (signature, expiry claim, row present, not revoked; scopes come from the row).
   - active -> revoked: `revoke`, `:987`; `revokeAllExcept`, `:1008`.
   - active -> expired: by clock; a connected socket is closed by `awaitInvalidation`, `:1042`.
-  - expired / revoked -> pruned (fork): `AuthSessionRepository.pruneExpiredAndRevoked` deletes rows older than 7 days (`AUTH_SESSION_RETENTION`) in 500-row batches during 6-hourly compaction (`DatabaseStorage.ts`) and offline `t3 doctor` compaction (`DatabaseMaintenance.ts`), preserving live connected/renewal-chain session IDs (`SessionStore.liveSessionIds`) and `dev-auth-*` revocation tombstones.
+  - active -> deleted (fork): `delete`, `apps/server/src/auth/SessionStore.ts` (hard-deletes ephemeral CLI sessions on exit while never deleting `dev-auth-*` tombstones).
+  - expired / revoked -> pruned (fork): `AuthSessionRepository.pruneExpiredAndRevoked` deletes rows older than 7 days (`AUTH_SESSION_RETENTION`) and revoked `bot` rows older than 1 hour (`AUTH_REVOKED_BOT_SESSION_RETENTION`) in 500-row batches during 6-hourly compaction (`DatabaseStorage.ts`) and offline `t3 doctor` compaction (`DatabaseMaintenance.ts`), preserving live connected/renewal-chain session IDs (`SessionStore.liveSessionIds`) and `dev-auth-*` revocation tombstones.
   - WebSocket ticket: `issueWebSocketToken`, `:852`; `verifyWebSocketToken`, `:889`.
 - Restart: rows survive. Connected counts and `latestSessionByProofKey` are lost; all sockets are closed by the restart, so the counts stay consistent.
 - Explicit or implicit: implicit; state is derived from row columns and the clock in each method.

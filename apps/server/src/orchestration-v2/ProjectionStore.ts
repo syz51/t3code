@@ -4009,7 +4009,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
       );
     });
 
-    const readCanonicalProjection = Effect.fn("ProjectionStore.readCanonicalProjection")(
+    const readCanonicalProjection = Effect.fn("ProjectionStore.readCanonicalProjection", {
+      attributes: routineSpan,
+    })(
       function* (
         threadId: ThreadId,
         window?: ProjectionWindow,
@@ -7449,7 +7451,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
      * Index columns of the thread's own turn items that `where` selects, in timeline order. The
      * same columns as `readTimelineIndex`, which reads every row and stays as it is.
      */
-    const readTimelineWindow = Effect.fn("ProjectionStore.readTimelineWindow")(function* (
+    const readTimelineWindow = Effect.fn("ProjectionStore.readTimelineWindow", {
+      attributes: routineSpan,
+    })(function* (
       threadId: ThreadId,
       includePersistentOutput: boolean,
       where: Statement.Fragment,
@@ -7628,10 +7632,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
           }),
       );
       /** Counts the visible rows that sort before the given ordinal and item id. */
-      const visibleBefore = Effect.fn("ProjectionStore.countVisibleTimelineRows")(function* (
-        ordinal: number,
-        itemId = "",
-      ) {
+      const visibleBefore = Effect.fn("ProjectionStore.countVisibleTimelineRows", {
+        attributes: routineSpan,
+      })(function* (ordinal: number, itemId = "") {
         const rows = yield* sql<{ count: number }>`
           SELECT COUNT(*) AS count FROM orchestration_v2_projection_turn_items
           WHERE thread_id = ${threadId} AND (ordinal, turn_item_id) < (${ordinal}, ${itemId})`;
@@ -8164,7 +8167,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
      * The rows `getTimelinePage` matches, cut after the first `limit + 1`, with their positions
      * in the full visible index. Reads only the rows from the start position to the page end.
      */
-    const matchLocalTimelineRows = Effect.fn("ProjectionStore.matchLocalTimelineRows")(function* (
+    const matchLocalTimelineRows = Effect.fn("ProjectionStore.matchLocalTimelineRows", {
+      attributes: routineSpan,
+    })(function* (
       local: LocalTimeline,
       options: ProjectionTimelinePageOptions,
       totalItems: number,
@@ -8995,6 +9000,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
 
     const pendingBackgroundDataByThreadId = Effect.fn(
       "ProjectionStore.pendingBackgroundDataByThreadId",
+      { attributes: routineSpan },
     )(function* (input: {
       readonly providerThreadRows: ReadonlyArray<PayloadRow & { readonly thread_id: string }>;
       readonly pendingTurnItemRows: ReadonlyArray<ShellPendingTurnItemRow>;
@@ -9613,7 +9619,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
       };
     });
 
-    const decodeShellSnapshot = Effect.fn("ProjectionStore.decodeShellSnapshot")(function* ({
+    const decodeShellSnapshot = Effect.fn("ProjectionStore.decodeShellSnapshot", {
+      attributes: routineSpan,
+    })(function* ({
       targetThreadIds,
       threadRows,
       runRows,
@@ -9909,9 +9917,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, ProjectionStoreService
       }));
     }, Effect.mapError(shellSnapshotReadError));
 
-    const listActiveThreads = Effect.fn("ProjectionStore.listActiveThreads")(function* (
-      projectId?: ProjectId,
-    ) {
+    const listActiveThreads = Effect.fn("ProjectionStore.listActiveThreads", {
+      attributes: routineSpan,
+    })(function* (projectId?: ProjectId) {
       const rows = yield* sql<{
         readonly thread_id: string;
         readonly project_id: string;

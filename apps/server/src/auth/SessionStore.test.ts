@@ -710,4 +710,30 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("SessionStore.lay
       expect(yield* sessions.liveSessionIds).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
   );
+
+  it.effect("hard-deletes ephemeral sessions and invalidates their tokens", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const issued = yield* sessions.issue({
+        subject: "mcp-client",
+        method: "bearer-access-token",
+        client: { label: "t3 thread cli", deviceType: "bot" },
+      });
+
+      yield* sessions.markConnected(issued.sessionId);
+      expect(yield* sessions.liveSessionIds).toEqual([issued.sessionId]);
+      expect(yield* sessions.delete(issued.sessionId)).toBe(true);
+      expect(yield* sessions.delete(issued.sessionId)).toBe(false);
+      expect(yield* sessions.liveSessionIds).toEqual([]);
+
+      const verification = yield* sessions.verify(issued.token).pipe(Effect.flip);
+      expect(verification._tag).toBe("UnknownSessionTokenError");
+
+      const remaining = yield* sql<{ readonly session_id: string }>`
+        SELECT session_id FROM auth_sessions WHERE session_id = ${issued.sessionId}
+      `;
+      expect(remaining).toEqual([]);
+    }).pipe(Effect.provide(Layer.mergeAll(layerSessionStore(), SqlitePersistence.layerMemory))),
+  );
 });

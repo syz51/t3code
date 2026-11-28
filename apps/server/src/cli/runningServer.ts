@@ -40,7 +40,7 @@ export class RunningServerNoReplyError extends Schema.TaggedError<RunningServerN
 
 export type ServerClient = HttpApiClient.ForApi<typeof EnvironmentHttpApi>;
 
-// The scope revokes the session; the TTL bounds it if that never runs.
+// The scope deletes the session; the TTL bounds it if that never runs.
 const SESSION_TTL = Duration.minutes(2);
 const REQUEST_TIMEOUT = Duration.seconds(30);
 
@@ -52,7 +52,7 @@ export const serverClient = Effect.fn("RunningServer.serverClient")(function* (
   const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
   const session = yield* Effect.acquireRelease(
     environmentAuth.issueSession({ scopes, subject: "cli", label: "t3 cli", ttl: SESSION_TTL }),
-    ({ sessionId }) => environmentAuth.revokeSession(sessionId).pipe(Effect.ignore({ log: true })),
+    ({ sessionId }) => environmentAuth.deleteSession(sessionId).pipe(Effect.ignore({ log: true })),
   );
   return yield* HttpApiClient.make(EnvironmentHttpApi, {
     baseUrl: origin,

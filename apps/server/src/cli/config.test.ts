@@ -93,6 +93,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
   const defaultObservabilityConfig = {
     traceMinLevel: "Info",
     traceTimingEnabled: true,
+    traceMinSpanDurationMs: 10,
     traceBatchWindowMs: 1_000,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,
@@ -1134,5 +1135,29 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         privateNetworkOnly: undefined,
       });
     }),
+  );
+
+  it.effect(
+    "resolves T3CODE_TRACE_MIN_SPAN_DURATION_MS with a 10ms default and non-negative clamp",
+    () =>
+      Effect.gen(function* () {
+        const { join } = yield* Path.Path;
+        const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-trace-threshold");
+        const resolveThreshold = (env: Record<string, string>) =>
+          resolveServerConfig(minimalWebFlags(baseDir), Option.none()).pipe(
+            Effect.map((config) => config.traceMinSpanDurationMs),
+            Effect.provide(
+              Layer.mergeAll(
+                ConfigProvider.layer(ConfigProvider.fromEnv({ env })),
+                NetService.layer,
+              ),
+            ),
+          );
+
+        expect(yield* resolveThreshold({})).toBe(10);
+        expect(yield* resolveThreshold({ T3CODE_TRACE_MIN_SPAN_DURATION_MS: "0" })).toBe(0);
+        expect(yield* resolveThreshold({ T3CODE_TRACE_MIN_SPAN_DURATION_MS: "25" })).toBe(25);
+        expect(yield* resolveThreshold({ T3CODE_TRACE_MIN_SPAN_DURATION_MS: "-5" })).toBe(0);
+      }),
   );
 });

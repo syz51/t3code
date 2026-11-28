@@ -612,6 +612,9 @@ export class EnvironmentAuth extends Context.Service<
     readonly revokeSession: (
       sessionId: AuthSessionId,
     ) => Effect.Effect<boolean, ServerAuthInternalError>;
+    readonly deleteSession: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<boolean, ServerAuthInternalError>;
     readonly listClientSessions: (
       currentSessionId: AuthSessionId,
     ) => Effect.Effect<ReadonlyArray<AuthClientSession>, ServerAuthInternalError>;
@@ -1421,6 +1424,12 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentAuth.revokeSession"),
     );
 
+  const deleteSession: EnvironmentAuth["Service"]["deleteSession"] = (sessionId) =>
+    sessions.delete(sessionId).pipe(
+      Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+      Effect.withSpan("EnvironmentAuth.deleteSession"),
+    );
+
   const revokeOtherSessionsExcept = (sessionId: AuthSessionId) =>
     sessions.revokeAllExcept(sessionId).pipe(
       Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
@@ -1787,6 +1796,7 @@ export const make = Effect.gen(function* () {
     issueSession,
     listSessions,
     revokeSession,
+    deleteSession,
     listClientSessions,
     revokeClient,
     revokeClientSession,

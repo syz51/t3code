@@ -67,15 +67,21 @@ export const layer = Layer.unwrap(
                 resource,
               }).pipe(Effect.provide(OtlpExportFailures.layer("traces")));
 
+        const sampleFastLocalSpans =
+          config.traceTimingEnabled &&
+          LogLevel.isGreaterThanOrEqualTo(config.traceMinLevel, "Info");
+        const localMinSpanDurationMs = sampleFastLocalSpans
+          ? Math.max(0, config.traceMinSpanDurationMs)
+          : 0;
+
         const tracer = yield* makeLocalFileTracer({
           filePath: config.serverTracePath,
           maxBytes: config.traceMaxBytes,
           maxFiles: config.traceMaxFiles,
           batchWindowMs: config.traceBatchWindowMs,
           sink,
-          sampleRoutineSpans:
-            config.traceTimingEnabled &&
-            LogLevel.isGreaterThanOrEqualTo(config.traceMinLevel, "Info"),
+          sampleRoutineSpans: localMinSpanDurationMs > 0,
+          minSpanDurationMs: localMinSpanDurationMs,
           ...(delegate ? { delegate } : {}),
         });
 
@@ -92,7 +98,7 @@ export const layer = Layer.unwrap(
         return Layer.mergeAll(
           Layer.succeed(Tracer.Tracer, stallTraceCapture.tracer),
           Layer.succeed(StallTraceCapture.StallTraceCapture, stallTraceCapture.service),
-          BrowserTraceCollector.layer(sink),
+          BrowserTraceCollector.layer(sink, { minSpanDurationMs: localMinSpanDurationMs }),
         );
       }),
     ).pipe(Layer.provide(OtlpExporter.layerFlusher), Layer.provideMerge(layerSerialization));

@@ -1,6 +1,7 @@
 import * as NetService from "@t3tools/shared/Net";
 import { isWildcardHost, normalizeHostname } from "@t3tools/shared/hostClassification";
 import {
+  DEFAULT_TRACE_MIN_SPAN_DURATION_MS,
   OtlpHeadersFromString,
   OtlpProtocol,
   type SignalExport,
@@ -107,6 +108,10 @@ const EnvServerConfig = Config.all({
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
+  traceMinSpanDurationMs: Config.Int("T3CODE_TRACE_MIN_SPAN_DURATION_MS").pipe(
+    Config.withDefault(DEFAULT_TRACE_MIN_SPAN_DURATION_MS),
+    Config.map((value) => Math.max(0, value)),
+  ),
   traceFile: traceFileConfig,
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: traceMaxFilesConfig,
@@ -510,6 +515,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logLevel,
     traceMinLevel: env.traceMinLevel,
     traceTimingEnabled: env.traceTimingEnabled,
+    traceMinSpanDurationMs: env.traceMinSpanDurationMs,
     traceBatchWindowMs: env.traceBatchWindowMs,
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,

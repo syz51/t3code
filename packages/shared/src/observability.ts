@@ -183,6 +183,7 @@ export interface TraceSink {
 
 export interface LocalFileTracerOptions extends TraceSinkOptions {
   readonly sampleRoutineSpans?: boolean;
+  readonly minSpanDurationMs?: number;
   readonly delegate?: Tracer.Tracer;
   readonly sink?: TraceSink;
 }
@@ -599,7 +600,30 @@ export const withoutRoutineSpans = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     return rest;
   });
 
+export const DEFAULT_TRACE_MIN_SPAN_DURATION_MS = 10;
 const SLOW_ROUTINE_SPAN_NANOS = 10_000_000n;
+
+export function shouldRecordLocalTraceRecord(
+  record: TraceRecord,
+  minSpanDurationMs: number,
+): boolean {
+  if (!Number.isFinite(minSpanDurationMs) || minSpanDurationMs <= 0) {
+    return true;
+  }
+  if (record.events.length > 0 || record.durationMs >= minSpanDurationMs) {
+    return true;
+  }
+  if (record.type === "effect-span") {
+    if (record.exit._tag !== "Success") return true;
+  } else {
+    const isFailure = record.status?.code === "2";
+    const isInterrupted =
+      record.attributes["effect.fiber.interrupted"] === true ||
+      (record.status?.code === "1" && record.status?.message === "Interrupted");
+    if (isFailure || isInterrupted) return true;
+  }
+  return record.spanId.endsWith("00");
+}
 
 class LocalFileSpan implements Tracer.Span {
   readonly _tag = "Span";
@@ -617,6 +641,7 @@ class LocalFileSpan implements Tracer.Span {
   events: Array<[name: string, startTime: bigint, attributes: Record<string, unknown>]>;
   private readonly delegate: Tracer.Span;
   private readonly sampleRoutineSpans: boolean;
+  private readonly minSpanDurationNanos: bigint | undefined;
   private readonly push: (record: EffectTraceRecord) => void;
 
   constructor(
@@ -624,9 +649,16 @@ class LocalFileSpan implements Tracer.Span {
     delegate: Tracer.Span,
     push: (record: EffectTraceRecord) => void,
     sampleRoutineSpans: boolean,
+    minSpanDurationMs: number | undefined,
   ) {
     this.delegate = delegate;
     this.sampleRoutineSpans = sampleRoutineSpans;
+    this.minSpanDurationNanos =
+      minSpanDurationMs !== undefined && Number.isFinite(minSpanDurationMs)
+        ? minSpanDurationMs > 0
+          ? BigInt(Math.round(minSpanDurationMs * 1_000_000))
+          : 0n
+        : undefined;
     this.push = push;
     this.name = delegate.name;
     this.spanId = delegate.spanId;
@@ -655,20 +687,25 @@ class LocalFileSpan implements Tracer.Span {
     };
     this.delegate.end(endTime, redactExitCredentials(traceExit));
 
-    if (this.sampled && !(this.sampleRoutineSpans && this.isDroppableRoutine(endTime, traceExit))) {
+    if (this.sampled && !this.isDroppable(endTime, traceExit)) {
       this.push(spanToTraceRecord(this));
     }
   }
 
   // Keyed per span: background fibers share the boot trace, and recurring ticks reuse one parent span.
-  private isDroppableRoutine(endTime: bigint, exit: Exit.Exit<unknown, unknown>): boolean {
+  private isDroppable(endTime: bigint, exit: Exit.Exit<unknown, unknown>): boolean {
+    if (!ExitRuntime.isSuccess(exit) || this.events.length > 0 || this.spanId.endsWith("00")) {
+      return false;
+    }
+    const durationNanos = endTime - this.status.startTime;
+    if (this.minSpanDurationNanos !== undefined) {
+      return durationNanos < this.minSpanDurationNanos;
+    }
     return (
+      this.sampleRoutineSpans &&
       (this.attributes.get("db.system.name") === "sqlite" ||
         this.attributes.get(ROUTINE_ATTRIBUTE) === true) &&
-      ExitRuntime.isSuccess(exit) &&
-      this.events.length === 0 &&
-      endTime - this.status.startTime < SLOW_ROUTINE_SPAN_NANOS &&
-      !this.spanId.endsWith("00")
+      durationNanos < SLOW_ROUTINE_SPAN_NANOS
     );
   }
 
@@ -723,6 +760,7 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
         delegate.span(spanOptions),
         sink.push,
         options.sampleRoutineSpans === true,
+        options.minSpanDurationMs,
       );
     },
     ...(delegate.context ? { context: delegate.context } : {}),

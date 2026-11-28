@@ -217,6 +217,15 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         const activeSessionExpiresAt = DateTime.formatIso(
           DateTime.addDuration(now, Duration.days(30)),
         );
+        const recentRevokedAt = DateTime.formatIso(
+          DateTime.subtractDuration(now, Duration.days(1)),
+        );
+        const staleBotRevokedAt = DateTime.formatIso(
+          DateTime.subtractDuration(
+            now,
+            Duration.sum(AuthSessions.AUTH_REVOKED_BOT_SESSION_RETENTION, Duration.minutes(5)),
+          ),
+        );
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           yield* sql`PRAGMA auto_vacuum = NONE`;
@@ -231,6 +240,8 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
               session_id, subject, scopes, method, client_device_type, issued_at, expires_at, revoked_at
             ) VALUES
               ('session-active', 'browser', '["access:read"]', 'browser-session-cookie', 'desktop', ${staleSessionAt}, ${activeSessionExpiresAt}, NULL),
+              ('session-recent-revoked', 'browser', '["access:read"]', 'browser-session-cookie', 'desktop', ${staleSessionAt}, ${activeSessionExpiresAt}, ${recentRevokedAt}),
+              ('session-revoked-bot', 'mcp-client', '["access:read"]', 'bearer-access-token', 'bot', ${recentRevokedAt}, ${activeSessionExpiresAt}, ${staleBotRevokedAt}),
               ('session-old-revoked', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${staleSessionAt}, ${activeSessionExpiresAt}, ${staleSessionAt}),
               ('session-old-expired', 'mcp-client', '["access:read"]', 'bearer-access-token', 'desktop', ${staleSessionAt}, ${staleSessionAt}, NULL)
           `;
@@ -295,7 +306,7 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
           assert.deepEqual(
             yield* sql`SELECT session_id AS "sessionId" FROM auth_sessions ORDER BY session_id`,
-            [{ sessionId: "session-active" }],
+            [{ sessionId: "session-active" }, { sessionId: "session-recent-revoked" }],
           );
           assert.deepEqual(
             yield* sql`

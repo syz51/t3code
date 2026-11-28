@@ -80,6 +80,7 @@ it.effect.each([
         logLevel: "Error",
         traceMinLevel: "Info",
         traceTimingEnabled: false,
+        traceMinSpanDurationMs: 10,
         traceBatchWindowMs: 200,
         traceMaxBytes: 1024,
         traceMaxFiles: 1,

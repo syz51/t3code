@@ -42,6 +42,7 @@ vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
           ),
         ),
       revokeSession: () => Effect.succeed(true),
+      deleteSession: () => Effect.succeed(true),
     }),
   };
 });

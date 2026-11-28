@@ -250,7 +250,7 @@ export type ThreadTools = ReturnType<typeof makeThreadTools>;
 
 /**
  * Signs in as a short-lived MCP client of the running server, the same way an
- * outside agent does, and revokes that session when the command ends.
+ * outside agent does, and deletes that ephemeral session when the command ends.
  */
 export const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function* <A, E, R>(
   flags: {
@@ -280,7 +280,7 @@ export const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function*
         client: { deviceType: "bot" },
       }),
       (session) =>
-        environmentAuth.revokeSession(session.sessionId).pipe(Effect.ignore({ log: true })),
+        environmentAuth.deleteSession(session.sessionId).pipe(Effect.ignore({ log: true })),
     );
     const session = yield* mcpToolSession({
       endpoint: new URL("/mcp", origin).href,

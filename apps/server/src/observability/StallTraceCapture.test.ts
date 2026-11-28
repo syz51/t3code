@@ -51,6 +51,7 @@ describe("StallTraceCapture", () => {
         maxBytes: 1024 * 1024,
         maxFiles: 2,
         batchWindowMs: 60_000,
+        minSpanDurationMs: 10,
         sink,
       });
       const capture = yield* StallTraceCapture.make({

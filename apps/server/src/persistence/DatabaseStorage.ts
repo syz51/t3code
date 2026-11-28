@@ -167,14 +167,17 @@ const make = Effect.gen(function* () {
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
     const result = yield* maintenance.pruneEventStore(betweenPages);
-    const authSessionCutoff = DateTime.subtractDuration(
-      yield* DateTime.now,
-      AuthSessions.AUTH_SESSION_RETENTION,
+    const now = yield* DateTime.now;
+    const authSessionCutoff = DateTime.subtractDuration(now, AuthSessions.AUTH_SESSION_RETENTION);
+    const revokedBotCutoff = DateTime.subtractDuration(
+      now,
+      AuthSessions.AUTH_REVOKED_BOT_SESSION_RETENTION,
     );
     const excludeSessionIds = yield* liveAuthSessionIds;
     const authSessionResult = yield* authSessions
       .pruneExpiredAndRevoked({
         before: authSessionCutoff,
+        revokedBotBefore: revokedBotCutoff,
         excludeSessionIds,
         betweenPages,
       })

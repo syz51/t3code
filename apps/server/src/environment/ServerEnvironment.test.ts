@@ -47,6 +47,7 @@ const makeServerConfig = Effect.fn(function* (baseDir: string) {
     logLevel: "Error",
     traceMinLevel: "Info",
     traceTimingEnabled: true,
+    traceMinSpanDurationMs: 10,
     traceBatchWindowMs: 200,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,

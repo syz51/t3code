@@ -39,6 +39,9 @@ import {
   waitForRun,
 } from "./thread.ts";
 
+const deletedSessionIds: Array<string> = [];
+const revokedSessionIds: Array<string> = [];
+
 vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../auth/EnvironmentAuth.ts")>();
   return {
@@ -50,7 +53,16 @@ vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
           token: "synthetic-token",
           expiresAt,
         })),
-      revokeSession: () => Effect.succeed(true),
+      revokeSession: (sessionId) =>
+        Effect.sync(() => {
+          revokedSessionIds.push(sessionId);
+          return true;
+        }),
+      deleteSession: (sessionId) =>
+        Effect.sync(() => {
+          deletedSessionIds.push(sessionId);
+          return true;
+        }),
     }),
   };
 });
@@ -127,6 +139,8 @@ it.effect("list includes delegated threads across pages and still leaves out sub
         },
       }),
     );
+    deletedSessionIds.length = 0;
+    revokedSessionIds.length = 0;
     yield* Command.runWith(threadCommand, { version: "0.0.0" })([
       "list",
       "--project",
@@ -135,6 +149,8 @@ it.effect("list includes delegated threads across pages and still leaves out sub
       "--base-dir",
       baseDir,
     ]);
+    assert.deepStrictEqual(deletedSessionIds, ["test-session"]);
+    assert.deepStrictEqual(revokedSessionIds, []);
     const listed = JSON.parse(String((yield* TestConsole.logLines).at(-1))) as Array<{
       threadId: string;
     }>;

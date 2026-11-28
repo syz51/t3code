@@ -13,6 +13,7 @@ import { sweepStalePendingAttachments } from "./attachmentStore.ts";
 import { markNoCopyOnWrite } from "./noCopyOnWrite.ts";
 import {
   DEFAULT_SIGNAL_EXPORT,
+  DEFAULT_TRACE_MIN_SPAN_DURATION_MS,
   nodeProcessRuntimeAttributes,
   processServiceInstanceId,
   type SignalExport,
@@ -69,6 +70,7 @@ export class ServerConfig extends Context.Service<
     readonly logLevel: LogLevel.LogLevel;
     readonly traceMinLevel: LogLevel.LogLevel;
     readonly traceTimingEnabled: boolean;
+    readonly traceMinSpanDurationMs: number;
     readonly traceBatchWindowMs: number;
     readonly traceMaxBytes: number;
     readonly traceMaxFiles: number;
@@ -242,6 +244,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     logLevel: "Error",
     traceMinLevel: "Info",
     traceTimingEnabled: true,
+    traceMinSpanDurationMs: DEFAULT_TRACE_MIN_SPAN_DURATION_MS,
     traceBatchWindowMs: 200,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,
