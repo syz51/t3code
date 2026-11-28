@@ -1,6 +1,7 @@
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -17,6 +18,7 @@ import { isSqlError } from "effect/sql/SqlError";
 
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import { rebuildMessageSearch } from "../orchestration-v2/messageSearchIndex.ts";
+import * as AuthSessions from "./AuthSessions.ts";
 
 export class DatabaseMissingError extends Schema.TaggedError<DatabaseMissingError>()(
   "DatabaseMissingError",
@@ -244,8 +246,15 @@ const make = Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* lockExclusively(databasePath);
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const authSessions = yield* AuthSessions.AuthSessionRepository;
         yield* onStep("prune-events");
         const summary = yield* maintenance.pruneEventStore();
+        yield* authSessions.pruneExpiredAndRevoked({
+          before: DateTime.subtractDuration(
+            yield* DateTime.now,
+            AuthSessions.AUTH_SESSION_RETENTION,
+          ),
+        });
         yield* onStep("vacuum");
         // VACUUM is required to enable incremental auto_vacuum on existing databases.
         yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
@@ -257,7 +266,7 @@ const make = Effect.gen(function* () {
         return summary;
       }).pipe(
         Effect.provide(
-          ProjectionMaintenance.layer.pipe(
+          Layer.merge(ProjectionMaintenance.layer, AuthSessions.layer).pipe(
             Layer.provideMerge(NodeSqliteClient.layer({ filename: databasePath })),
           ),
         ),

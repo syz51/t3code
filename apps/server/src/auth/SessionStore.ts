@@ -486,6 +486,8 @@ export class SessionStore extends Context.Service<
     ) => Effect.Effect<number, SessionCredentialInternalError>;
     readonly markConnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
     readonly markDisconnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
+    /** Session ids currently referenced by connected sockets or active DPoP renewal chains. */
+    readonly liveSessionIds: Effect.Effect<ReadonlyArray<AuthSessionId>, never>;
   }
 >()("t3/auth/SessionStore") {}
 
@@ -566,6 +568,7 @@ const make = Effect.gen(function* () {
     yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32),
   );
   const connectedSessionsRef = yield* Ref.make(new Map<AuthSessionId, number>());
+  const invalidationChainSessionsRef = yield* Ref.make(new Map<AuthSessionId, number>());
   const changesPubSub = yield* PubSub.unbounded<SessionCredentialChange>();
   // Newest session per DPoP key. A live socket moves to it at expiry, so a
   // client that renews its short-lived token keeps its socket.
@@ -1288,52 +1291,86 @@ const make = Effect.gen(function* () {
         // Revoking any session the socket has used closes it. Events only wake this loop
         // and the rows decide: revocations are written before they are published, and
         // clientRemoved also reports an expired session losing its last socket.
-        const chain = [sessionId];
+        const chain: Array<AuthSessionId> = [];
+        const trackChainSession = (id: AuthSessionId) =>
+          Effect.uninterruptible(
+            Ref.update(invalidationChainSessionsRef, (current) => {
+              const next = new Map(current);
+              next.set(id, (next.get(id) ?? 0) + 1);
+              return next;
+            }).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  chain.push(id);
+                }),
+              ),
+            ),
+          );
+        const releaseChainSessions = Ref.update(invalidationChainSessionsRef, (current) => {
+          if (chain.length === 0) return current;
+          const next = new Map(current);
+          for (const id of chain) {
+            const remaining = (next.get(id) ?? 0) - 1;
+            if (remaining > 0) next.set(id, remaining);
+            else next.delete(id);
+          }
+          return next;
+        });
         const nextRemoval = Effect.gen(function* () {
           while (true) {
             const change = yield* PubSub.take(subscription);
             if (change.type === "clientRemoved" && chain.includes(change.sessionId)) return;
           }
         });
-        let current = original.value;
-        while (true) {
-          const rows = yield* Effect.forEach(chain, readRow);
-          if (rows.some((row) => Option.isNone(row) || row.value.revokedAt !== null)) return;
-          // Renewal moves a session's expiry in place, so the snapshot can be stale.
-          const currentRow = rows.at(-1);
-          if (currentRow !== undefined && Option.isSome(currentRow)) current = currentRow.value;
-          const now = yield* DateTime.now;
-          const remaining = current.expiresAt.epochMilliseconds - now.epochMilliseconds;
-          if (remaining > 0) {
-            yield* Effect.raceFirst(nextRemoval, Effect.sleep(Duration.millis(remaining)));
-            continue;
+        yield* Effect.gen(function* () {
+          yield* trackChainSession(sessionId);
+          let current = original.value;
+          while (true) {
+            const rows = yield* Effect.forEach(chain, readRow);
+            if (rows.some((row) => Option.isNone(row) || row.value.revokedAt !== null)) return;
+            // Renewal moves a session's expiry in place, so the snapshot can be stale.
+            const currentRow = rows.at(-1);
+            if (currentRow !== undefined && Option.isSome(currentRow)) current = currentRow.value;
+            const now = yield* DateTime.now;
+            const remaining = current.expiresAt.epochMilliseconds - now.epochMilliseconds;
+            if (remaining > 0) {
+              yield* Effect.raceFirst(nextRemoval, Effect.sleep(Duration.millis(remaining)));
+              continue;
+            }
+            // A renewal can land between the read above and the clock sample.
+            const latest = yield* readRow(current.sessionId);
+            if (
+              Option.isSome(latest) &&
+              latest.value.expiresAt.epochMilliseconds > current.expiresAt.epochMilliseconds
+            ) {
+              current = latest.value;
+              continue;
+            }
+            const successorId =
+              renewalKey === undefined ? undefined : latestSessionByProofKey.get(renewalKey);
+            if (successorId === undefined || successorId === current.sessionId) return;
+            const successor = yield* readRow(successorId);
+            // The socket keeps its original scopes, so the renewal must still grant all of them.
+            if (
+              Option.isNone(successor) ||
+              successor.value.subject !== original.value.subject ||
+              !original.value.scopes.every((scope) => successor.value.scopes.includes(scope))
+            ) {
+              return;
+            }
+            yield* trackChainSession(successorId);
+            current = successor.value;
           }
-          // A renewal can land between the read above and the clock sample.
-          const latest = yield* readRow(current.sessionId);
-          if (
-            Option.isSome(latest) &&
-            latest.value.expiresAt.epochMilliseconds > current.expiresAt.epochMilliseconds
-          ) {
-            current = latest.value;
-            continue;
-          }
-          const successorId =
-            renewalKey === undefined ? undefined : latestSessionByProofKey.get(renewalKey);
-          if (successorId === undefined || successorId === current.sessionId) return;
-          const successor = yield* readRow(successorId);
-          // The socket keeps its original scopes, so the renewal must still grant all of them.
-          if (
-            Option.isNone(successor) ||
-            successor.value.subject !== original.value.subject ||
-            !original.value.scopes.every((scope) => successor.value.scopes.includes(scope))
-          ) {
-            return;
-          }
-          chain.push(successorId);
-          current = successor.value;
-        }
+        }).pipe(Effect.ensuring(releaseChainSessions));
       }),
     );
+  });
+
+  const liveSessionIds: SessionStore["Service"]["liveSessionIds"] = Effect.gen(function* () {
+    const connected = yield* Ref.get(connectedSessionsRef);
+    const chained = yield* Ref.get(invalidationChainSessionsRef);
+    if (connected.size === 0 && chained.size === 0) return [];
+    return Array.from(new Set([...connected.keys(), ...chained.keys()]));
   });
 
   return SessionStore.of({
@@ -1356,6 +1393,7 @@ const make = Effect.gen(function* () {
     revokeByProofKey,
     markConnected,
     markDisconnected,
+    liveSessionIds,
   });
 });
 

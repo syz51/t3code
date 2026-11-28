@@ -680,4 +680,34 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("SessionStore.lay
       }
     }).pipe(Effect.provide(layerSessionStore())),
   );
+
+  it.effect("tracks connected sessions and DPoP renewal chains in liveSessionIds", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const client = yield* sessions.issue(relaySessionInput);
+      const invalidated = yield* Deferred.make<void>();
+
+      yield* sessions.markConnected(client.sessionId);
+      const watcher = yield* sessions
+        .awaitInvalidation(client.sessionId, relaySessionInput.proofKeyThumbprint)
+        .pipe(
+          Effect.andThen(Deferred.succeed(invalidated, undefined)),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+      expect(yield* sessions.liveSessionIds).toEqual([client.sessionId]);
+
+      yield* TestClock.adjust(Duration.minutes(59));
+      const renewal = yield* sessions.issue(relaySessionInput);
+      // Advance past original expiry so awaitInvalidation chains onto the renewal session.
+      yield* TestClock.adjust(Duration.minutes(2));
+      expect(yield* Deferred.isDone(invalidated)).toBe(false);
+      expect((yield* sessions.liveSessionIds).toSorted()).toEqual(
+        [client.sessionId, renewal.sessionId].toSorted(),
+      );
+
+      yield* sessions.markDisconnected(client.sessionId);
+      yield* Fiber.interrupt(watcher);
+      expect(yield* sessions.liveSessionIds).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
+  );
 });

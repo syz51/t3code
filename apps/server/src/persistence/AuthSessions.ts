@@ -1,10 +1,13 @@
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as SqlError from "effect/sql/SqlError";
 import * as SqlSchema from "effect/sql/SqlSchema";
 
 import {
@@ -14,6 +17,7 @@ import {
   ServerAuthSessionMethod,
 } from "@t3tools/contracts";
 
+import { REUSABLE_DEV_SESSION_PREFIX } from "../auth/ReusableDevAuth.ts";
 import {
   type AuthSessionRepositoryError,
   PersistenceDecodeError,
@@ -108,6 +112,10 @@ export const SetAuthSessionLastConnectedAtInput = Schema.Struct({
 });
 export type SetAuthSessionLastConnectedAtInput = typeof SetAuthSessionLastConnectedAtInput.Type;
 
+// Bounds auth_sessions growth while keeping recent revoked/expired rows for diagnostics and errors.
+export const AUTH_SESSION_RETENTION = Duration.days(7);
+const PRUNE_BATCH_SIZE = 500;
+
 export class AuthSessionRepository extends Context.Service<
   AuthSessionRepository,
   {
@@ -145,6 +153,19 @@ export class AuthSessionRepository extends Context.Service<
     readonly revokeByProofKey: (
       input: RevokeAuthSessionsByProofKeyInput,
     ) => Effect.Effect<ReadonlyArray<AuthSessionId>, AuthSessionRepositoryError>;
+    readonly pruneExpiredAndRevoked: (input: {
+      readonly before: DateTime.Utc;
+      readonly excludeSessionIds?: ReadonlyArray<AuthSessionId>;
+      readonly batchSize?: number;
+      readonly betweenPages?: Effect.Effect<void>;
+    }) => Effect.Effect<
+      {
+        readonly deletedRevokedCount: number;
+        readonly deletedExpiredCount: number;
+        readonly totalDeletedCount: number;
+      },
+      AuthSessionRepositoryError
+    >;
   }
 >()("t3/persistence/AuthSessions/AuthSessionRepository") {}
 
@@ -586,6 +607,91 @@ export const make = Effect.gen(function* () {
       Effect.map((rows) => rows.map((row) => row.sessionId)),
     );
 
+  // Per-batch drain helper covered by the outer pruneExpiredAndRevoked span.
+  const drainDeleteBatches = Effect.fnUntraced(function* (
+    deleteBatch: Effect.Effect<ReadonlyArray<{ readonly pruned: number }>, SqlError.SqlError>,
+    batchSize: number,
+    betweenPages: Effect.Effect<void>,
+  ) {
+    let deleted = 0;
+    for (;;) {
+      const rows = yield* deleteBatch;
+      deleted += rows.length;
+      if (rows.length < batchSize) return deleted;
+      yield* Effect.yieldNow;
+      yield* betweenPages;
+    }
+  });
+
+  const pruneExpiredAndRevoked: AuthSessionRepository["Service"]["pruneExpiredAndRevoked"] =
+    Effect.fn("AuthSessionRepository.pruneExpiredAndRevoked")(
+      function* (input) {
+        const cutoffIso = DateTime.formatIso(input.before);
+        const batchSize =
+          input.batchSize !== undefined && Number.isFinite(input.batchSize)
+            ? Math.max(1, Math.floor(input.batchSize))
+            : PRUNE_BATCH_SIZE;
+        const betweenPages = input.betweenPages ?? Effect.void;
+        // Keep revoked reusable-dev-token tombstones so startup createIfAbsent never re-enables them.
+        const devSessionPattern = `${REUSABLE_DEV_SESSION_PREFIX}*`;
+        const excludeFilter =
+          input.excludeSessionIds !== undefined && input.excludeSessionIds.length > 0
+            ? sql`AND session_id NOT IN ${sql.in(input.excludeSessionIds)}`
+            : sql``;
+
+        // Both predicates are indexed by idx_auth_sessions_active(revoked_at, expires_at, issued_at).
+        const deletedRevokedCount = yield* drainDeleteBatches(
+          sql<{ readonly pruned: number }>`
+            DELETE FROM auth_sessions
+            WHERE rowid IN (
+              SELECT rowid FROM auth_sessions
+              WHERE revoked_at IS NOT NULL
+                AND revoked_at < ${cutoffIso}
+                AND session_id NOT GLOB ${devSessionPattern}
+                ${excludeFilter}
+              LIMIT ${batchSize}
+            )
+            RETURNING 1 AS pruned
+          `,
+          batchSize,
+          betweenPages,
+        );
+        if (deletedRevokedCount > 0) {
+          yield* Effect.yieldNow;
+          yield* betweenPages;
+        }
+        const deletedExpiredCount = yield* drainDeleteBatches(
+          sql<{ readonly pruned: number }>`
+            DELETE FROM auth_sessions
+            WHERE rowid IN (
+              SELECT rowid FROM auth_sessions
+              WHERE revoked_at IS NULL
+                AND expires_at < ${cutoffIso}
+                AND session_id NOT GLOB ${devSessionPattern}
+                ${excludeFilter}
+              LIMIT ${batchSize}
+            )
+            RETURNING 1 AS pruned
+          `,
+          batchSize,
+          betweenPages,
+        );
+
+        return {
+          deletedRevokedCount,
+          deletedExpiredCount,
+          totalDeletedCount: deletedRevokedCount + deletedExpiredCount,
+        };
+      },
+      Effect.mapError(
+        (cause) =>
+          new PersistenceSqlError({
+            operation: "AuthSessionRepository.pruneExpiredAndRevoked:query",
+            cause,
+          }),
+      ),
+    );
+
   return {
     create,
     createReplacingActive,
@@ -598,6 +704,7 @@ export const make = Effect.gen(function* () {
     setLastConnectedAt,
     getProofKeyThumbprint,
     revokeByProofKey,
+    pruneExpiredAndRevoked,
   } satisfies AuthSessionRepository["Service"];
 });
 
