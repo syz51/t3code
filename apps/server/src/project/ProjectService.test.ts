@@ -1177,6 +1177,86 @@ it.effect("keeps a folder added while a scan of the project folder waited to com
   }).pipe(Effect.provide(layerProjectServiceDependencies)),
 );
 
+it.effect(
+  "skips ProjectService.syncFolders fork and span while throttled, then syncs when due",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "project-folder-sync-throttle-" }),
+      );
+      let syncSpans = 0;
+      let rootScans = 0;
+      const syncEnded = yield* Queue.unbounded<void>();
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          if (options.name === "ProjectService.syncFolders") {
+            syncSpans += 1;
+            const end = span.end.bind(span);
+            span.end = (...args) => {
+              end(...args);
+              Queue.offerUnsafe(syncEnded, undefined);
+            };
+          }
+          return span;
+        },
+      });
+      const countingFileSystem = FileSystem.FileSystem.of({
+        ...fileSystem,
+        readDirectory: (target, options) => {
+          if (target === root) {
+            rootScans += 1;
+          }
+          return fileSystem.readDirectory(target, options);
+        },
+      });
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-06-20T10:00:00.000Z"));
+        const service = yield* ProjectService.make.pipe(
+          Effect.provideService(FileSystem.FileSystem, countingFileSystem),
+        );
+        const projectId = ProjectId.make("project:folder-sync-throttle");
+        yield* service.create({
+          commandId: CommandId.make("command:folder-sync-throttle:create"),
+          projectId,
+          title: "Folder sync throttle",
+          workspaceRoot: root,
+        });
+        yield* Queue.take(syncEnded);
+        assert.equal(syncSpans, 1);
+        const scansAfterInitialSync = rootScans;
+
+        yield* service.getById(projectId);
+        yield* service.getByWorkspaceRoot(root);
+        yield* service.snapshot;
+        yield* TestClock.adjust("29 seconds");
+        yield* Effect.all([service.getById(projectId), service.getById(projectId)], {
+          concurrency: "unbounded",
+        });
+        yield* Effect.yieldNow;
+        assert.equal(syncSpans, 1);
+        assert.equal(rootScans, scansAfterInitialSync);
+
+        yield* fileSystem.makeDirectory(`${root}/web/.git`, { recursive: true });
+        yield* TestClock.adjust("1 second");
+        yield* Effect.all([service.getById(projectId), service.getById(projectId)], {
+          concurrency: "unbounded",
+        });
+        yield* Queue.take(syncEnded);
+        yield* Effect.yieldNow;
+        assert.equal(syncSpans, 2);
+        assert.equal(rootScans, scansAfterInitialSync + 1);
+        assert.deepEqual(Option.getOrThrow(yield* service.getById(projectId)).trackedFolders, [
+          { path: path.join(root, "web"), name: "web", discovered: true },
+        ]);
+        yield* Effect.yieldNow;
+        assert.equal(syncSpans, 2);
+      }).pipe(Effect.withTracer(tracer), Effect.withTracerEnabled(true));
+    }).pipe(Effect.provide(layerProjectServiceDependencies)),
+);
+
 it.effect("rejects an update that waited on the lock while its project was deleted", () =>
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
